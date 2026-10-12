@@ -169,3 +169,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+.DS_Store
+# Generated native macOS build and installer artifacts
+macOS/.build/
+macOS/.packaging/
+macOS/output/

@@ -1,0 +1,22 @@
+{
+  "mode": "interactive",
+  "granularity": "fine",
+  "response_language": "it",
+  "model_profile": "balanced",
+  "commit_docs": false,
+  "planning": { "commit_docs": false },
+  "parallelization": { "enabled": true, "plan_level": true, "task_level": false, "max_concurrent_agents": 3 },
+  "git": { "branching_strategy": "none", "create_tag": false },
+  "workflow": {
+    "research": true,
+    "plan_check": true,
+    "verifier": true,
+    "nyquist_validation": true,
+    "auto_advance": false,
+    "use_worktrees": false,
+    "ui_phase": false,
+    "ui_safety_gate": false,
+    "security_enforcement": true,
+    "security_block_on": "high"
+  }
+}

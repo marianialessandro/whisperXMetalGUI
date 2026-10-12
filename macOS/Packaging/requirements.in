@@ -1,0 +1,25 @@
+# Runtime macOS Apple Silicon; WhisperX sources are shipped separately in Resources.
+ctranslate2>=4.5.0
+faster-whisper>=1.2.0
+nltk>=3.9.1
+numpy>=2.1.0
+omegaconf>=2.3.0
+pandas>=2.2.3
+pyannote-audio==4.0.4
+huggingface-hub>=0.28.1,<1
+torch==2.8.0
+torchaudio==2.8.0
+torchvision==0.23.0
+torchcodec==0.7.0
+transformers==4.57.6
+mlx-whisper==0.4.3
+# Versions already exercised by the local transcription engine.
+ctranslate2==4.6.0
+faster-whisper==1.2.0
+huggingface-hub==0.35.3
+mlx==0.32.2
+mlx-metal==0.32.2
+numpy==2.2.6
+scipy==1.15.3
+tokenizers==0.22.1
+av==15.1.0
