@@ -13,6 +13,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.baseline import manifest, provision, ctc_metal_probe
 from tools.baseline.offline_worker import deny_python_network
+from tools.baseline.native_ctc import NativeCTC
 
 
 class MetalTrellis:
@@ -83,6 +84,25 @@ def native_metal_ctc(alignment, spans, binary, binary_sha256):
         alignment.get_trellis, alignment.backtrack = original_trellis, original_backtrack
 
 
+@contextlib.contextmanager
+def persistent_metal_ctc(alignment, spans, context):
+    import numpy as np
+    original_trellis, original_backtrack = alignment.get_trellis, alignment.backtrack
+    def trellis(emission, tokens, blank_id=0):
+        if emission.device.type != "cpu" or str(emission.dtype) != "torch.float32":
+            raise ValueError("trial_expected_original_cpu_float32_boundary")
+        path, record = context.compute(emission.detach().numpy(), np.asarray(tokens, dtype=np.int32), blank_id)
+        spans.append(record)
+        return MetalTrellis(path, emission.shape[0], len(tokens))
+    def backtrack(trellis, emission, tokens, blank_id=0):
+        return None if trellis.result is None else [alignment.Point(token, frame, score) for token, frame, score in trellis.result]
+    alignment.get_trellis, alignment.backtrack = trellis, backtrack
+    try:
+        yield
+    finally:
+        alignment.get_trellis, alignment.backtrack = original_trellis, original_backtrack
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--audio", type=Path, required=True)
@@ -94,13 +114,17 @@ def main(argv=None):
     parser.add_argument("--output-dir", type=Path, required=True, help="New private output directory for both aligned results and explicit partial comparison.")
     parser.add_argument("--replicas", type=int, default=1, help="Optional 1–10 same-loaded-model replicas with alternating original/candidate order; no cold-process benchmark claim.")
     parser.add_argument("--warmup", action="store_true", help="Run both paths once outside timings before the recorded replicas.")
-    parser.add_argument("--ctc-backend", choices=("mlx", "native"), default="mlx", help="Optional experimental CTC backend; native uses a private NPZ subprocess per segment, including compilation/startup in candidate timings.")
+    parser.add_argument("--ctc-backend", choices=("mlx", "native", "native-persistent"), default="mlx", help="Optional experimental CTC backend; native uses a private NPZ subprocess per segment; native-persistent uses one in-memory C ABI context for all segments, with setup reported separately.")
     parser.add_argument("--native-binary", type=Path, help="Explicit prebuilt native_ctc_probe executable, required with native backend.")
     parser.add_argument("--native-binary-sha256", help="Expected SHA256 of the native executable, required with native backend.")
+    parser.add_argument("--native-library", type=Path, help="Explicit prebuilt native CTC dylib, required with native-persistent backend.")
+    parser.add_argument("--native-library-sha256", help="Expected SHA256 of the native dylib, required with native-persistent backend.")
     args = parser.parse_args(argv)
     if not 1 <= args.replicas <= 10: parser.error("replicas must be between 1 and 10")
     if args.ctc_backend == "native" and (args.native_binary is None or args.native_binary_sha256 is None): parser.error("native backend requires binary and its expected SHA256")
-    if args.ctc_backend == "mlx" and (args.native_binary is not None or args.native_binary_sha256 is not None): parser.error("native options require --ctc-backend native")
+    if args.ctc_backend != "native" and (args.native_binary is not None or args.native_binary_sha256 is not None): parser.error("native binary options require --ctc-backend native")
+    if args.ctc_backend == "native-persistent" and (args.native_library is None or args.native_library_sha256 is None): parser.error("native-persistent backend requires library and its expected SHA256")
+    if args.ctc_backend != "native-persistent" and (args.native_library is not None or args.native_library_sha256 is not None): parser.error("native library options require --ctc-backend native-persistent")
     try:
         if args.output_dir.exists() or manifest.sha256(args.audio) != args.audio_sha256 or manifest.sha256(args.segments) != args.segments_sha256:
             raise ValueError("trial_inputs_or_destination_invalid")
@@ -119,8 +143,13 @@ def main(argv=None):
             if manifest.sha256(args.native_binary) != args.native_binary_sha256: raise ValueError("native_binary_hash_mismatch")
             native_identity = {"binary_sha256": args.native_binary_sha256, "shader_sha256": manifest.sha256(Path(__file__).with_name("native_ctc.metal"))}
         def candidate_context(records):
+            if args.ctc_backend == "native-persistent": return persistent_metal_ctc(alignment, records, persistent)
             return native_metal_ctc(alignment, records, args.native_binary, args.native_binary_sha256) if args.ctc_backend == "native" else metal_ctc(alignment, records)
-        with provision.quiet_download(), deny_python_network():
+        native_setup_ns = None
+        with contextlib.ExitStack() as resources, provision.quiet_download(), deny_python_network():
+            if args.ctc_backend == "native-persistent":
+                persistent = resources.enter_context(NativeCTC(args.native_library, args.native_library_sha256))
+                native_identity, native_setup_ns = persistent.identity, persistent.initialization_wall_ns
             import whisperx
             import whisperx.alignment as alignment
             import torch
@@ -150,11 +179,13 @@ def main(argv=None):
             with (args.output_dir / name).open("x") as output: json.dump(result, output, ensure_ascii=False, indent=2)
         report = {"scope": "experimental_ctc_alignment_only", "status": "aligned_exactly_equal" if all(matches) else "aligned_mismatch", "source_audio_sha256": args.audio_sha256, "asr_result_sha256": args.segments_sha256, "original_completion_ns": baseline_ns, "metal_trial_completion_ns": candidate_ns, "timing_scope": "one_original_then_one_candidate_same_loaded_model_not_speedup_benchmark" if args.replicas == 1 else "alternating_same_loaded_model_alignment_only", "original_replicas_ns": baseline_times, "candidate_replicas_ns": candidate_times, "orders": orders, "all_replicas_exactly_equal": all(matches), "warmup_performed": args.warmup, "ctc_spans": spans, "residuals": ["original_mps_to_cpu_emission_boundary", "cpu_to_mlx_probe_bridge", "cpu_word_char_timestamp_reductions", "cpu_wildcard_column_reduction"], "quality_certified": False, "production_backend": False, "full_baseline_gate_passed": False}
         report["ctc_backend"], report["native_identity"] = args.ctc_backend, native_identity
+        report["native_context_initialization_wall_ns"] = native_setup_ns
         if args.ctc_backend == "native": report["residuals"][1] = "private_npz_and_native_process_startup_per_segment"
+        if args.ctc_backend == "native-persistent": report["residuals"][1] = "cpu_to_native_shared_buffer_copy_per_segment"
         with (args.output_dir / "comparison.json").open("x") as output: json.dump(report, output, indent=2)
         print(json.dumps({key: value for key, value in report.items() if key != "ctc_spans"}))
         return 0 if all(matches) else 2
-    except (OSError, ValueError, RuntimeError, KeyError, StopIteration, subprocess.TimeoutExpired):
+    except (OSError, ValueError, RuntimeError, KeyError, StopIteration, AttributeError, subprocess.TimeoutExpired):
         print(json.dumps({"status": "trial_failed", "code": "ctc_alignment_trial_failed", "full_baseline_gate_passed": False}))
         return 2
 

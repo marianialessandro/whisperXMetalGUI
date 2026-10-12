@@ -1,0 +1,79 @@
+"""Development-only synchronous C ABI bridge to persistent native Metal CTC; no production backend promotion."""
+
+import ctypes as ct
+import hashlib
+from pathlib import Path
+import threading
+import time
+
+from tools.baseline import manifest
+
+
+class Point(ct.Structure):
+    _fields_ = [("token", ct.c_int32), ("frame", ct.c_int32), ("score", ct.c_float)]
+
+
+class Result(ct.Structure):
+    _fields_ = [("path_length", ct.c_int32), ("abi_version", ct.c_uint32), ("validation_wall_ns", ct.c_uint64), ("computation_wall_ns", ct.c_uint64), ("validation_gpu_seconds", ct.c_double), ("computation_gpu_seconds", ct.c_double), ("dp_logical_bytes", ct.c_uint64), ("allocated_shared_buffer_bytes", ct.c_uint64)]
+
+
+class NativeCTC:
+    def __init__(self, library, expected_sha256):
+        started = time.perf_counter_ns()
+        library = Path(library).resolve(strict=True)
+        if manifest.sha256(library) != expected_sha256:
+            raise ValueError("native_library_hash_mismatch")
+        self._lock = threading.RLock()
+        self._context = ct.c_void_p()
+        self._library = ct.CDLL(str(library))
+        self._library.wxctc_abi_version.argtypes = []
+        self._library.wxctc_abi_version.restype = ct.c_uint32
+        if self._library.wxctc_abi_version() != 1 or ct.sizeof(Point) != 12 or ct.sizeof(Result) != 56:
+            raise ValueError("native_abi_version_mismatch")
+        self._library.wxctc_create.argtypes = [ct.c_char_p, ct.c_uint64, ct.POINTER(ct.c_void_p), ct.POINTER(ct.c_char), ct.c_uint32]
+        self._library.wxctc_create.restype = ct.c_int
+        self._library.wxctc_compute.argtypes = [ct.c_void_p, ct.POINTER(ct.c_float), ct.c_uint64, ct.POINTER(ct.c_int32), ct.c_uint64, ct.c_uint32, ct.c_uint32, ct.c_int32, ct.POINTER(Point), ct.c_uint32, ct.POINTER(Result), ct.POINTER(ct.c_char), ct.c_uint32]
+        self._library.wxctc_compute.restype = ct.c_int
+        self._library.wxctc_destroy.argtypes = [ct.c_void_p]
+        self._library.wxctc_destroy.restype = None
+        shader_path = Path(__file__).with_name("native_ctc.metal")
+        shader = shader_path.read_bytes()
+        error = ct.create_string_buffer(128)
+        if self._library.wxctc_create(shader, len(shader), ct.byref(self._context), error, len(error)):
+            raise ValueError(error.value.decode("ascii"))
+        self.identity = {"library_sha256": expected_sha256, "shader_sha256": hashlib.sha256(shader).hexdigest(), "abi_version": 1}
+        self.initialization_wall_ns = time.perf_counter_ns() - started
+
+    def compute(self, emission, tokens, blank=0):
+        import numpy as np
+        if not isinstance(emission, np.ndarray) or emission.dtype != np.float32 or emission.ndim != 2 or not isinstance(tokens, np.ndarray) or tokens.dtype != np.int32 or tokens.ndim != 1:
+            raise ValueError("native_input_format_invalid")
+        frames, vocabulary = emission.shape
+        count = len(tokens)
+        if not 0 < count <= frames <= 32768 or not 0 < vocabulary <= 1 << 24 or emission.nbytes > 64 * 1024 * 1024 or (frames + 1) * (count + 1) > 16 * 1024 * 1024 or type(blank) is not int or not -(1 << 31) <= blank < 1 << 31:
+            raise ValueError("native_input_shape_invalid")
+        with self._lock:
+            if not self._context.value:
+                raise ValueError("native_context_closed")
+            started = time.perf_counter_ns()
+            emission, tokens = np.ascontiguousarray(emission), np.ascontiguousarray(tokens)
+            path, result, error = (Point * frames)(), Result(), ct.create_string_buffer(128)
+            status = self._library.wxctc_compute(self._context, emission.ctypes.data_as(ct.POINTER(ct.c_float)), emission.size, tokens.ctypes.data_as(ct.POINTER(ct.c_int32)), tokens.size, frames, vocabulary, blank, path, frames, ct.byref(result), error, len(error))
+            if status:
+                raise ValueError(error.value.decode("ascii"))
+            if result.abi_version != 1 or not -1 <= result.path_length <= frames:
+                raise ValueError("native_result_invalid")
+            points = None if result.path_length < 0 else [(path[i].token, path[i].frame, path[i].score) for i in range(result.path_length)]
+            return points, {"frames": frames, "tokens": count, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "logical_cpu_to_native_emission_bytes": emission.nbytes, "logical_final_path_readback_bytes": 4 + (0 if points is None else 12 * len(points)), "physical_copy_bytes": None, "transport": "synchronous_in_memory_c_abi", "command_buffers_per_run": 2, "validation_wall_ns": result.validation_wall_ns, "computation_wall_ns": result.computation_wall_ns, "validation_gpu_seconds": result.validation_gpu_seconds, "computation_gpu_seconds": result.computation_gpu_seconds, "dp_logical_storage_bytes": result.dp_logical_bytes, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
+
+    def close(self):
+        with self._lock:
+            if self._context.value:
+                self._library.wxctc_destroy(self._context)
+                self._context = ct.c_void_p()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exception):
+        self.close()

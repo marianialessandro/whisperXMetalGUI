@@ -1,41 +1,9 @@
-#import <Foundation/Foundation.h>
-#import <Metal/Metal.h>
+#include "native_ctc_core.hpp"
 #define NATIVE_NPZ_INVENTORY_LIBRARY
 #include "native_npz_inventory.cpp"
-#include <chrono>
 #include <map>
 
-struct Dimensions { uint32_t frames; uint32_t vocabulary; uint32_t count; int32_t blank; };
-static_assert(sizeof(Dimensions) == 16);
-struct Timing { uint64_t wall_ns; double gpu_seconds; };
-
 static std::vector<uint8_t> payload(std::ifstream& source, const Tensor& tensor, uint64_t size) { require(tensor.payload <= 64 * 1024 * 1024, "input_budget_invalid"); return read(source, tensor.offset, tensor.payload, size); }
-
-static void encode(id<MTLCommandBuffer> command, id<MTLComputePipelineState> pipeline, NSArray<id<MTLBuffer>>* buffers, const Dimensions& dimensions, NSUInteger dimension_index, NSUInteger grid, NSUInteger group, NSString* label) {
-    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "metal_encoder_creation_failed");
-    encoder.label = label; [encoder setComputePipelineState:pipeline];
-    NSUInteger index = 0;
-    for (id<MTLBuffer> buffer in buffers) { if (index == dimension_index) ++index; [encoder setBuffer:buffer offset:0 atIndex:index++]; }
-    [encoder setBytes:&dimensions length:sizeof(dimensions) atIndex:dimension_index];
-    [encoder dispatchThreads:MTLSizeMake(grid, 1, 1) threadsPerThreadgroup:MTLSizeMake(group, 1, 1)];
-    [encoder endEncoding];
-}
-
-static Timing complete(id<MTLCommandBuffer> command, std::chrono::steady_clock::time_point started) {
-    [command commit]; [command waitUntilCompleted];
-    require(command.status == MTLCommandBufferStatusCompleted, "metal_command_failed");
-    auto wall = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
-    require(command.GPUEndTime >= command.GPUStartTime && command.GPUStartTime > 0, "metal_gpu_timestamps_unavailable");
-    return {static_cast<uint64_t>(wall), command.GPUEndTime - command.GPUStartTime};
-}
-
-static Timing execute(id<MTLCommandQueue> queue, id<MTLComputePipelineState> pipeline, NSArray<id<MTLBuffer>>* buffers, const Dimensions& dimensions, NSUInteger dimension_index, NSUInteger grid, NSUInteger group, NSString* label) {
-    auto started = std::chrono::steady_clock::now();
-    id<MTLCommandBuffer> command = [queue commandBuffer]; require(command != nil, "metal_command_creation_failed");
-    command.label = label;
-    encode(command, pipeline, buffers, dimensions, dimension_index, grid, group, label);
-    return complete(command, started);
-}
 
 int main(int argc, char** argv) {
     @autoreleasepool {
@@ -66,59 +34,16 @@ int main(int argc, char** argv) {
             auto emission_bytes = payload(source, emission, size), token_bytes = payload(source, tokens, size), blank_bytes = payload(source, blank, size);
             int32_t blank_id; std::memcpy(&blank_id, blank_bytes.data(), sizeof(blank_id));
             Dimensions dimensions{static_cast<uint32_t>(emission.shape[0]), static_cast<uint32_t>(emission.shape[1]), static_cast<uint32_t>(tokens.shape[0]), blank_id};
-            id<MTLDevice> device = MTLCreateSystemDefaultDevice(); require(device != nil && [device supportsFamily:MTLGPUFamilyApple7], "apple_metal_required");
             auto shader_size = std::filesystem::file_size(kernels_path); require(shader_size <= 1024 * 1024, "shader_budget_invalid");
             std::ifstream shader_file(kernels_path, std::ios::binary); require(shader_file.good(), "shader_read_failed");
             auto shader_hash = digest(shader_file); auto shader_bytes = read(shader_file, 0, shader_size, shader_size);
-            NSString* shader = [[NSString alloc] initWithBytes:shader_bytes.data() length:shader_bytes.size() encoding:NSUTF8StringEncoding]; require(shader != nil, "shader_encoding_invalid");
-            MTLCompileOptions* compile = [[MTLCompileOptions alloc] init]; compile.fastMathEnabled = NO;
-            NSError* error = nil;
-            id<MTLLibrary> library = [device newLibraryWithSource:shader options:compile error:&error]; require(library != nil, "shader_compilation_failed");
-            NSMutableArray<id<MTLComputePipelineState>>* pipelines = [[NSMutableArray alloc] init];
-            NSArray<NSString*>* kernel_names = compact ? @[@"ctc_validate", @"ctc_prefix", @"ctc_trellis_compact", @"ctc_backtrack_compact"] : @[@"ctc_validate", @"ctc_prefix", @"ctc_trellis", @"ctc_backtrack"];
-            for (NSString* name in kernel_names) {
-                id<MTLFunction> function = [library newFunctionWithName:name]; require(function != nil, "shader_function_missing");
-                id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error]; require(pipeline != nil && pipeline.maxTotalThreadsPerThreadgroup >= 256, "pipeline_creation_failed");
-                [pipelines addObject:pipeline];
-            }
-            id<MTLCommandQueue> queue = [device newCommandQueue]; require(queue != nil, "metal_queue_creation_failed");
-            id<MTLBuffer> e = [device newBufferWithBytes:emission_bytes.data() length:emission_bytes.size() options:MTLResourceStorageModeShared];
-            id<MTLBuffer> t = [device newBufferWithBytes:token_bytes.data() length:token_bytes.size() options:MTLResourceStorageModeShared];
-            id<MTLBuffer> invalid = [device newBufferWithLength:4 options:MTLResourceStorageModeShared];
-            id<MTLBuffer> prefix = [device newBufferWithLength:(dimensions.frames + 1) * 4 options:MTLResourceStorageModeShared];
-            uint64_t trellis_bytes = compact ? 2 * (dimensions.count + 1) * 4 : cells * 4;
-            id<MTLBuffer> trellis = [device newBufferWithLength:trellis_bytes options:MTLResourceStorageModeShared];
-            id<MTLBuffer> path = [device newBufferWithLength:(1 + dimensions.frames * 3) * 4 options:MTLResourceStorageModeShared];
-            id<MTLBuffer> decisions = compact ? [device newBufferWithLength:dimensions.frames * dimensions.count options:MTLResourceStorageModeShared] : nil;
-            id<MTLBuffer> endpoint = compact ? [device newBufferWithLength:4 options:MTLResourceStorageModeShared] : nil;
-            require(e != nil && t != nil && invalid != nil && prefix != nil && trellis != nil && path != nil, "metal_allocation_failed");
-            require(!compact || (decisions != nil && endpoint != nil), "metal_allocation_failed");
+            NativeCTCContext context(reinterpret_cast<const char*>(shader_bytes.data()), shader_bytes.size(), compact, batched);
             std::vector<std::vector<Timing>> timings;
+            NativeResult result;
             for (int replica = 0; replica <= replicas; ++replica) {
-                *static_cast<uint32_t*>(invalid.contents) = 0;
-                std::vector<Timing> stages;
-                stages.push_back(execute(queue, pipelines[0], @[e, t, invalid], dimensions, 2, dimensions.frames * dimensions.vocabulary, 256, @"ctc_validate"));
-                require(*static_cast<uint32_t*>(invalid.contents) == 0, "input_values_invalid");
-                NSArray<id<MTLBuffer>>* trellis_buffers = compact ? @[e, t, prefix, trellis, decisions, endpoint] : @[e, t, prefix, trellis];
-                NSArray<id<MTLBuffer>>* backtrack_buffers = compact ? @[e, t, trellis, path, decisions, endpoint] : @[e, t, trellis, path];
-                if (batched) {
-                    auto started = std::chrono::steady_clock::now();
-                    id<MTLCommandBuffer> command = [queue commandBuffer]; require(command != nil, "metal_command_creation_failed");
-                    command.label = @"ctc_prefix_trellis_backtrack";
-                    // Default tracked Metal buffers preserve dependencies between these sequential encoders.
-                    encode(command, pipelines[1], @[e, prefix], dimensions, 1, 1, 1, kernel_names[1]);
-                    encode(command, pipelines[2], trellis_buffers, dimensions, 2, 256, 256, kernel_names[2]);
-                    encode(command, pipelines[3], backtrack_buffers, dimensions, 2, 1, 1, kernel_names[3]);
-                    stages.push_back(complete(command, started));
-                } else {
-                    stages.push_back(execute(queue, pipelines[1], @[e, prefix], dimensions, 1, 1, 1, kernel_names[1]));
-                    stages.push_back(execute(queue, pipelines[2], trellis_buffers, dimensions, 2, 256, 256, kernel_names[2]));
-                    stages.push_back(execute(queue, pipelines[3], backtrack_buffers, dimensions, 2, 1, 1, kernel_names[3]));
-                }
-                timings.push_back(stages);
+                result = context.compute(reinterpret_cast<const float*>(emission_bytes.data()), emission_bytes.size() / 4, reinterpret_cast<const int32_t*>(token_bytes.data()), token_bytes.size() / 4, dimensions);
+                timings.push_back(result.timings);
             }
-            const auto* result = static_cast<const float*>(path.contents); int length = static_cast<int>(result[0]);
-            require(length >= -1 && length <= static_cast<int>(dimensions.frames), "gpu_path_invalid");
             std::ostringstream output; output << std::setprecision(10);
             output << "{\"status\":\"native_metal_ctc_executed\",\"pid\":" << getpid() << ",\"scope\":\"native_ctc_primitive_only\",\"input_sha256\":\"" << expected << "\",\"shader_sha256\":\"" << shader_hash << "\",\"frames\":" << dimensions.frames << ",\"tokens\":" << dimensions.count << ",\"quality_certified\":false,\"production_backend\":false,\"full_baseline_gate_passed\":false,\"python_required\":false,\"physical_copy_bytes\":null,\"batched\":" << (batched ? "true" : "false") << ",\"command_buffers_per_run\":" << (batched ? 2 : 4) << ",\"timing_kind\":\"" << (batched ? "validation_then_batched_prefix_trellis_backtrack" : "four_waited_command_buffers_validation_prefix_trellis_backtrack") << "\",\"runs\":[";
             for (size_t replica = 0; replica < timings.size(); ++replica) {
@@ -127,11 +52,11 @@ int main(int argc, char** argv) {
                 for (size_t stage = 0; stage < timings[replica].size(); ++stage) { if (stage) output << ','; output << "{\"" << (batched && stage == 1 ? "kernel_group" : "kernel") << "\":\"" << (batched && stage == 1 ? "ctc_prefix_trellis_backtrack" : names[stage]) << "\",\"dispatch_completed\":true,\"wall_ns\":" << timings[replica][stage].wall_ns << ",\"gpu_command_elapsed_seconds\":" << timings[replica][stage].gpu_seconds << '}'; }
                 output << "]}";
             }
-            output << "],\"compact\":" << (compact ? "true" : "false") << ",\"dp_logical_storage_bytes\":" << (trellis_bytes + (compact ? dimensions.frames * dimensions.count + 4 : 0)) << ",\"path\":";
-            if (length < 0) output << "null";
+            output << "],\"compact\":" << (compact ? "true" : "false") << ",\"dp_logical_storage_bytes\":" << result.dp_bytes << ",\"path\":";
+            if (!result.found) output << "null";
             else {
                 output << '[';
-                for (int index = length - 1; index >= 0; --index) { if (index != length - 1) output << ','; output << '[' << static_cast<int>(result[1 + index * 3]) << ',' << static_cast<int>(result[2 + index * 3]) << ',' << result[3 + index * 3] << ']'; }
+                for (size_t index = 0; index < result.path.size(); ++index) { if (index) output << ','; const auto& point = result.path[index]; output << '[' << point.token << ',' << point.frame << ',' << point.score << ']'; }
                 output << ']';
             }
             output << "}\n";

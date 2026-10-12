@@ -1,4 +1,5 @@
 #include <CommonCrypto/CommonDigest.h>
+#include "native_checks.hpp"
 #include <fcntl.h>
 #include <getopt.h>
 #include <unistd.h>
@@ -19,9 +20,6 @@
 
 // This feasibility tool inventories the stored ZIP/NPY format observed in the real MLX checkpoints without Python, tensor loading or numerical conversion.
 struct Tensor { std::string name; std::string dtype; std::vector<uint64_t> shape; uint64_t payload; uint64_t offset; bool fortran; };
-struct InventoryError final : std::runtime_error { explicit InventoryError(const char* code) : std::runtime_error(code) {} };
-
-static void require(bool condition, const char* code) { if (!condition) throw InventoryError(code); }
 static uint16_t u16(const std::vector<uint8_t>& data, size_t index) { require(index + 2 <= data.size(), "zip_truncated"); return uint16_t(data[index]) | uint16_t(data[index + 1]) << 8; }
 static uint32_t u32(const std::vector<uint8_t>& data, size_t index) { require(index + 4 <= data.size(), "zip_truncated"); return uint32_t(u16(data, index)) | uint32_t(u16(data, index + 2)) << 16; }
 static uint64_t u64(const std::vector<uint8_t>& data, size_t index) { require(index + 8 <= data.size(), "zip_truncated"); return uint64_t(u32(data, index)) | uint64_t(u32(data, index + 4)) << 32; }
