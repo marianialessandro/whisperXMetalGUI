@@ -24,6 +24,8 @@ int wxctc_compute_segments(wxctc_context* context, const float* emission, uint64
 int wxctc_row_max(wxctc_context* context, const float* emission, uint64_t emission_elements, uint32_t frames, uint32_t vocabulary, float* values, int64_t* indices, uint32_t output_capacity, wxctc_max_result* result, char* error_code, uint32_t error_capacity);
 // Optional ABI v1 extension: binary64 min/max skipping NaN; empty/all-NaN returns NaN; negative zero is rejected to avoid runtime-dependent tie semantics.
 int wxctc_timestamp_bounds(wxctc_context* context, const uint64_t* values, uint64_t count, uint64_t* output, uint32_t output_capacity, wxctc_max_result* result, char* error_code, uint32_t error_capacity);
+// Optional ABI v1 extension: CSR subsets of a shared binary64 input; output_capacity is measured in uint64 elements and must cover twice the query count.
+int wxctc_timestamp_bounds_batch(wxctc_context* context, const uint64_t* values, uint64_t count, const uint32_t* indices, uint64_t index_count, const uint32_t* offsets, uint64_t offset_count, uint64_t* output, uint32_t output_capacity, wxctc_max_result* result, char* error_code, uint32_t error_capacity);
 // Calls on one context are serialized; destroy only after all calls have returned, without racing a new call.
 void wxctc_destroy(wxctc_context* context);
 

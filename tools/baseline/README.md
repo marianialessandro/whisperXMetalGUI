@@ -49,6 +49,16 @@ The optional `wxctc_timestamp_bounds` ABI extension compares binary64 bit patter
 
 The report includes dispatch counts, per-call completion/GPU times, reference Pandas/NumPy versions and copies: eight input bytes per value and 24 logical output bytes, excluding ABI metadata and driver copies. This feasibility adapter performs a separate synchronous dispatch for each reduction. Small word subsets may cost more in CPU/GPU synchronization than their arithmetic; timing must be checked before promotion. Batching and keeping character timestamps resident are subsequent work. No production default changes or full quality certification follow from these trials.
 
+## Batched timestamp bounds
+
+Use `--native-timestamp-bounds-batched` instead of `--native-timestamp-bounds` with the persistent backend to group extrema for all words/sentences of each character frame. It preserves the existing flags/defaults and is mutually exclusive with the individual timestamp mode. The scoped NLTK loader proxy records the spans emitted by the original tokenizer, then the Pandas factory builds the exact inclusive sentence selections and non-space word selections used by the oracle. Labels, spaces and word IDs are CPU metadata; no sentence splitting is reimplemented.
+
+The `wxctc_timestamp_bounds_batch` ABI v1 extension receives one binary64 timestamp array and CSR query indices/offsets. Metal validates offsets and indices before reading selected values, then runs one 256-lane group per subset in one command buffer. Limits are 65536 input values, 32768 queries and 4194304 index entries. Empty subsets and NaNs follow the individual mode; selected negative zero fails explicitly. Validation failure leaves caller output untouched. Existing ABI exports/layouts are unchanged.
+
+Each character frame uploads its start/end columns once for the batch. The scoped Series retrieves the requested extrema from the completed GPU results, checking subset identity and timestamp snapshot bytes; mutation or an unregistered subset fails instead of using stale data or falling back to CPU min/max. The Pandas/NLTK references restore on exit and error. This adapter belongs to a standalone CLI process and does not support concurrent original alignment calls while its hooks are installed.
+
+Reports retain `native_timestamp_bounds_dispatch_count` for actual batch dispatches and add query/consumption counts. Logical transfer includes timestamp bytes plus CSR metadata; readback is 16 bytes per unique subset plus a four-byte validation word, excluding ABI metadata and physical copies. This does not eliminate character readback, CPU scaling/rounding, snapshot checks or the upload from CPU; retaining timestamps across the complete character/word pipeline remains subsequent work. Word means, interpolation and production defaults remain original.
+
 ## Lifecycle and verification
 
 The development ABI in `native_ctc_bridge.h` returns zero on success and nonzero with a fixed error code on failure. Input pointers and declared lengths must remain valid until a synchronous call returns. Output capacity must cover `frames`. Calls on one context serialize; finish all calls before destroying it and never race destruction with a new call. The Python wrapper's context manager and lock enforce compute/close ordering. No CPU fallback is invoked when native validation fails.

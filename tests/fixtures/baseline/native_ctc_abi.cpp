@@ -42,6 +42,16 @@ int main(int argc, char** argv) {
     assert(wxctc_timestamp_bounds(context, timestamps, 3, bounds, 2, &maximum_result, error, sizeof(error)) != 0 && bounds[0] == 123);
     assert(wxctc_timestamp_bounds(context, timestamps, 0, bounds, 2, &maximum_result, error, sizeof(error)) == 0);
     assert(bounds[0] == 0x7ff8000000000000ull && bounds[1] == bounds[0]);
+    timestamps[0] = 0x3ff0000000000000ull;
+    uint32_t subset_indices[]{0, 1, 2}, subset_offsets[]{0, 2, 3};
+    uint64_t batch_bounds[4]{123, 123, 123, 123};
+    assert(wxctc_timestamp_bounds_batch(context, timestamps, 3, subset_indices, 3, subset_offsets, 3, batch_bounds, 3, &maximum_result, error, sizeof(error)) != 0 && batch_bounds[0] == 123);
+    assert(wxctc_timestamp_bounds_batch(context, timestamps, 3, subset_indices, 3, subset_offsets, 3, batch_bounds, 4, &maximum_result, error, sizeof(error)) == 0);
+    assert(batch_bounds[0] == timestamps[0] && batch_bounds[1] == timestamps[0] && batch_bounds[2] == timestamps[2] && batch_bounds[3] == timestamps[2]);
+    subset_indices[2] = 0xffffffffu; batch_bounds[0] = 123;
+    assert(wxctc_timestamp_bounds_batch(context, timestamps, 3, subset_indices, 3, subset_offsets, 3, batch_bounds, 4, &maximum_result, error, sizeof(error)) != 0 && batch_bounds[0] == 123);
+    assert(wxctc_timestamp_bounds_batch(context, timestamps, 65537, subset_indices, 3, subset_offsets, 3, batch_bounds, 4, &maximum_result, error, sizeof(error)) != 0);
+    assert(wxctc_timestamp_bounds_batch(context, timestamps, 3, nullptr, 3, subset_offsets, 3, batch_bounds, 4, &maximum_result, error, sizeof(error)) != 0);
     int32_t wildcard[]{2};
     assert(wxctc_compute_wildcard(context, emission, 6, wildcard, 1, 3, 2, 0, path, 3, &result, error, sizeof(error)) == 0);
     assert(result.path_length > 0 && path[0].frame == 0 && path[0].token == 0);

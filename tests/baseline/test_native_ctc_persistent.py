@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import whisperx.alignment as alignment
 from tools.baseline.native_ctc import NativeCTC
-from tools.baseline.native_timestamp_bounds import native_timestamp_bounds
+from tools.baseline.native_timestamp_bounds import native_timestamp_bounds, native_timestamp_bounds_batched
 from tools.baseline.ctc_alignment_trial import persistent_metal_ctc, native_wildcard_max
 from tools.baseline.native_ctc_fused import DeferredWildcard, fused_wildcard_preparation
 
@@ -82,6 +82,65 @@ class PersistentNativeCTCTests(unittest.TestCase):
                 with native_timestamp_bounds(alignment, context, []): alignment.pd.DataFrame([{**rows[0], "start": -0.}])["start"].min()
             self.assertIs(alignment.pd, original_pd)
         with self.assertRaisesRegex(ValueError, "native_context_closed"): context.timestamp_bounds(np.array([1.]))
+
+    def test_timestamp_batch_csr_matches_pandas_and_rejects_unsafe_metadata(self):
+        import pandas as pd
+        generator = np.random.default_rng(943)
+        values = generator.normal(size=1025)
+        values[::17] = np.nan
+        values[1:6] = [0., np.inf, -np.inf, np.nextafter(1., 2.), 1e-300]
+        groups = [[], [0], [1, 2, 3, 4, 5], list(range(1025)), [17, 34], [4, 4, 1], *[generator.integers(0, len(values), size=int(size)).tolist() for size in generator.integers(0, 130, size=31)]]
+        offsets = np.asarray([0, *np.cumsum([len(group) for group in groups])], dtype=np.uint32)
+        indices = np.asarray([index for group in groups for index in group], dtype=np.uint32)
+        with NativeCTC(self.library, self.identity) as context:
+            actual, record = context.timestamp_bounds_batch(values, indices, offsets)
+            for bounds, group in zip(actual, groups):
+                series = pd.Series(values[group])
+                for result, reference in zip(bounds, [series.min(), series.max()]):
+                    if np.isnan(reference): self.assertTrue(np.isnan(result))
+                    else: self.assertEqual(result.tobytes(), np.float64(reference).tobytes())
+            self.assertEqual(record["command_buffers_per_run"], 1)
+            self.assertEqual(record["queries"], len(groups))
+            self.assertGreater(record["computation_gpu_seconds"], 0)
+            for bad_indices, bad_offsets in [(np.array([1025], dtype=np.uint32), np.array([0, 1], dtype=np.uint32)), (indices, np.array([1, len(indices)], dtype=np.uint32)), (indices, np.array([0, len(indices) + 1], dtype=np.uint32)), (indices, np.array([0, 2, 1, len(indices)], dtype=np.uint32)), (indices, np.array([0, 0xffffffff, len(indices)], dtype=np.uint32))]:
+                with self.assertRaisesRegex(ValueError, "indices_invalid"): context.timestamp_bounds_batch(values, bad_indices, bad_offsets)
+            with self.assertRaisesRegex(ValueError, "negative_zero"): context.timestamp_bounds_batch(np.array([-0.]), np.array([0], dtype=np.uint32), np.array([0, 1], dtype=np.uint32))
+            empty, _ = context.timestamp_bounds_batch(np.array([], dtype=np.float64), np.array([], dtype=np.uint32), np.array([0, 0, 0], dtype=np.uint32))
+            self.assertTrue(np.isnan(empty).all())
+            with self.assertRaisesRegex(ValueError, "format_invalid"): context.timestamp_bounds_batch(values, indices.astype(np.int32), offsets)
+            reused, _ = context.timestamp_bounds_batch(values, indices, offsets)
+            np.testing.assert_array_equal(actual.view(np.uint64), reused.view(np.uint64))
+
+    def test_batched_pandas_uses_original_spans_and_restores_after_mutation_error(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        rows = [{"char": char, "start": None if i == 2 else float(i), "end": None if i == 2 else float(i + 1), "score": .3, "word-idx": word} for i, (char, word) in enumerate(zip("a ? b", [0, 1, 1, 2, 2]))]
+        original_pd = alignment.pd
+        tokenizer = SimpleNamespace(span_tokenize=lambda text: iter([(0, 3), (3, 5)]))
+        with NativeCTC(self.library, self.identity) as context, patch.object(alignment, "nltk_load", return_value=tokenizer) as loader:
+            records = []
+            with native_timestamp_bounds_batched(alignment, context, records):
+                self.assertEqual(list(alignment.nltk_load("test").span_tokenize("a ? b")), [(0, 3), (3, 5)])
+                frame = alignment.pd.DataFrame(rows)
+                self.assertEqual(frame.loc[[0, 1, 2, 3]]["start"].min(), 0.)
+                self.assertEqual(frame.loc[[0, 2]]["end"].max(), 1.)
+                self.assertTrue(np.isnan(frame.loc[[2]]["start"].min()))
+                self.assertEqual(frame.loc[[4]]["end"].max(), 5.)
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]["queries_consumed"], 4)
+                with self.assertRaisesRegex(ValueError, "dtype_not_supported"): frame.loc[[4]]["start"].astype(np.float32).min()
+                with self.assertRaisesRegex(ValueError, "subset_not_registered"): frame.loc[[2, 4]]["start"].min()
+                with self.assertRaisesRegex(ValueError, "options_not_supported"): frame.loc[[4]]["start"].min(skipna=False)
+            self.assertIs(alignment.pd, original_pd)
+            self.assertIs(alignment.nltk_load, loader)
+            with self.assertRaisesRegex(ValueError, "snapshot_changed"):
+                with native_timestamp_bounds_batched(alignment, context, []):
+                    list(alignment.nltk_load("test").span_tokenize("a ? b"))
+                    frame = alignment.pd.DataFrame(rows)
+                    frame.loc[0, "start"] = 9.
+                    frame.loc[[0]]["start"].min()
+            self.assertIs(alignment.pd, original_pd)
+            self.assertIs(alignment.nltk_load, loader)
 
     def test_buffer_growth_reuse_and_sentinel_paths_match_original(self):
         generator = np.random.default_rng(43)

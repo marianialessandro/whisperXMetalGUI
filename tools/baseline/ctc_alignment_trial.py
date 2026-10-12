@@ -162,6 +162,7 @@ def main(argv=None):
     parser.add_argument("--native-fused-wildcard", action="store_true", help="Optional trial-only deferred wildcard preparation; native Metal expands the source emission and runs CTC without intermediate wildcard readback. Requires native-persistent; excludes --native-wildcard-max.")
     parser.add_argument("--native-character-segments", action="store_true", help="Optional GPU character bounds/means and segment-only readback; requires native-persistent and pinned CPython 3.12 sum semantics. Word reductions/timestamp scaling remain original.")
     parser.add_argument("--native-timestamp-bounds", action="store_true", help="Optional Metal binary64 timestamp min/max for word/sentence character subsets; requires native-persistent. Means, timestamp scaling and interpolation remain original; negative zero fails explicitly.")
+    parser.add_argument("--native-timestamp-bounds-batched", action="store_true", help="Optional shared-input Metal timestamp min/max batch per character frame; requires native-persistent and excludes --native-timestamp-bounds. Uses original tokenizer spans and word metadata; means/interpolation remain original.")
     args = parser.parse_args(argv)
     if not 1 <= args.replicas <= 10: parser.error("replicas must be between 1 and 10")
     if args.ctc_backend == "native" and (args.native_binary is None or args.native_binary_sha256 is None): parser.error("native backend requires binary and its expected SHA256")
@@ -171,6 +172,8 @@ def main(argv=None):
     if args.native_wildcard_max and args.ctc_backend != "native-persistent": parser.error("--native-wildcard-max requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.ctc_backend != "native-persistent": parser.error("--native-fused-wildcard requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.native_wildcard_max: parser.error("wildcard modes are mutually exclusive")
+    if args.native_timestamp_bounds_batched and args.ctc_backend != "native-persistent": parser.error("--native-timestamp-bounds-batched requires --ctc-backend native-persistent")
+    if args.native_timestamp_bounds_batched and args.native_timestamp_bounds: parser.error("timestamp bounds modes are mutually exclusive")
     if args.native_timestamp_bounds and args.ctc_backend != "native-persistent": parser.error("--native-timestamp-bounds requires --ctc-backend native-persistent")
     if args.native_character_segments and args.ctc_backend != "native-persistent": parser.error("--native-character-segments requires --ctc-backend native-persistent")
     try:
@@ -195,6 +198,9 @@ def main(argv=None):
         @contextlib.contextmanager
         def candidate_context(records, maximum_records, bounds_records):
             with contextlib.ExitStack() as scopes:
+                if args.native_timestamp_bounds_batched:
+                    from tools.baseline.native_timestamp_bounds import native_timestamp_bounds_batched
+                    scopes.enter_context(native_timestamp_bounds_batched(alignment, persistent, bounds_records))
                 if args.native_timestamp_bounds:
                     from tools.baseline.native_timestamp_bounds import native_timestamp_bounds
                     scopes.enter_context(native_timestamp_bounds(alignment, persistent, bounds_records))
@@ -249,7 +255,10 @@ def main(argv=None):
         report["native_character_segments_dispatch_count"] = sum(record.get("character_segments_gpu") is True for record in spans)
         report["native_timestamp_bounds_enabled"], report["timestamp_bounds_spans"] = args.native_timestamp_bounds, timestamp_spans
         report["native_timestamp_bounds_dispatch_count"] = len(timestamp_spans)
-        if args.native_timestamp_bounds:
+        report["native_timestamp_bounds_batched_enabled"] = args.native_timestamp_bounds_batched
+        report["native_timestamp_bounds_query_count"] = sum(record.get("queries", 1) for record in timestamp_spans)
+        report["native_timestamp_bounds_queries_consumed"] = sum(record.get("queries_consumed", 1) for record in timestamp_spans)
+        if args.native_timestamp_bounds or args.native_timestamp_bounds_batched:
             import numpy as np
             report["timestamp_bounds_reference_runtime"] = {"pandas": alignment.pd.__version__, "numpy": np.__version__, "policy": "binary64_min_max_skipna_negative_zero_rejected"}
         if args.ctc_backend == "native": report["residuals"][1] = "private_npz_and_native_process_startup_per_segment"
@@ -257,7 +266,7 @@ def main(argv=None):
         if args.native_wildcard_max: report["residuals"][-1] = "cpu_wildcard_mask_gather_concat_and_max_readback"
         if args.native_fused_wildcard: report["residuals"][-1] = "cpu_wildcard_mask_and_token_metadata"
         if args.native_character_segments: report["residuals"][2] = "cpu_word_reductions_and_character_timestamp_scaling"
-        if args.native_timestamp_bounds: report["residuals"][2] = "cpu_word_means_character_timestamp_scaling_interpolation_and_dataframe_selection"
+        if args.native_timestamp_bounds or args.native_timestamp_bounds_batched: report["residuals"][2] = "cpu_word_means_character_timestamp_scaling_interpolation_dataframe_selection_and_snapshot_validation"
         with (args.output_dir / "comparison.json").open("x") as output: json.dump(report, output, indent=2)
         print(json.dumps({key: value for key, value in report.items() if key not in ("ctc_spans", "wildcard_spans", "timestamp_bounds_spans")}))
         return 0 if all(matches) else 2

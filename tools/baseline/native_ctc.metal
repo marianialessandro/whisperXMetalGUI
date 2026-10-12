@@ -276,3 +276,37 @@ kernel void ctc_timestamp_bounds(device const ulong* values [[buffer(0)]], const
         output[2] = invalid[0];
     }
 }
+
+// One group per CSR query shares a single immutable binary64 timestamp input and one command-buffer completion.
+kernel void ctc_timestamp_bounds_batch(device const ulong* values [[buffer(0)]], constant Dimensions& dimensions [[buffer(1)]], device const uint* indices [[buffer(2)]], device const uint* offsets [[buffer(3)]], device ulong* output [[buffer(4)]], device atomic_uint* invalid [[buffer(5)]], uint lane [[thread_position_in_threadgroup]], uint query [[threadgroup_position_in_grid]]) {
+    threadgroup ulong minima[256], maxima[256];
+    threadgroup uint counts[256];
+    uint begin = offsets[query], end = offsets[query + 1];
+    bool valid = begin <= end && end <= dimensions.count && (query != 0 || begin == 0) && (query + 1 != dimensions.frames || end == dimensions.count);
+    if (!valid) {
+        if (lane == 0) { atomic_fetch_or_explicit(invalid, 1u, memory_order_relaxed); output[query * 2] = output[query * 2 + 1] = 0x7ff8000000000000ul; }
+        return;
+    }
+    ulong low = ~0ul, high = 0ul;
+    uint count = 0;
+    for (uint i = begin + lane; i < end; i += 256) {
+        uint index = indices[i];
+        if (index >= dimensions.vocabulary) { atomic_fetch_or_explicit(invalid, 1u, memory_order_relaxed); continue; }
+        ulong bits = values[index], magnitude = bits & 0x7ffffffffffffffful;
+        if (magnitude > 0x7ff0000000000000ul) continue;
+        if (bits == 0x8000000000000000ul) { atomic_fetch_or_explicit(invalid, 2u, memory_order_relaxed); continue; }
+        ulong key = (bits >> 63) ? ~bits : bits ^ 0x8000000000000000ul;
+        low = min(low, key); high = max(high, key); ++count;
+    }
+    minima[lane] = low; maxima[lane] = high; counts[lane] = count;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride /= 2) {
+        if (lane < stride) { minima[lane] = min(minima[lane], minima[lane + stride]); maxima[lane] = max(maxima[lane], maxima[lane + stride]); counts[lane] += counts[lane + stride]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        ulong low_key = minima[0], high_key = maxima[0];
+        output[query * 2] = counts[0] == 0 ? 0x7ff8000000000000ul : ((low_key >> 63) ? low_key ^ 0x8000000000000000ul : ~low_key);
+        output[query * 2 + 1] = counts[0] == 0 ? 0x7ff8000000000000ul : ((high_key >> 63) ? high_key ^ 0x8000000000000000ul : ~high_key);
+    }
+}
