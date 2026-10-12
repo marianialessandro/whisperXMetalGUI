@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import numpy as np
 import torch
 from whisperx.alignment import get_trellis, backtrack
+import whisperx.alignment as alignment
+from tools.baseline.ctc_alignment_trial import native_metal_ctc
 
 
 @unittest.skipUnless(platform.system() == "Darwin" and torch.backends.mps.is_available(), "Apple Metal hardware required")
@@ -52,6 +54,29 @@ class NativeMetalCTCTests(unittest.TestCase):
                     self.assertIn("kernel_group", batched["runs"][0]["stages"][1])
                     self.assertNotIn("AddressSanitizer", candidate.stderr)
                     self.assertNotIn("runtime error:", candidate.stderr)
+
+    def test_native_alignment_adapter_preserves_points_and_restores_hooks_on_failure(self):
+        emission = torch.tensor([[-3., -.1], [-.2, -2.], [-.1, -3.]], dtype=torch.float32)
+        expected = backtrack(get_trellis(emission, [1]), emission, [1])
+        original_trellis, original_backtrack = alignment.get_trellis, alignment.backtrack
+        identity = hashlib.sha256(self.binary.read_bytes()).hexdigest()
+        spans = []
+        with native_metal_ctc(alignment, spans, self.binary, identity):
+            trellis = alignment.get_trellis(emission, [1])
+            self.assertEqual(trellis.size(0), 4)
+            result = alignment.backtrack(trellis, emission, [1])
+            self.assertEqual([(p.token_index, p.time_index) for p in result], [(p.token_index, p.time_index) for p in expected])
+            for actual, reference in zip(result, expected): self.assertAlmostEqual(actual.score, reference.score, delta=16 * np.finfo(np.float32).eps)
+        self.assertIs(alignment.get_trellis, original_trellis)
+        self.assertIs(alignment.backtrack, original_backtrack)
+        self.assertEqual(spans[0]["command_buffers_per_run"], 2)
+        with self.assertRaises(ValueError):
+            with native_metal_ctc(alignment, [], self.binary, identity): alignment.get_trellis(emission, [-1])
+        self.assertIs(alignment.get_trellis, original_trellis)
+        self.assertIs(alignment.backtrack, original_backtrack)
+        with self.assertRaises(ValueError):
+            with native_metal_ctc(alignment, [], self.binary, "0" * 64): pass
+        self.assertIs(alignment.get_trellis, original_trellis)
 
     def save(self, path, emission, tokens, blank=0):
         np.savez(path, emission=emission.numpy(), tokens=np.asarray(tokens, dtype=np.int32), blank_id=np.asarray(blank, dtype=np.int32))
