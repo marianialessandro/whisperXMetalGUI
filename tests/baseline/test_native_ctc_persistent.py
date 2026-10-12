@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import struct
 from pathlib import Path
 import platform
 import subprocess
@@ -172,6 +173,59 @@ class PersistentNativeCTCTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "vocabulary_mismatch"):
             with fused_wildcard_preparation(3): emission[:, mask]
         self.assertNotIsInstance(emission[:, mask], DeferredWildcard)
+
+    def test_gpu_character_segments_match_cpython_compensated_means_bitwise(self):
+        generator = np.random.default_rng(71)
+        cases = [(torch.log_softmax(torch.from_numpy(generator.normal(size=(240, 32)).astype(np.float32)), dim=-1), generator.integers(1, 32, size=35).tolist(), 0, False), (torch.full((16, 4), -1.), [1, 4, 3, 4], 2, True)]
+        stress = torch.full((66, 3), -100000., dtype=torch.float32)
+        stress[0, 1] = 0
+        stress[1:65, 0] = float(np.log(1e-17))
+        stress[65, 2] = 0
+        cases.append((stress, [1, 2], 0, False))
+        for count in (31, 63, 127):
+            varied = torch.full((count + 2, 3), -100000., dtype=torch.float32)
+            varied[0, 1] = 0
+            varied[1:count + 1, 0] = torch.from_numpy(generator.uniform(-103, 0, size=count).astype(np.float32))
+            varied[count + 1, 2] = 0
+            cases.insert(0, (varied, [1, 2], 0, False))
+        with NativeCTC(self.library, self.identity) as context:
+            for emission, tokens, blank, wildcard in cases:
+                points, _ = context.compute_wildcard(emission.numpy(), np.asarray(tokens, dtype=np.int32), blank) if wildcard else context.compute(emission.numpy(), np.asarray(tokens, dtype=np.int32), blank)
+                original = alignment.merge_repeats([alignment.Point(*point) for point in points], "x" * len(tokens))
+                groups, record = context.compute_segments(emission.numpy(), np.asarray(tokens, dtype=np.int32), blank, wildcard)
+                self.assertEqual([(start, end) for start, end, score in groups], [(item.start, item.end) for item in original])
+                for group, reference in zip(groups, original): self.assertEqual(struct.pack("d", group[2]), struct.pack("d", reference.score))
+                self.assertEqual(record["logical_final_path_readback_bytes"], 0)
+                self.assertEqual(record["logical_character_segment_readback_bytes"], len(tokens) * 16)
+                self.assertEqual(record["gpu_kernels"][-1], "ctc_merge_repeats")
+                self.assertEqual(record["command_buffers_per_run"], 2)
+            values = [point[2] for point in points if point[0] == 0]
+            sequential = 0.
+            for value in values: sequential += value
+            self.assertNotEqual(sum(values), sequential)
+            impossible = np.full((8, 3), float("-inf"), dtype=np.float32)
+            impossible[:, 0] = 0
+            groups, _ = context.compute_segments(impossible, np.asarray([1, 2], dtype=np.int32))
+            self.assertIsNone(groups)
+
+    def test_character_segment_hook_preserves_labels_and_restores_on_failure(self):
+        emission = torch.tensor([[-3., -.1], [-.2, -2.], [-.1, -3.]], dtype=torch.float32)
+        originals = alignment.get_trellis, alignment.backtrack, alignment.merge_repeats
+        with NativeCTC(self.library, self.identity) as context:
+            records = []
+            with persistent_metal_ctc(alignment, records, context, character_segments=True):
+                trellis = alignment.get_trellis(emission, [1])
+                path = alignment.backtrack(trellis, emission, [1])
+                result = alignment.merge_repeats(path, "è")
+                self.assertEqual(result[0].label, "è")
+                self.assertEqual((result[0].start, result[0].end), (0, 1))
+                with self.assertRaises(ValueError): alignment.merge_repeats(path, "wrong")
+            self.assertEqual(records[0]["logical_final_path_readback_bytes"], 0)
+            with self.assertRaises(ValueError):
+                with persistent_metal_ctc(alignment, [], context, character_segments=True): alignment.get_trellis(emission, [-1])
+        self.assertIs(alignment.get_trellis, originals[0])
+        self.assertIs(alignment.backtrack, originals[1])
+        self.assertIs(alignment.merge_repeats, originals[2])
 
     def test_c_abi_lifetime_lengths_and_buffer_reuse_under_sanitizers(self):
         result = subprocess.run([str(self.harness), str(self.root / "tools/baseline/native_ctc.metal")], capture_output=True, text=True, timeout=30)

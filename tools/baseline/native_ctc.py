@@ -5,12 +5,17 @@ import hashlib
 from pathlib import Path
 import threading
 import time
+import sys
 
 from tools.baseline import manifest
 
 
 class Point(ct.Structure):
     _fields_ = [("token", ct.c_int32), ("frame", ct.c_int32), ("score", ct.c_float)]
+
+
+class Segment(ct.Structure):
+    _fields_ = [("start", ct.c_int32), ("end", ct.c_int32), ("score", ct.c_double)]
 
 
 class Result(ct.Structure):
@@ -54,7 +59,11 @@ class NativeCTC:
     def compute_wildcard(self, emission, tokens, blank=0):
         return self._compute(emission, tokens, blank, True)
 
-    def _compute(self, emission, tokens, blank, wildcard):
+    def compute_segments(self, emission, tokens, blank=0, wildcard=False):
+        if sys.version_info[:2] != (3, 12): raise ValueError("native_character_sum_runtime_not_supported")
+        return self._compute(emission, tokens, blank, wildcard, True)
+
+    def _compute(self, emission, tokens, blank, wildcard, segments=False):
         import numpy as np
         if not isinstance(emission, np.ndarray) or emission.dtype != np.float32 or emission.ndim != 2 or not isinstance(tokens, np.ndarray) or tokens.dtype != np.int32 or tokens.ndim != 1:
             raise ValueError("native_input_format_invalid")
@@ -68,18 +77,27 @@ class NativeCTC:
                 raise ValueError("native_context_closed")
             started = time.perf_counter_ns()
             emission, tokens = np.ascontiguousarray(emission), np.ascontiguousarray(tokens)
-            path, result, error = (Point * frames)(), Result(), ct.create_string_buffer(128)
-            function = self._library.wxctc_compute_wildcard if wildcard else self._library.wxctc_compute
-            if wildcard:
-                function.argtypes = self._library.wxctc_compute.argtypes
+            path, result, error = (Segment * count)() if segments else (Point * frames)(), Result(), ct.create_string_buffer(128)
+            if segments:
+                if ct.sizeof(Segment) != 16: raise ValueError("native_segment_abi_mismatch")
+                function = self._library.wxctc_compute_segments
+                function.argtypes = [ct.c_void_p, ct.POINTER(ct.c_float), ct.c_uint64, ct.POINTER(ct.c_int32), ct.c_uint64, ct.c_uint32, ct.c_uint32, ct.c_int32, ct.c_uint32, ct.POINTER(Segment), ct.c_uint32, ct.POINTER(Result), ct.POINTER(ct.c_char), ct.c_uint32]
                 function.restype = ct.c_int
-            status = function(self._context, emission.ctypes.data_as(ct.POINTER(ct.c_float)), emission.size, tokens.ctypes.data_as(ct.POINTER(ct.c_int32)), tokens.size, frames, vocabulary, blank, path, frames, ct.byref(result), error, len(error))
+                status = function(self._context, emission.ctypes.data_as(ct.POINTER(ct.c_float)), emission.size, tokens.ctypes.data_as(ct.POINTER(ct.c_int32)), tokens.size, frames, vocabulary, blank, int(wildcard), path, count, ct.byref(result), error, len(error))
+            else:
+                function = self._library.wxctc_compute_wildcard if wildcard else self._library.wxctc_compute
+                if wildcard:
+                    function.argtypes = self._library.wxctc_compute.argtypes
+                    function.restype = ct.c_int
+                status = function(self._context, emission.ctypes.data_as(ct.POINTER(ct.c_float)), emission.size, tokens.ctypes.data_as(ct.POINTER(ct.c_int32)), tokens.size, frames, vocabulary, blank, path, frames, ct.byref(result), error, len(error))
             if status:
                 raise ValueError(error.value.decode("ascii"))
             if result.abi_version != 1 or not -1 <= result.path_length <= frames:
                 raise ValueError("native_result_invalid")
-            points = None if result.path_length < 0 else [(path[i].token, path[i].frame, path[i].score) for i in range(result.path_length)]
-            return points, {"frames": frames, "tokens": count, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "logical_cpu_to_native_emission_bytes": emission.nbytes, "logical_final_path_readback_bytes": 4 + (0 if points is None else 12 * len(points)), "logical_intermediate_wildcard_readback_bytes": 0, "wildcard_fused": wildcard, "gpu_kernels": ["ctc_validate_wildcard", "ctc_expand_wildcard", "ctc_prefix", "ctc_trellis_compact", "ctc_backtrack_compact"] if wildcard else ["ctc_validate", "ctc_prefix", "ctc_trellis_compact", "ctc_backtrack_compact"], "physical_copy_bytes": None, "transport": "synchronous_in_memory_c_abi", "command_buffers_per_run": 2, "validation_wall_ns": result.validation_wall_ns, "computation_wall_ns": result.computation_wall_ns, "validation_gpu_seconds": result.validation_gpu_seconds, "computation_gpu_seconds": result.computation_gpu_seconds, "dp_logical_storage_bytes": result.dp_logical_bytes, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
+            points = None if result.path_length < 0 else ([(path[i].start, path[i].end, path[i].score) for i in range(count)] if segments else [(path[i].token, path[i].frame, path[i].score) for i in range(result.path_length)])
+            kernels = ["ctc_validate_wildcard", "ctc_expand_wildcard", "ctc_prefix", "ctc_trellis_compact", "ctc_backtrack_compact"] if wildcard else ["ctc_validate", "ctc_prefix", "ctc_trellis_compact", "ctc_backtrack_compact"]
+            if segments: kernels.append("ctc_merge_repeats")
+            return points, {"frames": frames, "tokens": count, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "logical_cpu_to_native_emission_bytes": emission.nbytes, "logical_final_path_readback_bytes": 0 if segments else 4 + (0 if points is None else 12 * len(points)), "logical_character_segment_readback_bytes": 0 if not segments or points is None else 16 * count, "logical_control_path_length_bytes": 4, "character_segments_gpu": segments, "logical_intermediate_wildcard_readback_bytes": 0, "wildcard_fused": wildcard, "gpu_kernels": kernels, "physical_copy_bytes": None, "transport": "synchronous_in_memory_c_abi", "command_buffers_per_run": 2, "validation_wall_ns": result.validation_wall_ns, "computation_wall_ns": result.computation_wall_ns, "validation_gpu_seconds": result.validation_gpu_seconds, "computation_gpu_seconds": result.computation_gpu_seconds, "dp_logical_storage_bytes": result.dp_logical_bytes, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
 
     def row_max(self, emission):
         import numpy as np

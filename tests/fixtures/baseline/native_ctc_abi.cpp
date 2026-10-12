@@ -35,6 +35,11 @@ int main(int argc, char** argv) {
     assert(result.path_length > 0 && path[0].frame == 0 && path[0].token == 0);
     assert(wxctc_compute_wildcard(context, emission, 6, wildcard, 1, 3, 2, 0, path, 2, &result, error, sizeof(error)) != 0);
     assert(wxctc_compute_wildcard(context, emission, 6, wildcard, 1, 3, 2, 2, path, 3, &result, error, sizeof(error)) != 0);
+    wxctc_segment segments[1]{};
+    assert(wxctc_compute_segments(context, emission, 6, tokens, 1, 3, 2, 0, 0, segments, 0, &result, error, sizeof(error)) != 0);
+    assert(wxctc_compute_segments(context, emission, 6, tokens, 1, 3, 2, 0, 2, segments, 1, &result, error, sizeof(error)) != 0);
+    assert(wxctc_compute_segments(context, emission, 6, tokens, 1, 3, 2, 0, 0, segments, 1, &result, error, sizeof(error)) == 0);
+    assert(result.path_length == 1 && segments[0].start == 0 && segments[0].end == 1 && segments[0].score > 0);
     uint64_t grown = 0;
     for (int iteration = 0; iteration < 8; ++iteration) {
         std::vector<float> large(256 * 4, -1);
