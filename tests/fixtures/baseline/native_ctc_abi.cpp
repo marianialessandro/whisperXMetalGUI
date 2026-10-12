@@ -22,6 +22,14 @@ int main(int argc, char** argv) {
     assert(result.path_length == -1);
     assert(wxctc_compute(context, emission, 5, tokens, 1, 3, 2, 0, path, 3, &result, error, sizeof(error)) != 0);
     assert(wxctc_compute(context, emission, 6, tokens, 1, 3, 2, -1, path, 3, &result, error, sizeof(error)) != 0);
+    float maxima[3]{123, 123, 123};
+    int64_t indices[3]{123, 123, 123};
+    wxctc_max_result maximum_result{};
+    assert(wxctc_row_max(context, emission, 6, 3, 2, maxima, indices, 2, &maximum_result, error, sizeof(error)) != 0);
+    assert(maxima[0] == 123 && indices[0] == 123);
+    assert(wxctc_row_max(context, emission, 5, 3, 2, maxima, indices, 3, &maximum_result, error, sizeof(error)) != 0);
+    assert(wxctc_row_max(context, emission, 6, 3, 2, maxima, indices, 3, &maximum_result, error, sizeof(error)) == 0);
+    assert(maximum_result.abi_version == 1 && maxima[0] == -.1f && indices[0] == 1 && indices[1] == 0);
     uint64_t grown = 0;
     for (int iteration = 0; iteration < 8; ++iteration) {
         std::vector<float> large(256 * 4, -1);

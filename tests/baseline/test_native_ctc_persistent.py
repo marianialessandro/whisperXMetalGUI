@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import whisperx.alignment as alignment
 from tools.baseline.native_ctc import NativeCTC
-from tools.baseline.ctc_alignment_trial import persistent_metal_ctc
+from tools.baseline.ctc_alignment_trial import persistent_metal_ctc, native_wildcard_max
 
 
 @unittest.skipUnless(platform.system() == "Darwin" and torch.backends.mps.is_available(), "Apple Metal hardware required")
@@ -83,6 +83,46 @@ class PersistentNativeCTCTests(unittest.TestCase):
             self.assertIs(alignment.backtrack, originals[1])
             self.assertEqual(spans[0]["transport"], "synchronous_in_memory_c_abi")
         with self.assertRaisesRegex(ValueError, "native_library_hash_mismatch"): NativeCTC(self.library, "0" * 64)
+
+    def test_row_max_preserves_exact_values_first_indices_and_buffer_reuse(self):
+        generator = np.random.default_rng(57)
+        cases = [torch.tensor([[-3., -.1, -.1], [float("-inf"), float("-inf"), float("-inf")], [-0., 0., -1.]], dtype=torch.float32), torch.from_numpy(-np.abs(generator.normal(size=(65, 513)).astype(np.float32))), torch.full((2, 1), -2.)]
+        with NativeCTC(self.library, self.identity) as context:
+            capacity = 0
+            for emission in cases:
+                reference = emission.max(dim=1)
+                values, indices, record = context.row_max(emission.numpy())
+                np.testing.assert_array_equal(values.view(np.uint32), reference.values.numpy().view(np.uint32))
+                np.testing.assert_array_equal(indices, reference.indices.numpy())
+                self.assertGreaterEqual(record["allocated_shared_buffer_bytes"], capacity)
+                capacity = record["allocated_shared_buffer_bytes"]
+                self.assertEqual(record["kernel"], "ctc_row_max")
+                self.assertGreater(record["computation_gpu_seconds"], 0)
+            for value in [float("nan"), float("inf"), 1.]:
+                with self.assertRaisesRegex(ValueError, "input_values_invalid"): context.row_max(np.full((3, 2), value, dtype=np.float32))
+            self.compare(context, torch.tensor([[-3., -.1], [-.2, -2.], [-.1, -3.]], dtype=torch.float32), [1])
+            with self.assertRaises(ValueError): context.row_max(np.empty((3, 0), dtype=np.float32))
+        with self.assertRaisesRegex(ValueError, "native_context_closed"): context.row_max(np.zeros((3, 2), dtype=np.float32))
+
+    def test_scoped_wildcard_dispatch_preserves_gather_and_restores_after_error(self):
+        emission = torch.tensor([[-.1, -3., -1., -1.], [-.2, -2., -.1, -.1]], dtype=torch.float32)
+        mask = torch.tensor([False, True, True, True])
+        original = emission[:, mask].max(dim=1)
+        with NativeCTC(self.library, self.identity) as context:
+            spans = []
+            with native_wildcard_max(context, spans):
+                actual = emission[:, mask].max(dim=1)
+                torch.testing.assert_close(actual.values, original.values, rtol=0, atol=0)
+                self.assertTrue(torch.equal(actual.indices, original.indices))
+                emission.max(dim=0)
+                emission.max(dim=1, keepdim=True)
+                emission.double().max(dim=1)
+            self.assertEqual(len(spans), 1)
+            with self.assertRaises(ValueError):
+                with native_wildcard_max(context, spans): torch.full((3, 2), float("nan")).max(dim=1)
+            before = len(spans)
+            emission.max(dim=1)
+            self.assertEqual(len(spans), before)
 
     def test_c_abi_lifetime_lengths_and_buffer_reuse_under_sanitizers(self):
         result = subprocess.run([str(self.harness), str(self.root / "tools/baseline/native_ctc.metal")], capture_output=True, text=True, timeout=30)

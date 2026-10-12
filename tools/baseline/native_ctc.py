@@ -17,6 +17,10 @@ class Result(ct.Structure):
     _fields_ = [("path_length", ct.c_int32), ("abi_version", ct.c_uint32), ("validation_wall_ns", ct.c_uint64), ("computation_wall_ns", ct.c_uint64), ("validation_gpu_seconds", ct.c_double), ("computation_gpu_seconds", ct.c_double), ("dp_logical_bytes", ct.c_uint64), ("allocated_shared_buffer_bytes", ct.c_uint64)]
 
 
+class MaxResult(ct.Structure):
+    _fields_ = [("abi_version", ct.c_uint32), ("reserved", ct.c_uint32), ("validation_wall_ns", ct.c_uint64), ("computation_wall_ns", ct.c_uint64), ("validation_gpu_seconds", ct.c_double), ("computation_gpu_seconds", ct.c_double), ("allocated_shared_buffer_bytes", ct.c_uint64)]
+
+
 class NativeCTC:
     def __init__(self, library, expected_sha256):
         started = time.perf_counter_ns()
@@ -65,6 +69,29 @@ class NativeCTC:
                 raise ValueError("native_result_invalid")
             points = None if result.path_length < 0 else [(path[i].token, path[i].frame, path[i].score) for i in range(result.path_length)]
             return points, {"frames": frames, "tokens": count, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "logical_cpu_to_native_emission_bytes": emission.nbytes, "logical_final_path_readback_bytes": 4 + (0 if points is None else 12 * len(points)), "physical_copy_bytes": None, "transport": "synchronous_in_memory_c_abi", "command_buffers_per_run": 2, "validation_wall_ns": result.validation_wall_ns, "computation_wall_ns": result.computation_wall_ns, "validation_gpu_seconds": result.validation_gpu_seconds, "computation_gpu_seconds": result.computation_gpu_seconds, "dp_logical_storage_bytes": result.dp_logical_bytes, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
+
+    def row_max(self, emission):
+        import numpy as np
+        if not isinstance(emission, np.ndarray) or emission.dtype != np.float32 or emission.ndim != 2:
+            raise ValueError("native_input_format_invalid")
+        frames, vocabulary = emission.shape
+        if not 0 < frames <= 32768 or not 0 < vocabulary <= 1 << 24 or emission.nbytes > 64 * 1024 * 1024:
+            raise ValueError("native_input_shape_invalid")
+        with self._lock:
+            if not self._context.value:
+                raise ValueError("native_context_closed")
+            started = time.perf_counter_ns()
+            function = self._library.wxctc_row_max
+            function.argtypes = [ct.c_void_p, ct.POINTER(ct.c_float), ct.c_uint64, ct.c_uint32, ct.c_uint32, ct.POINTER(ct.c_float), ct.POINTER(ct.c_int64), ct.c_uint32, ct.POINTER(MaxResult), ct.POINTER(ct.c_char), ct.c_uint32]
+            function.restype = ct.c_int
+            if ct.sizeof(MaxResult) != 48: raise ValueError("native_row_max_abi_mismatch")
+            emission = np.ascontiguousarray(emission)
+            values, indices = np.empty(frames, dtype=np.float32), np.empty(frames, dtype=np.int64)
+            result, error = MaxResult(), ct.create_string_buffer(128)
+            status = function(self._context, emission.ctypes.data_as(ct.POINTER(ct.c_float)), emission.size, frames, vocabulary, values.ctypes.data_as(ct.POINTER(ct.c_float)), indices.ctypes.data_as(ct.POINTER(ct.c_int64)), frames, ct.byref(result), error, len(error))
+            if status: raise ValueError(error.value.decode("ascii"))
+            if result.abi_version != 1: raise ValueError("native_result_invalid")
+            return values, indices, {"scope": "experimental_wildcard_row_max", "frames": frames, "vocabulary": vocabulary, "kernel": "ctc_row_max", "dispatch_completed": True, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "logical_cpu_to_native_emission_bytes": emission.nbytes, "logical_output_readback_bytes": frames * 12, "physical_copy_bytes": None, "transport": "synchronous_in_memory_c_abi", "command_buffers_per_run": 2, "validation_wall_ns": result.validation_wall_ns, "computation_wall_ns": result.computation_wall_ns, "validation_gpu_seconds": result.validation_gpu_seconds, "computation_gpu_seconds": result.computation_gpu_seconds, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
 
     def close(self):
         with self._lock:

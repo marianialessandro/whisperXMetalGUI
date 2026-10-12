@@ -5,6 +5,7 @@
 struct wxctc_context { NativeCTCContext core; wxctc_context(const char* shader, uint64_t size) : core(shader, size, true, true) {} };
 static_assert(sizeof(wxctc_point) == 12);
 static_assert(sizeof(wxctc_result) == 56);
+static_assert(sizeof(wxctc_max_result) == 48);
 
 static void set_error(char* destination, uint32_t capacity, const char* code) {
     if (destination != nullptr && capacity > 0) { std::strncpy(destination, code, capacity - 1); destination[capacity - 1] = 0; }
@@ -35,6 +36,21 @@ int wxctc_compute(wxctc_context* context, const float* emission, uint64_t emissi
             return 0;
         } catch (const InventoryError& error) { set_error(error_code, error_capacity, error.what()); return 1; }
         catch (...) { set_error(error_code, error_capacity, "native_ctc_execution_failed"); return 1; }
+    }
+}
+
+int wxctc_row_max(wxctc_context* context, const float* emission, uint64_t emission_elements, uint32_t frames, uint32_t vocabulary, float* values, int64_t* indices, uint32_t output_capacity, wxctc_max_result* result, char* error_code, uint32_t error_capacity) {
+    @autoreleasepool {
+        set_error(error_code, error_capacity, "");
+        if (result != nullptr) { *result = {}; result->abi_version = 1; }
+        try {
+            require(context != nullptr && result != nullptr && values != nullptr && indices != nullptr && output_capacity >= frames, "output_or_context_invalid");
+            auto completed = context->core.row_max(emission, emission_elements, frames, vocabulary);
+            for (uint32_t i = 0; i < frames; ++i) { values[i] = completed.values[i]; indices[i] = completed.indices[i]; }
+            *result = {1, 0, completed.timings[0].wall_ns, completed.timings[1].wall_ns, completed.timings[0].gpu_seconds, completed.timings[1].gpu_seconds, completed.allocated_bytes};
+            return 0;
+        } catch (const InventoryError& error) { set_error(error_code, error_capacity, error.what()); return 1; }
+        catch (...) { set_error(error_code, error_capacity, "native_row_max_execution_failed"); return 1; }
     }
 }
 

@@ -3,6 +3,28 @@ using namespace metal;
 
 struct Dimensions { uint frames; uint vocabulary; uint count; int blank; };
 
+kernel void ctc_row_max(device const float* emission [[buffer(0)]], constant Dimensions& dimensions [[buffer(1)]], device float* values [[buffer(2)]], device uint* indices [[buffer(3)]], uint frame [[threadgroup_position_in_grid]], uint lane [[thread_position_in_threadgroup]]) {
+    threadgroup float scores[256];
+    threadgroup uint columns[256];
+    float best = -INFINITY;
+    uint column = UINT_MAX;
+    for (uint j = lane; j < dimensions.vocabulary; j += 256) {
+        float value = emission[frame * dimensions.vocabulary + j];
+        if (value > best || (value == best && j < column)) { best = value; column = j; }
+    }
+    scores[lane] = best; columns[lane] = column;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride /= 2) {
+        if (lane < stride) {
+            float other = scores[lane + stride];
+            uint index = columns[lane + stride];
+            if (other > scores[lane] || (other == scores[lane] && index < columns[lane])) { scores[lane] = other; columns[lane] = index; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) { values[frame] = scores[0]; indices[frame] = columns[0]; }
+}
+
 kernel void ctc_validate(device const float* emission [[buffer(0)]], device const int* tokens [[buffer(1)]], constant Dimensions& dimensions [[buffer(2)]], device atomic_uint* invalid [[buffer(3)]], uint index [[thread_position_in_grid]]) {
     if (index == 0 && (dimensions.blank < 0 || dimensions.blank >= int(dimensions.vocabulary))) atomic_fetch_or_explicit(invalid, 1u, memory_order_relaxed);
     if (index < dimensions.frames * dimensions.vocabulary && (!(emission[index] <= 0) || isnan(emission[index]))) atomic_fetch_or_explicit(invalid, 1u, memory_order_relaxed);
