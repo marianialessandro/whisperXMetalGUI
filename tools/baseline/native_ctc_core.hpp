@@ -48,10 +48,12 @@ class NativeCTCContext {
     id<MTLCommandQueue> queue_;
     id<MTLLibrary> library_;
     id<MTLComputePipelineState> max_pipeline_;
+    id<MTLComputePipelineState> wildcard_validate_, wildcard_expand_;
     NSMutableArray<id<MTLComputePipelineState>>* pipelines_;
     NSArray<NSString*>* names_;
     id<MTLBuffer> e_, t_, invalid_, prefix_, rows_, path_, decisions_, endpoint_;
     id<MTLBuffer> max_values_, max_indices_;
+    id<MTLBuffer> expanded_;
     bool compact_, batched_;
     std::mutex mutex_;
 
@@ -60,7 +62,15 @@ class NativeCTCContext {
         require(buffer != nil, "metal_allocation_failed");
     }
 
-    uint64_t allocated_bytes() const { return e_.length + t_.length + invalid_.length + prefix_.length + rows_.length + path_.length + decisions_.length + endpoint_.length + max_values_.length + max_indices_.length; }
+    uint64_t allocated_bytes() const { return e_.length + t_.length + invalid_.length + prefix_.length + rows_.length + path_.length + decisions_.length + endpoint_.length + max_values_.length + max_indices_.length + expanded_.length; }
+
+    void pipeline(id<MTLComputePipelineState> __strong& state, NSString* name) {
+        if (state != nil) return;
+        id<MTLFunction> function = [library_ newFunctionWithName:name]; require(function != nil, "optional_shader_function_missing");
+        NSError* error = nil;
+        state = [device_ newComputePipelineStateWithFunction:function error:&error];
+        require(state != nil && state.maxTotalThreadsPerThreadgroup >= 256, "optional_pipeline_creation_failed");
+    }
 
 public:
     NativeCTCContext(const char* shader, uint64_t shader_bytes, bool compact, bool batched) : compact_(compact), batched_(batched) {
@@ -81,12 +91,18 @@ public:
         queue_ = [device_ newCommandQueue]; require(queue_ != nil, "metal_queue_creation_failed");
     }
 
-    NativeResult compute(const float* emission, uint64_t emission_elements, const int32_t* tokens, uint64_t token_elements, const Dimensions& d) {
+    NativeResult compute(const float* emission, uint64_t emission_elements, const int32_t* tokens, uint64_t token_elements, const Dimensions& source, bool wildcard = false) {
         std::lock_guard<std::mutex> guard(mutex_);
+        Dimensions d = source;
         require(emission != nullptr && tokens != nullptr && d.frames > 0 && d.frames <= 32768 && d.vocabulary > 0 && d.vocabulary <= uint64_t(1) << 24 && d.count > 0 && d.count <= d.frames, "input_shape_invalid");
         uint64_t elements = uint64_t(d.frames) * d.vocabulary, cells = uint64_t(d.frames + 1) * (d.count + 1);
         require(emission_elements == elements && token_elements == d.count, "input_lengths_invalid");
         require(elements * 4 <= 64 * 1024 * 1024 && cells <= 16 * 1024 * 1024, "input_budget_invalid");
+        if (wildcard) {
+            require(batched_ && d.vocabulary >= 2 && uint64_t(d.frames) * (d.vocabulary + 1) * 4 <= 64 * 1024 * 1024, "wildcard_shape_or_budget_invalid");
+            pipeline(wildcard_validate_, @"ctc_validate_wildcard"); pipeline(wildcard_expand_, @"ctc_expand_wildcard");
+            reserve(expanded_, uint64_t(d.frames) * (d.vocabulary + 1) * 4);
+        }
         uint64_t dp_bytes = compact_ ? 2 * uint64_t(d.count + 1) * 4 : cells * 4;
         reserve(e_, elements * 4); reserve(t_, uint64_t(d.count) * 4); reserve(invalid_, 4);
         reserve(prefix_, uint64_t(d.frames + 1) * 4); reserve(rows_, dp_bytes); reserve(path_, (1 + uint64_t(d.frames) * 3) * 4);
@@ -94,16 +110,19 @@ public:
         std::memcpy(e_.contents, emission, elements * 4); std::memcpy(t_.contents, tokens, uint64_t(d.count) * 4);
         *static_cast<uint32_t*>(invalid_.contents) = 0;
         std::vector<Timing> timings;
-        timings.push_back(execute(queue_, pipelines_[0], @[e_, t_, invalid_], d, 2, elements, 256, names_[0]));
+        timings.push_back(execute(queue_, wildcard ? wildcard_validate_ : pipelines_[0], @[e_, t_, invalid_], d, 2, elements, 256, wildcard ? @"ctc_validate_wildcard" : names_[0]));
         require(*static_cast<uint32_t*>(invalid_.contents) == 0, "input_values_invalid");
-        NSArray<id<MTLBuffer>>* trellis = compact_ ? @[e_, t_, prefix_, rows_, decisions_, endpoint_] : @[e_, t_, prefix_, rows_];
-        NSArray<id<MTLBuffer>>* backtrack = compact_ ? @[e_, t_, rows_, path_, decisions_, endpoint_] : @[e_, t_, rows_, path_];
+        id<MTLBuffer> input = wildcard ? expanded_ : e_;
+        if (wildcard) ++d.vocabulary;
+        NSArray<id<MTLBuffer>>* trellis = compact_ ? @[input, t_, prefix_, rows_, decisions_, endpoint_] : @[input, t_, prefix_, rows_];
+        NSArray<id<MTLBuffer>>* backtrack = compact_ ? @[input, t_, rows_, path_, decisions_, endpoint_] : @[input, t_, rows_, path_];
         if (batched_) {
             auto started = std::chrono::steady_clock::now();
             id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "metal_command_creation_failed");
-            command.label = @"ctc_prefix_trellis_backtrack";
+            command.label = wildcard ? @"ctc_wildcard_prefix_trellis_backtrack" : @"ctc_prefix_trellis_backtrack";
             // Default tracked buffers preserve dependencies between sequential encoders.
-            encode(command, pipelines_[1], @[e_, prefix_], d, 1, 1, 1, names_[1]);
+            if (wildcard) encode(command, wildcard_expand_, @[e_, expanded_], source, 1, uint64_t(d.frames) * 256, 256, @"ctc_expand_wildcard");
+            encode(command, pipelines_[1], @[input, prefix_], d, 1, 1, 1, names_[1]);
             encode(command, pipelines_[2], trellis, d, 2, 256, 256, names_[2]);
             encode(command, pipelines_[3], backtrack, d, 2, 1, 1, names_[3]);
             timings.push_back(complete(command, started));

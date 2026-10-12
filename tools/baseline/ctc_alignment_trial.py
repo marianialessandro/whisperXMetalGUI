@@ -87,8 +87,14 @@ def native_metal_ctc(alignment, spans, binary, binary_sha256):
 @contextlib.contextmanager
 def persistent_metal_ctc(alignment, spans, context):
     import numpy as np
+    from tools.baseline.native_ctc_fused import DeferredWildcard
     original_trellis, original_backtrack = alignment.get_trellis, alignment.backtrack
     def trellis(emission, tokens, blank_id=0):
+        if isinstance(emission, DeferredWildcard):
+            if emission.kind != "expanded" or blank_id != emission.blank: raise ValueError("fused_wildcard_metadata_invalid")
+            path, record = context.compute_wildcard(emission.base_emission.detach().numpy(), np.asarray(tokens, dtype=np.int32), blank_id)
+            spans.append(record)
+            return MetalTrellis(path, emission.shape[0], len(tokens))
         if emission.device.type != "cpu" or str(emission.dtype) != "torch.float32":
             raise ValueError("trial_expected_original_cpu_float32_boundary")
         path, record = context.compute(emission.detach().numpy(), np.asarray(tokens, dtype=np.int32), blank_id)
@@ -141,6 +147,7 @@ def main(argv=None):
     parser.add_argument("--native-library", type=Path, help="Explicit prebuilt native CTC dylib, required with native-persistent backend.")
     parser.add_argument("--native-library-sha256", help="Expected SHA256 of the native dylib, required with native-persistent backend.")
     parser.add_argument("--native-wildcard-max", action="store_true", help="Optional trial-only interception of CPU FP32 max(dim=1) using native Metal; requires native-persistent. Mask/gather/concatenation and max readback still use the original CPU boundary.")
+    parser.add_argument("--native-fused-wildcard", action="store_true", help="Optional trial-only deferred wildcard preparation; native Metal expands the source emission and runs CTC without intermediate wildcard readback. Requires native-persistent; excludes --native-wildcard-max.")
     args = parser.parse_args(argv)
     if not 1 <= args.replicas <= 10: parser.error("replicas must be between 1 and 10")
     if args.ctc_backend == "native" and (args.native_binary is None or args.native_binary_sha256 is None): parser.error("native backend requires binary and its expected SHA256")
@@ -148,6 +155,8 @@ def main(argv=None):
     if args.ctc_backend == "native-persistent" and (args.native_library is None or args.native_library_sha256 is None): parser.error("native-persistent backend requires library and its expected SHA256")
     if args.ctc_backend != "native-persistent" and (args.native_library is not None or args.native_library_sha256 is not None): parser.error("native library options require --ctc-backend native-persistent")
     if args.native_wildcard_max and args.ctc_backend != "native-persistent": parser.error("--native-wildcard-max requires --ctc-backend native-persistent")
+    if args.native_fused_wildcard and args.ctc_backend != "native-persistent": parser.error("--native-fused-wildcard requires --ctc-backend native-persistent")
+    if args.native_fused_wildcard and args.native_wildcard_max: parser.error("wildcard modes are mutually exclusive")
     try:
         if args.output_dir.exists() or manifest.sha256(args.audio) != args.audio_sha256 or manifest.sha256(args.segments) != args.segments_sha256:
             raise ValueError("trial_inputs_or_destination_invalid")
@@ -169,6 +178,9 @@ def main(argv=None):
         @contextlib.contextmanager
         def candidate_context(records, maximum_records):
             with contextlib.ExitStack() as scopes:
+                if args.native_fused_wildcard:
+                    from tools.baseline.native_ctc_fused import fused_wildcard_preparation
+                    scopes.enter_context(fused_wildcard_preparation(max(metadata["dictionary"].values()) + 1))
                 if args.native_wildcard_max: scopes.enter_context(native_wildcard_max(persistent, maximum_records))
                 if args.ctc_backend == "native-persistent": scopes.enter_context(persistent_metal_ctc(alignment, records, persistent))
                 else: scopes.enter_context(native_metal_ctc(alignment, records, args.native_binary, args.native_binary_sha256) if args.ctc_backend == "native" else metal_ctc(alignment, records))
@@ -210,9 +222,12 @@ def main(argv=None):
         report["native_context_initialization_wall_ns"] = native_setup_ns
         report["native_wildcard_max_enabled"], report["wildcard_spans"] = args.native_wildcard_max, wildcard_spans
         report["native_wildcard_max_dispatch_count"] = len(wildcard_spans)
+        report["native_fused_wildcard_enabled"] = args.native_fused_wildcard
+        report["native_fused_wildcard_dispatch_count"] = sum(record.get("wildcard_fused") is True for record in spans)
         if args.ctc_backend == "native": report["residuals"][1] = "private_npz_and_native_process_startup_per_segment"
         if args.ctc_backend == "native-persistent": report["residuals"][1] = "cpu_to_native_shared_buffer_copy_per_segment"
         if args.native_wildcard_max: report["residuals"][-1] = "cpu_wildcard_mask_gather_concat_and_max_readback"
+        if args.native_fused_wildcard: report["residuals"][-1] = "cpu_wildcard_mask_and_token_metadata"
         with (args.output_dir / "comparison.json").open("x") as output: json.dump(report, output, indent=2)
         print(json.dumps({key: value for key, value in report.items() if key not in ("ctc_spans", "wildcard_spans")}))
         return 0 if all(matches) else 2

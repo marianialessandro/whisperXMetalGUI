@@ -13,6 +13,7 @@ import torch
 import whisperx.alignment as alignment
 from tools.baseline.native_ctc import NativeCTC
 from tools.baseline.ctc_alignment_trial import persistent_metal_ctc, native_wildcard_max
+from tools.baseline.native_ctc_fused import DeferredWildcard, fused_wildcard_preparation
 
 
 @unittest.skipUnless(platform.system() == "Darwin" and torch.backends.mps.is_available(), "Apple Metal hardware required")
@@ -123,6 +124,54 @@ class PersistentNativeCTCTests(unittest.TestCase):
             before = len(spans)
             emission.max(dim=1)
             self.assertEqual(len(spans), before)
+
+    def test_fused_wildcard_matches_explicit_original_expansion_without_intermediate_readback(self):
+        generator = np.random.default_rng(61)
+        cases = [(torch.full((16, 4), -1.), [1, 4, 3, 4], 2), (torch.log_softmax(torch.from_numpy(generator.normal(size=(80, 513)).astype(np.float32)), dim=-1), [513, 1, 513, 299, 4], 0), (torch.full((5, 3), float("-inf")), [1, 3], 1)]
+        with NativeCTC(self.library, self.identity) as context:
+            for emission, tokens, blank in cases:
+                mask = torch.ones(emission.shape[1], dtype=torch.bool)
+                mask[blank] = False
+                extended = torch.cat([emission, emission[:, mask].max(dim=1).values[:, None]], dim=1)
+                expected = alignment.backtrack(alignment.get_trellis(extended, tokens, blank), extended, tokens, blank)
+                actual, record = context.compute_wildcard(emission.numpy(), np.asarray(tokens, dtype=np.int32), blank)
+                if expected is None: self.assertIsNone(actual)
+                else:
+                    self.assertEqual([(p[0], p[1]) for p in actual], [(p.token_index, p.time_index) for p in expected])
+                    for point, reference in zip(actual, expected): self.assertAlmostEqual(point[2], reference.score, delta=16 * np.finfo(np.float32).eps)
+                self.assertEqual(record["logical_intermediate_wildcard_readback_bytes"], 0)
+                self.assertEqual(record["logical_cpu_to_native_emission_bytes"], emission.numel() * 4)
+                self.assertEqual(record["command_buffers_per_run"], 2)
+                self.assertTrue(record["wildcard_fused"])
+            for tokens, blank in [([5], 0), ([-1], 0), ([4], 4)]:
+                with self.assertRaisesRegex(ValueError, "input_values_invalid"): context.compute_wildcard(np.zeros((6, 4), dtype=np.float32), np.asarray(tokens, dtype=np.int32), blank)
+            self.compare(context, torch.tensor([[-3., -.1], [-.2, -2.], [-.1, -3.]], dtype=torch.float32), [1])
+
+    def test_deferred_preparation_runs_fused_ctc_and_refuses_unmaterialized_values(self):
+        emission = torch.tensor([[-3., -.1], [-.2, -2.], [-.1, -3.]], dtype=torch.float32)
+        mask = torch.tensor([False, True])
+        explicit = torch.cat([emission, emission[:, mask].max(dim=1).values[:, None]], dim=1)
+        expected = alignment.backtrack(alignment.get_trellis(explicit, [2]), explicit, [2])
+        with NativeCTC(self.library, self.identity) as context:
+            spans = []
+            with persistent_metal_ctc(alignment, spans, context), fused_wildcard_preparation(2):
+                selected = emission[:, mask]
+                self.assertIsInstance(selected, DeferredWildcard)
+                maximum = selected.max(dim=1)
+                with self.assertRaises(ValueError): maximum.values.sum()
+                with self.assertRaises(ValueError): maximum.indices.sum()
+                extended = torch.cat([emission, maximum.values.unsqueeze(1)], dim=1)
+                self.assertEqual(extended.shape, explicit.shape)
+                trellis = alignment.get_trellis(extended, [2])
+                actual = alignment.backtrack(trellis, extended, [2])
+                self.assertEqual([(p.token_index, p.time_index) for p in actual], [(p.token_index, p.time_index) for p in expected])
+                with self.assertRaisesRegex(ValueError, "base_identity_mismatch"): torch.cat([emission.clone(), maximum.values.unsqueeze(1)], dim=1)
+            self.assertEqual(spans[0]["logical_intermediate_wildcard_readback_bytes"], 0)
+            self.assertTrue(spans[0]["wildcard_fused"])
+        self.assertNotIsInstance(emission[:, mask], DeferredWildcard)
+        with self.assertRaisesRegex(ValueError, "vocabulary_mismatch"):
+            with fused_wildcard_preparation(3): emission[:, mask]
+        self.assertNotIsInstance(emission[:, mask], DeferredWildcard)
 
     def test_c_abi_lifetime_lengths_and_buffer_reuse_under_sanitizers(self):
         result = subprocess.run([str(self.harness), str(self.root / "tools/baseline/native_ctc.metal")], capture_output=True, text=True, timeout=30)

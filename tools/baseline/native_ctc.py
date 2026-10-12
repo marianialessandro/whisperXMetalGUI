@@ -49,6 +49,12 @@ class NativeCTC:
         self.initialization_wall_ns = time.perf_counter_ns() - started
 
     def compute(self, emission, tokens, blank=0):
+        return self._compute(emission, tokens, blank, False)
+
+    def compute_wildcard(self, emission, tokens, blank=0):
+        return self._compute(emission, tokens, blank, True)
+
+    def _compute(self, emission, tokens, blank, wildcard):
         import numpy as np
         if not isinstance(emission, np.ndarray) or emission.dtype != np.float32 or emission.ndim != 2 or not isinstance(tokens, np.ndarray) or tokens.dtype != np.int32 or tokens.ndim != 1:
             raise ValueError("native_input_format_invalid")
@@ -56,19 +62,24 @@ class NativeCTC:
         count = len(tokens)
         if not 0 < count <= frames <= 32768 or not 0 < vocabulary <= 1 << 24 or emission.nbytes > 64 * 1024 * 1024 or (frames + 1) * (count + 1) > 16 * 1024 * 1024 or type(blank) is not int or not -(1 << 31) <= blank < 1 << 31:
             raise ValueError("native_input_shape_invalid")
+        if wildcard and (vocabulary < 2 or frames * (vocabulary + 1) * 4 > 64 * 1024 * 1024): raise ValueError("native_wildcard_shape_invalid")
         with self._lock:
             if not self._context.value:
                 raise ValueError("native_context_closed")
             started = time.perf_counter_ns()
             emission, tokens = np.ascontiguousarray(emission), np.ascontiguousarray(tokens)
             path, result, error = (Point * frames)(), Result(), ct.create_string_buffer(128)
-            status = self._library.wxctc_compute(self._context, emission.ctypes.data_as(ct.POINTER(ct.c_float)), emission.size, tokens.ctypes.data_as(ct.POINTER(ct.c_int32)), tokens.size, frames, vocabulary, blank, path, frames, ct.byref(result), error, len(error))
+            function = self._library.wxctc_compute_wildcard if wildcard else self._library.wxctc_compute
+            if wildcard:
+                function.argtypes = self._library.wxctc_compute.argtypes
+                function.restype = ct.c_int
+            status = function(self._context, emission.ctypes.data_as(ct.POINTER(ct.c_float)), emission.size, tokens.ctypes.data_as(ct.POINTER(ct.c_int32)), tokens.size, frames, vocabulary, blank, path, frames, ct.byref(result), error, len(error))
             if status:
                 raise ValueError(error.value.decode("ascii"))
             if result.abi_version != 1 or not -1 <= result.path_length <= frames:
                 raise ValueError("native_result_invalid")
             points = None if result.path_length < 0 else [(path[i].token, path[i].frame, path[i].score) for i in range(result.path_length)]
-            return points, {"frames": frames, "tokens": count, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "logical_cpu_to_native_emission_bytes": emission.nbytes, "logical_final_path_readback_bytes": 4 + (0 if points is None else 12 * len(points)), "physical_copy_bytes": None, "transport": "synchronous_in_memory_c_abi", "command_buffers_per_run": 2, "validation_wall_ns": result.validation_wall_ns, "computation_wall_ns": result.computation_wall_ns, "validation_gpu_seconds": result.validation_gpu_seconds, "computation_gpu_seconds": result.computation_gpu_seconds, "dp_logical_storage_bytes": result.dp_logical_bytes, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
+            return points, {"frames": frames, "tokens": count, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "logical_cpu_to_native_emission_bytes": emission.nbytes, "logical_final_path_readback_bytes": 4 + (0 if points is None else 12 * len(points)), "logical_intermediate_wildcard_readback_bytes": 0, "wildcard_fused": wildcard, "gpu_kernels": ["ctc_validate_wildcard", "ctc_expand_wildcard", "ctc_prefix", "ctc_trellis_compact", "ctc_backtrack_compact"] if wildcard else ["ctc_validate", "ctc_prefix", "ctc_trellis_compact", "ctc_backtrack_compact"], "physical_copy_bytes": None, "transport": "synchronous_in_memory_c_abi", "command_buffers_per_run": 2, "validation_wall_ns": result.validation_wall_ns, "computation_wall_ns": result.computation_wall_ns, "validation_gpu_seconds": result.validation_gpu_seconds, "computation_gpu_seconds": result.computation_gpu_seconds, "dp_logical_storage_bytes": result.dp_logical_bytes, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
 
     def row_max(self, emission):
         import numpy as np

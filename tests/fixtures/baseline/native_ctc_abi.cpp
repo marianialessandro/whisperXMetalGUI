@@ -30,6 +30,11 @@ int main(int argc, char** argv) {
     assert(wxctc_row_max(context, emission, 5, 3, 2, maxima, indices, 3, &maximum_result, error, sizeof(error)) != 0);
     assert(wxctc_row_max(context, emission, 6, 3, 2, maxima, indices, 3, &maximum_result, error, sizeof(error)) == 0);
     assert(maximum_result.abi_version == 1 && maxima[0] == -.1f && indices[0] == 1 && indices[1] == 0);
+    int32_t wildcard[]{2};
+    assert(wxctc_compute_wildcard(context, emission, 6, wildcard, 1, 3, 2, 0, path, 3, &result, error, sizeof(error)) == 0);
+    assert(result.path_length > 0 && path[0].frame == 0 && path[0].token == 0);
+    assert(wxctc_compute_wildcard(context, emission, 6, wildcard, 1, 3, 2, 0, path, 2, &result, error, sizeof(error)) != 0);
+    assert(wxctc_compute_wildcard(context, emission, 6, wildcard, 1, 3, 2, 2, path, 3, &result, error, sizeof(error)) != 0);
     uint64_t grown = 0;
     for (int iteration = 0; iteration < 8; ++iteration) {
         std::vector<float> large(256 * 4, -1);
