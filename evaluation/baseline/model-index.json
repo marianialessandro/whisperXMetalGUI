@@ -1,0 +1,169 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "repository": "mlx-community/whisper-base-mlx",
+      "revision": "1e3e249fb8d01c655324bd6841b1deadffd6d04c",
+      "declared_license": null,
+      "gated": false,
+      "files": [
+        {
+          "name": "README.md",
+          "bytes": 341,
+          "sha256": "cae7055dda5f053fe9f35b5356e9fe1b985ebcb077acc1d93199608588ec2197",
+          "git_blob": "0e0b81afa0d31463f15b14d2db75efe4147a4df3"
+        },
+        {
+          "name": "config.json",
+          "bytes": 262,
+          "sha256": "737220a6d958b3ad48e78f840fa991556266983c84ea2ca40e413389c62e4c2f",
+          "git_blob": "3860125a7f82a556e43e28eda7147a51c802ba5a"
+        },
+        {
+          "name": "weights.npz",
+          "bytes": 143724204,
+          "sha256": "2f57d5f3ef473054c638961f90716f4ee415e8108de81313eccb2c5fd62eff0b",
+          "git_blob": "5f3107387232ade74399f8bf1f3ce024948fba54"
+        }
+      ],
+      "status": "private_files_sha256_verified",
+      "license_verified": true,
+      "native_conversion_proven": false,
+      "license_source": "https://raw.githubusercontent.com/openai/whisper/86098128c0b4f24f0e2aa2994de830614b474227/LICENSE",
+      "verified_license": "MIT",
+      "loadability_verified": true,
+      "loadability_scope": "asr_mlx_component"
+    },
+    {
+      "repository": "mlx-community/whisper-small-mlx",
+      "revision": "45f3915923c7a79a5a5b5a7d909d39aeb0e5630e",
+      "declared_license": null,
+      "gated": false,
+      "files": [
+        {
+          "name": "README.md",
+          "bytes": 343,
+          "sha256": "47bab1dbd0bd831bd6f1b76e9d5a774041c585c63a1ec29a60cee60cbb56a084",
+          "git_blob": "8996da18aab170971998d5fe7548a2cc1c50eefd"
+        },
+        {
+          "name": "config.json",
+          "bytes": 266,
+          "sha256": "e8f58e638208af66d5d5d67801259dc7a12d199e971967a9f9d33a8e3635668e",
+          "git_blob": "df4c65c442a30e50034ee63422b31bde60c3d407"
+        },
+        {
+          "name": "weights.npz",
+          "bytes": 481307592,
+          "sha256": "55b6674c9b339702d486e2b1573839a66f8ec8f821ed2886993ef717a86b09f5",
+          "git_blob": "c1f9e8aff52b130ba385bca87165a4948012648c"
+        }
+      ],
+      "status": "private_files_sha256_verified",
+      "license_verified": true,
+      "native_conversion_proven": false,
+      "license_source": "https://raw.githubusercontent.com/openai/whisper/86098128c0b4f24f0e2aa2994de830614b474227/LICENSE",
+      "verified_license": "MIT",
+      "loadability_verified": true,
+      "loadability_scope": "asr_mlx_component"
+    },
+    {
+      "repository": "mlx-community/whisper-large-v3-mlx",
+      "revision": "49e6aa286ad60c14352c404340ded53710378a11",
+      "declared_license": "mit",
+      "gated": false,
+      "files": [
+        {
+          "name": "README.md",
+          "bytes": 283,
+          "sha256": "1194c9a3805b7c80adf0017e92c72db0bbb14ab64462eb64d548c1c532b7aa56",
+          "git_blob": "aa6058f979bed0dce9307e6e2ce8c0764824f855"
+        },
+        {
+          "name": "config.json",
+          "bytes": 269,
+          "sha256": "34982ce6ae286095000f82ae9583b3431639e8b092bf60c961f203745e6500e3",
+          "git_blob": "2c626df3c540bdc0287b11725441d10e1af73680"
+        },
+        {
+          "name": "weights.npz",
+          "bytes": 3083520416,
+          "sha256": "05ff791ce3630fae47e7c51004e9666204d786246ec07cac6110af768099b40d",
+          "git_blob": "70530160ef01821def1f20f1242d2a01b8f08d4f"
+        }
+      ],
+      "status": "private_files_sha256_verified",
+      "license_verified": true,
+      "native_conversion_proven": false,
+      "license_source": "https://raw.githubusercontent.com/openai/whisper/86098128c0b4f24f0e2aa2994de830614b474227/LICENSE",
+      "verified_license": "MIT",
+      "loadability_verified": true,
+      "loadability_scope": "asr_mlx_component"
+    },
+    {
+      "repository": "pyannote/speaker-diarization-community-1",
+      "revision": "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee",
+      "declared_license": "cc-by-4.0",
+      "gated": "auto",
+      "files": [
+        {
+          "name": "README.md",
+          "bytes": 9978,
+          "sha256": "2db91f9265bd81f1653ff088b5bff22bf6aebebea03328513af65501643f8a31",
+          "git_blob": "8356d6634d7b1074581dd36e2225887ec809326e"
+        },
+        {
+          "name": "config.yaml",
+          "bytes": 444,
+          "sha256": "5ce2bfa9a938dc132cec1172592d65173cbb8f444ea1e4133f10f9391de155be",
+          "git_blob": "4022db43960736338378fdb6b5a85cfdae198910"
+        },
+        {
+          "name": "embedding/README.md",
+          "bytes": 938,
+          "sha256": "fa9e5105ae95edb231d841476cdb91eef4be0621c372ed4f7d3421294b5f8ad7",
+          "git_blob": "d71f943e00016652680bef1e6c49fbc842e0d4c4"
+        },
+        {
+          "name": "embedding/pytorch_model.bin",
+          "bytes": 26646242,
+          "sha256": "6f10ff60898a1d185fa22e1d11e0bfa8a92efec811f11bca48cb8cafebefd929",
+          "git_blob": "6347697826a1958253dd195fa296d8d97b8f6280"
+        },
+        {
+          "name": "plda/README.md",
+          "bytes": 220,
+          "sha256": "e1316dbbeb3261431478d48ceebbd4bba395c3587e7b80c254dbab00f1209d0a",
+          "git_blob": "5c01ad2e673203fe32a82d7a140eb817db9930b7"
+        },
+        {
+          "name": "plda/plda.npz",
+          "bytes": 133852,
+          "sha256": "9b77bcd840692710dd3496f62ecfeed8d8e5f002fd991b785079b244eab7d255",
+          "git_blob": "e61936ef2108eccdff801c440d5e3f6c6995aba4"
+        },
+        {
+          "name": "plda/xvec_transform.npz",
+          "bytes": 134376,
+          "sha256": "325f1ce8e48f7e55e9c8aa47e05d2766b7c48c4b25b8de8dd751e7a4cc5fbe8f",
+          "git_blob": "b8079f30a35a68fe7d996bd7abc2170338ba6767"
+        },
+        {
+          "name": "segmentation/pytorch_model.bin",
+          "bytes": 5906507,
+          "sha256": "7ad24338d844fb95985486eb1a464e32d229f6d7a03c9abe60f978bacf3f816e",
+          "git_blob": "e3b91de5a5374fc40b556f9cc51317d280b4ea79"
+        }
+      ],
+      "status": "private_files_sha256_verified",
+      "license_verified": true,
+      "native_conversion_proven": false,
+      "license_source": "https://huggingface.co/pyannote/speaker-diarization-community-1/blob/3533c8cf8e369892e6b79ff1bf80f7b0286a54ee/README.md",
+      "verified_license": "CC-BY-4.0",
+      "loadability_verified": true,
+      "loadability_scope": "local_diarization_mps_component"
+    }
+  ],
+  "loadability_verified": false,
+  "verification_scope": "partial_individual_components_not_complete_model_inventory_or_native_conversion"
+}

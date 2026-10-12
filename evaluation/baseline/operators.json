@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "operators": [
+    {
+      "id": "host_codec",
+      "target": "cpu_host",
+      "required": true
+    },
+    {
+      "id": "downmix",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "resample",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "whisper_stft",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "whisper_mel",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "whisper_encoder",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "whisper_decoder",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "whisper_logits_selection",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "speaker_features",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "wav2vec2",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "alignment_log_softmax",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "ctc_trellis",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "ctc_backtrack",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "word_reductions",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "speaker_segmentation",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "speaker_embedding",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "embedding_normalization",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "speaker_distances",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "plda",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "ahc",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "vbx",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "speaker_kmeans",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "constrained_assignment",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "window_aggregation",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "word_speaker_intersections",
+      "target": "gpu",
+      "required": true
+    },
+    {
+      "id": "host_text_export",
+      "target": "cpu_host",
+      "required": true
+    }
+  ],
+  "status": "expected_not_observed"
+}

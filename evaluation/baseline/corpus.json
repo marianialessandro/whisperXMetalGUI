@@ -1,0 +1,222 @@
+{
+  "schema_version": 1,
+  "status": "prerequisite_missing",
+  "assets": [
+    {
+      "id": "fleurs-it-dev-archive",
+      "path": "archives/it-dev.tar.gz",
+      "url": "https://huggingface.co/datasets/google/fleurs/resolve/70bb2e84b976b7e960aa89f1c648e09c59f894dd/data/it_it/audio/dev.tar.gz",
+      "revision": "70bb2e84b976b7e960aa89f1c648e09c59f894dd",
+      "sha256": "9ebd7a079958e9980b3f2d91766a968fbc4d60c615a775b064acfe5bd2bc4472",
+      "max_bytes": 288887332,
+      "license_id": "fleurs-cc-by-4.0"
+    },
+    {
+      "path": "audio/it/10017639081645832204.wav",
+      "sha256": "4beb44194d7cd28455a738311831f7877b034fca36cee49349ce7f9a20f8eb09",
+      "bytes": 1013818,
+      "archive_sha256": "9ebd7a079958e9980b3f2d91766a968fbc4d60c615a775b064acfe5bd2bc4472",
+      "archive_member": "dev/10017639081645832204.wav",
+      "revision": "70bb2e84b976b7e960aa89f1c648e09c59f894dd",
+      "sample_rate": 16000,
+      "channels": 1,
+      "duration": 15.84,
+      "codec": "pcm_f32le",
+      "id": "fleurs-it-10017639081645832204",
+      "language": "it",
+      "license_id": "fleurs-cc-by-4.0",
+      "transcript": "La parte settentrionale, conosciuta come Catena della Sentinella, vanta le montagne più alte dell’Antartide, il Massiccio del Vinson, che raggiunge i 4892 m con il Monte Vinson.",
+      "normalized_transcript": "la parte settentrionale conosciuta come catena della sentinella vanta le montagne più alte dell'antartide il massiccio del vinson che raggiunge i 4892 m con il monte vinson",
+      "type": "parity_only",
+      "annotation_status": "word_times_and_speakers_unreviewed",
+      "speaker_identity_status": "unavailable"
+    },
+    {
+      "path": "audio/it/10020283897811844164.wav",
+      "sha256": "110ff2cf03c37e167eae3058a657814576de10601edccbc6cc2cb34433373380",
+      "bytes": 480058,
+      "archive_sha256": "9ebd7a079958e9980b3f2d91766a968fbc4d60c615a775b064acfe5bd2bc4472",
+      "archive_member": "dev/10020283897811844164.wav",
+      "revision": "70bb2e84b976b7e960aa89f1c648e09c59f894dd",
+      "sample_rate": 16000,
+      "channels": 1,
+      "duration": 7.5,
+      "codec": "pcm_f32le",
+      "id": "fleurs-it-10020283897811844164",
+      "language": "it",
+      "license_id": "fleurs-cc-by-4.0",
+      "transcript": "Non appena usciti dalla corrente, tornare a nuoto non risulterà più difficile del normale.",
+      "normalized_transcript": "non appena usciti dalla corrente tornare a nuoto non risulterà più difficile del normale",
+      "type": "parity_only",
+      "annotation_status": "word_times_and_speakers_unreviewed",
+      "speaker_identity_status": "unavailable"
+    },
+    {
+      "id": "fleurs-en-dev-archive",
+      "path": "archives/en-dev.tar.gz",
+      "url": "https://huggingface.co/datasets/google/fleurs/resolve/70bb2e84b976b7e960aa89f1c648e09c59f894dd/data/en_us/audio/dev.tar.gz",
+      "revision": "70bb2e84b976b7e960aa89f1c648e09c59f894dd",
+      "sha256": "2658fda72f199e12676ecac9415094667a4e14e149b146e568ea00b2a2f0954c",
+      "max_bytes": 171250900,
+      "license_id": "fleurs-cc-by-4.0"
+    },
+    {
+      "path": "audio/en/10010138729160973689.wav",
+      "sha256": "048169439c0328b758349af74aeb54a82a7a476e309709eb791dced06db25d48",
+      "bytes": 418618,
+      "archive_sha256": "2658fda72f199e12676ecac9415094667a4e14e149b146e568ea00b2a2f0954c",
+      "archive_member": "dev/10010138729160973689.wav",
+      "revision": "70bb2e84b976b7e960aa89f1c648e09c59f894dd",
+      "sample_rate": 16000,
+      "channels": 1,
+      "duration": 6.54,
+      "codec": "pcm_f32le",
+      "id": "fleurs-en-10010138729160973689",
+      "language": "en",
+      "license_id": "fleurs-cc-by-4.0",
+      "transcript": "When you call someone who is thousands of miles away, you are using a satellite.",
+      "normalized_transcript": "when you call someone who is thousands of miles away you are using a satellite",
+      "type": "parity_only",
+      "annotation_status": "word_times_and_speakers_unreviewed",
+      "speaker_identity_status": "unavailable"
+    },
+    {
+      "path": "audio/en/10035998729701048400.wav",
+      "sha256": "5fefdcd12d4c136762cc7841b084126fc60c6d6410f983cc9f82b6cfc45737a2",
+      "bytes": 1048378,
+      "archive_sha256": "2658fda72f199e12676ecac9415094667a4e14e149b146e568ea00b2a2f0954c",
+      "archive_member": "dev/10035998729701048400.wav",
+      "revision": "70bb2e84b976b7e960aa89f1c648e09c59f894dd",
+      "sample_rate": 16000,
+      "channels": 1,
+      "duration": 16.38,
+      "codec": "pcm_f32le",
+      "id": "fleurs-en-10035998729701048400",
+      "language": "en",
+      "license_id": "fleurs-cc-by-4.0",
+      "transcript": "Now widely available throughout the archipelago, Javanese cuisine features an array of simply seasoned dishes, the predominant flavorings the Javanese favor being peanuts, chillies, sugar (especially Javanese coconut sugar) and various aromatic spices.",
+      "normalized_transcript": "now widely available throughout the archipelago javanese cuisine features an array of simply seasoned dishes the predominant flavorings the javanese favor being peanuts chillies sugar especially javanese coconut sugar and various aromatic spices",
+      "type": "parity_only",
+      "annotation_status": "word_times_and_speakers_unreviewed",
+      "speaker_identity_status": "unavailable"
+    },
+    {
+      "id": "nocando-alessandra-it-1",
+      "path": "audio/it-narration/alessandra_it_1.mp3",
+      "source": "https://recursos-glif.upf.edu/nocando/sites/default/files/2024-06/alessandra_it_1.mp3",
+      "revision": "2024-06-path-local-sha256-pin",
+      "sha256": "f0672f3b6a4868d9ce6f333a92e5c7b51b8e4f30e78304de77b94b6113ced72e",
+      "bytes": 3975739,
+      "license_id": "nocando-cc-by-nc-sa-3.0",
+      "language": "it",
+      "type": "parity_only",
+      "speech_type": "spontaneous_narration",
+      "duration": 193.985306,
+      "sample_rate": 44100,
+      "channels": 2,
+      "codec": "mp3",
+      "recording_id": "nocando_alessandra_it_1",
+      "source_group": "nocando_alessandra",
+      "annotation_status": "manual_phrase_intervals_available_word_boundaries_and_review_missing",
+      "speaker_identity_status": "dataset_speaker_label_requires_cross_recording_verification"
+    }
+  ],
+  "cases": [
+    {
+      "id": "parity_it_1",
+      "asset_id": "fleurs-it-10017639081645832204",
+      "type": "parity_only",
+      "split": "unassigned_pending_speaker_review",
+      "recording_id": "fleurs-it-10017639081645832204",
+      "source_group": "fleurs-dev-it",
+      "speaker_ids": [],
+      "settings": {
+        "language": "it",
+        "quality": "Rapida",
+        "voices": false,
+        "hints": ""
+      },
+      "annotation_status": "independent_word_speaker_review_missing"
+    },
+    {
+      "id": "parity_it_2",
+      "asset_id": "fleurs-it-10020283897811844164",
+      "type": "parity_only",
+      "split": "unassigned_pending_speaker_review",
+      "recording_id": "fleurs-it-10020283897811844164",
+      "source_group": "fleurs-dev-it",
+      "speaker_ids": [],
+      "settings": {
+        "language": "it",
+        "quality": "Rapida",
+        "voices": false,
+        "hints": ""
+      },
+      "annotation_status": "independent_word_speaker_review_missing"
+    },
+    {
+      "id": "parity_en_1",
+      "asset_id": "fleurs-en-10010138729160973689",
+      "type": "parity_only",
+      "split": "unassigned_pending_speaker_review",
+      "recording_id": "fleurs-en-10010138729160973689",
+      "source_group": "fleurs-dev-en",
+      "speaker_ids": [],
+      "settings": {
+        "language": "en",
+        "quality": "Rapida",
+        "voices": false,
+        "hints": ""
+      },
+      "annotation_status": "independent_word_speaker_review_missing"
+    },
+    {
+      "id": "parity_en_2",
+      "asset_id": "fleurs-en-10035998729701048400",
+      "type": "parity_only",
+      "split": "unassigned_pending_speaker_review",
+      "recording_id": "fleurs-en-10035998729701048400",
+      "source_group": "fleurs-dev-en",
+      "speaker_ids": [],
+      "settings": {
+        "language": "en",
+        "quality": "Rapida",
+        "voices": false,
+        "hints": ""
+      },
+      "annotation_status": "independent_word_speaker_review_missing"
+    },
+    {
+      "id": "parity_it_narration_mp3",
+      "asset_id": "nocando-alessandra-it-1",
+      "type": "parity_only",
+      "settings": {
+        "language": "it",
+        "quality": "Bilanciata",
+        "voices": false,
+        "hints": ""
+      },
+      "status": "diagnostic_only_not_quality_ground_truth"
+    }
+  ],
+  "missing": [
+    "licensed_natural_short_it_en",
+    "licensed_natural_long_it_en",
+    "italian_natural_diarization_ground_truth",
+    "independent_word_boundaries",
+    "english_natural_overlap_ground_truth"
+  ],
+  "candidate_sources": [
+    {
+      "id": "fleurs",
+      "url": "https://huggingface.co/datasets/google/fleurs",
+      "purpose": "read speech IT/EN and representative languages; not conversational overlap ground truth"
+    },
+    {
+      "id": "ami",
+      "url": "https://groups.inf.ed.ac.uk/ami/download/",
+      "purpose": "English natural long/overlap; exact audio and annotations still to acquire"
+    }
+  ],
+  "acquisition_status": "four_licensed_clips_acquired_for_parity"
+}

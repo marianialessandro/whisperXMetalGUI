@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "provenance": "Hand-authored synthetic contracts; no natural quality or GPU evidence.",
+  "valid_results": [
+    {"segments": [], "language": null},
+    {"segments": [{"start": 0.1, "end": 1.2, "text": "Ciao è 99", "speaker": "SPEAKER_00", "words": [{"word": "Ciao", "start": 0.1, "end": 0.4, "score": 0.9}, {"word": "è"}, {"word": "99"}]}], "language": "it", "word_segments": [{"word": "99"}]},
+    {"segments": [{"start": 0, "end": 2, "text": "Overlap", "speaker": "SPEAKER_00"}, {"start": 1, "end": 3, "text": "Second voice", "speaker": "SPEAKER_01"}], "language": "en"},
+    {"segments": [{"start": 9, "end": 12, "text": "😊 123", "words": [{"word": "😊"}, {"word": "123"}]}], "language": "it"}
+  ],
+  "invalid_results": [
+    {"language": "it"},
+    {"segments": "invalid", "language": "it"},
+    {"segments": [{"start": 2, "end": 1, "text": "reversed"}], "language": "it"},
+    {"segments": [{"start": -1, "end": 1, "text": "negative"}], "language": "it"},
+    {"segments": [{"start": 0, "end": 1, "text": "bad", "words": [{"word": 99}]}], "language": "it"}
+  ],
+  "completed_events": [
+    {"event": "stage", "message": "Preparo l’audio…"},
+    {"event": "stage", "message": "Trascrivo su GPU Apple. Al primo utilizzo scarico il modello…", "backend": "MLX / Metal"},
+    {"event": "completed", "result": "/sandbox/run/result.json", "output": "/sandbox/run", "warnings": []}
+  ],
+  "exports": [
+    {"result": {"segments": [], "language": null}, "txt": "", "srt": "", "vtt": "WEBVTT\n\n"},
+    {"result": {"segments": [{"start": 0, "end": 1, "text": " Ciao è ", "speaker": "SPEAKER_00"}], "language": "it"}, "txt": "[SPEAKER_00]: Ciao è\n", "srt": "1\n00:00:00,000 --> 00:00:01,000\n[SPEAKER_00]: Ciao è\n\n", "vtt": "WEBVTT\n\n00:00.000 --> 00:01.000\n[SPEAKER_00]: Ciao è\n\n"}
+  ],
+  "app_scenarios": {
+    "library": ["externalImportAndDeletePreserveOriginal", "managedImportMovesOnlySelectedSourceAndDeletionCanKeepIt", "titleFoldersAndSpeakerNamesSurviveReload", "relocationMovesManagedFilesAndRemovesPreviousLibrary", "occupiedDestinationIsNotOverwritten", "migrationFailureRestoresFilesAndOriginalCatalog", "migrationDoesNotDeleteUnmanagedFilesInOldDirectory", "unreadableManifestIsNeverOverwritten"],
+    "credentials": ["invalid_token", "model_access_denied", "server_unavailable", "keychain_unavailable", "disconnect_keeps_models_and_transcriptions"],
+    "worker_failures": ["missing_token_before_audio_load", "optional_alignment_warning_keeps_transcript", "optional_voices_warning_keeps_transcript", "cancelled_without_terminal", "crash_without_terminal"]
+  }
+}

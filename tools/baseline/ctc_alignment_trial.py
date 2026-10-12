@@ -1,0 +1,114 @@
+"""Compare original WhisperX alignment with scoped experimental Metal CTC using a direct CLI script; no UI or production changes."""
+
+import argparse
+import contextlib
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tools.baseline import manifest, provision, ctc_metal_probe
+from tools.baseline.offline_worker import deny_python_network
+
+
+class MetalTrellis:
+    def __init__(self, result, frames, count):
+        self.result = result
+        self.shape = (frames + 1, count + 1)
+
+    def size(self, dimension):
+        return self.shape[dimension]
+
+
+@contextlib.contextmanager
+def metal_ctc(alignment, spans):
+    import mlx.core as mx
+    original_trellis, original_backtrack = alignment.get_trellis, alignment.backtrack
+    def trellis(emission, tokens, blank_id=0):
+        if emission.device.type != "cpu":
+            raise ValueError("trial_expected_original_cpu_emission_boundary")
+        started = time.perf_counter_ns()
+        result = ctc_metal_probe.compute(mx.array(emission.detach().numpy()), mx.array(tokens, dtype=mx.int32), blank_id)
+        return MetalTrellis(result, emission.shape[0], len(tokens)), started
+    def wrapped_trellis(emission, tokens, blank_id=0):
+        result, started = trellis(emission, tokens, blank_id)
+        result.started = started
+        return result
+    def backtrack(trellis, emission, tokens, blank_id=0):
+        path = ctc_metal_probe.materialize_path(trellis.result)
+        mx.synchronize()
+        spans.append({"frames": emission.shape[0], "tokens": len(tokens), "completion_and_bridge_wall_ns": time.perf_counter_ns() - trellis.started, "logical_cpu_to_mlx_emission_bytes": emission.numel() * emission.element_size(), "logical_final_path_readback_bytes": 4 + (0 if path is None else 12 * len(path)), "physical_copy_bytes": None})
+        return None if path is None else [alignment.Point(token, frame, score) for token, frame, score in path]
+    alignment.get_trellis, alignment.backtrack = wrapped_trellis, backtrack
+    try:
+        yield
+    finally:
+        alignment.get_trellis, alignment.backtrack = original_trellis, original_backtrack
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--audio", type=Path, required=True)
+    parser.add_argument("--audio-sha256", required=True)
+    parser.add_argument("--segments", type=Path, required=True, help="Private hash-verified ASR original JSON; never independent word/speaker ground truth.")
+    parser.add_argument("--segments-sha256", required=True)
+    parser.add_argument("--language", choices=("it", "en"), required=True)
+    parser.add_argument("--torch-specs", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True, help="New private output directory for both aligned results and explicit partial comparison.")
+    parser.add_argument("--replicas", type=int, default=1, help="Optional 1–10 same-loaded-model replicas with alternating original/candidate order; no cold-process benchmark claim.")
+    parser.add_argument("--warmup", action="store_true", help="Run both paths once outside timings before the recorded replicas.")
+    args = parser.parse_args(argv)
+    if not 1 <= args.replicas <= 10: parser.error("replicas must be between 1 and 10")
+    try:
+        if args.output_dir.exists() or manifest.sha256(args.audio) != args.audio_sha256 or manifest.sha256(args.segments) != args.segments_sha256:
+            raise ValueError("trial_inputs_or_destination_invalid")
+        specs = json.loads(args.torch_specs.read_text())
+        spec = next(item for item in specs if item.get("role") == "alignment_" + args.language)
+        if spec.get("license_verified") is not True or provision.inspect_spec(spec)["status"] != "files_verified":
+            raise ValueError("trial_alignment_checkpoint_not_verified")
+        original = json.loads(args.segments.read_text())
+        args.output_dir.mkdir(parents=True)
+        os.environ.update(TORCH_HOME=spec["cache_root"], HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_HUB_DISABLE_IMPLICIT_TOKEN="1")
+        os.environ["PATH"] = str(Path(sys.executable).parent) + ":/usr/bin:/bin"
+        spans = []
+        with provision.quiet_download(), deny_python_network():
+            import whisperx
+            import whisperx.alignment as alignment
+            import torch
+            if not torch.backends.mps.is_available(): raise ValueError("mps_required")
+            audio = whisperx.load_audio(str(args.audio))
+            model, metadata = whisperx.load_align_model(args.language, "mps")
+            if args.warmup:
+                alignment.align(original["segments"], model, metadata, audio, "mps")
+                with metal_ctc(alignment, []): alignment.align(original["segments"], model, metadata, audio, "mps")
+                torch.mps.synchronize()
+            baseline_times, candidate_times, matches, orders = [], [], [], []
+            for replica in range(args.replicas):
+                order = ("original", "candidate") if replica % 2 == 0 else ("candidate", "original")
+                orders.append(list(order))
+                results = {}
+                for backend in order:
+                    torch.mps.synchronize()
+                    started = time.perf_counter_ns()
+                    with metal_ctc(alignment, spans) if backend == "candidate" else contextlib.nullcontext(): results[backend] = alignment.align(original["segments"], model, metadata, audio, "mps")
+                    torch.mps.synchronize()
+                    elapsed = time.perf_counter_ns() - started
+                    (baseline_times if backend == "original" else candidate_times).append(elapsed)
+                baseline, candidate = results["original"], results["candidate"]
+                matches.append(baseline == candidate)
+            baseline_ns, candidate_ns = baseline_times[-1], candidate_times[-1]
+        for name, result in (("original-aligned.json", baseline), ("metal-ctc-aligned.json", candidate)):
+            with (args.output_dir / name).open("x") as output: json.dump(result, output, ensure_ascii=False, indent=2)
+        report = {"scope": "experimental_ctc_alignment_only", "status": "aligned_exactly_equal" if all(matches) else "aligned_mismatch", "source_audio_sha256": args.audio_sha256, "asr_result_sha256": args.segments_sha256, "original_completion_ns": baseline_ns, "metal_trial_completion_ns": candidate_ns, "timing_scope": "one_original_then_one_candidate_same_loaded_model_not_speedup_benchmark" if args.replicas == 1 else "alternating_same_loaded_model_alignment_only", "original_replicas_ns": baseline_times, "candidate_replicas_ns": candidate_times, "orders": orders, "all_replicas_exactly_equal": all(matches), "warmup_performed": args.warmup, "ctc_spans": spans, "residuals": ["original_mps_to_cpu_emission_boundary", "cpu_to_mlx_probe_bridge", "cpu_word_char_timestamp_reductions", "cpu_wildcard_column_reduction"], "quality_certified": False, "production_backend": False, "full_baseline_gate_passed": False}
+        with (args.output_dir / "comparison.json").open("x") as output: json.dump(report, output, indent=2)
+        print(json.dumps({key: value for key, value in report.items() if key != "ctc_spans"}))
+        return 0 if all(matches) else 2
+    except (OSError, ValueError, RuntimeError, KeyError, StopIteration):
+        print(json.dumps({"status": "trial_failed", "code": "ctc_alignment_trial_failed", "full_baseline_gate_passed": False}))
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

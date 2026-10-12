@@ -1,0 +1,466 @@
+{
+  "schema_version": 1,
+  "required_cases": [
+    {
+      "id": "silence",
+      "requires_natural_quality": false
+    },
+    {
+      "id": "non_speech",
+      "requires_natural_quality": false
+    },
+    {
+      "id": "empty",
+      "requires_natural_quality": false
+    },
+    {
+      "id": "invalid_token",
+      "requires_natural_quality": false
+    },
+    {
+      "id": "model_failure",
+      "requires_natural_quality": false
+    },
+    {
+      "id": "cancelled",
+      "requires_natural_quality": false
+    },
+    {
+      "id": "interrupted",
+      "requires_natural_quality": false
+    },
+    {
+      "id": "unknown_chars",
+      "requires_natural_quality": false
+    },
+    {
+      "id": "out_of_range",
+      "requires_natural_quality": false
+    },
+    {
+      "id": "unicode_paths",
+      "requires_natural_quality": false
+    },
+    {
+      "id": "codec_mp3",
+      "requires_natural_quality": false
+    },
+    {
+      "id": "codec_m4a",
+      "requires_natural_quality": false
+    },
+    {
+      "id": "codec_mp4",
+      "requires_natural_quality": false
+    },
+    {
+      "id": "window_boundaries",
+      "requires_natural_quality": false
+    },
+    {
+      "id": "it_short",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "en_short",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "it_long",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "en_long",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "it_overlap",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "en_overlap",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "it_auto",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "en_auto",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "it_explicit",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "en_explicit",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "hints_on",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "hints_off",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "voices_off",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "voices_auto",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "voices_exact",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "profile_base",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "profile_small",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "profile_large_v3",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "language_it",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "language_en",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "language_fr",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "language_de",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "language_ja",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "language_zh",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "language_ar",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "language_uk",
+      "requires_natural_quality": true
+    },
+    {
+      "id": "language_no",
+      "requires_natural_quality": true
+    }
+  ],
+  "languages": [
+    {
+      "language": "ar",
+      "model": "jonatasgrosman/wav2vec2-large-xlsr-53-arabic",
+      "family": "huggingface",
+      "representative": true,
+      "status": "untested"
+    },
+    {
+      "language": "ca",
+      "model": "softcatala/wav2vec2-large-xlsr-catala",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "cs",
+      "model": "comodoro/wav2vec2-xls-r-300m-cs-250",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "da",
+      "model": "saattrupdan/wav2vec2-xls-r-300m-ftspeech",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "de",
+      "model": "VOXPOPULI_ASR_BASE_10K_DE",
+      "family": "torchaudio",
+      "representative": true,
+      "status": "untested"
+    },
+    {
+      "language": "el",
+      "model": "jonatasgrosman/wav2vec2-large-xlsr-53-greek",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "en",
+      "model": "WAV2VEC2_ASR_BASE_960H",
+      "family": "torchaudio",
+      "representative": true,
+      "status": "untested"
+    },
+    {
+      "language": "es",
+      "model": "VOXPOPULI_ASR_BASE_10K_ES",
+      "family": "torchaudio",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "eu",
+      "model": "stefan-it/wav2vec2-large-xlsr-53-basque",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "fa",
+      "model": "jonatasgrosman/wav2vec2-large-xlsr-53-persian",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "fi",
+      "model": "jonatasgrosman/wav2vec2-large-xlsr-53-finnish",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "fr",
+      "model": "VOXPOPULI_ASR_BASE_10K_FR",
+      "family": "torchaudio",
+      "representative": true,
+      "status": "untested"
+    },
+    {
+      "language": "gl",
+      "model": "ifrz/wav2vec2-large-xlsr-galician",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "he",
+      "model": "imvladikon/wav2vec2-xls-r-300m-hebrew",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "hi",
+      "model": "theainerd/Wav2Vec2-large-xlsr-hindi",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "hr",
+      "model": "classla/wav2vec2-xls-r-parlaspeech-hr",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "hu",
+      "model": "jonatasgrosman/wav2vec2-large-xlsr-53-hungarian",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "id",
+      "model": "cahya/wav2vec2-large-xlsr-indonesian",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "it",
+      "model": "VOXPOPULI_ASR_BASE_10K_IT",
+      "family": "torchaudio",
+      "representative": true,
+      "status": "untested"
+    },
+    {
+      "language": "ja",
+      "model": "jonatasgrosman/wav2vec2-large-xlsr-53-japanese",
+      "family": "huggingface",
+      "representative": true,
+      "status": "untested"
+    },
+    {
+      "language": "ka",
+      "model": "xsway/wav2vec2-large-xlsr-georgian",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "ko",
+      "model": "kresnik/wav2vec2-large-xlsr-korean",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "lv",
+      "model": "jimregan/wav2vec2-large-xlsr-latvian-cv",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "ml",
+      "model": "gvs/wav2vec2-large-xlsr-malayalam",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "nl",
+      "model": "jonatasgrosman/wav2vec2-large-xlsr-53-dutch",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "nn",
+      "model": "NbAiLab/nb-wav2vec2-1b-nynorsk",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "no",
+      "model": "NbAiLab/nb-wav2vec2-1b-bokmaal-v2",
+      "family": "huggingface",
+      "representative": true,
+      "status": "untested"
+    },
+    {
+      "language": "pl",
+      "model": "jonatasgrosman/wav2vec2-large-xlsr-53-polish",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "pt",
+      "model": "jonatasgrosman/wav2vec2-large-xlsr-53-portuguese",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "ro",
+      "model": "gigant/romanian-wav2vec2",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "ru",
+      "model": "jonatasgrosman/wav2vec2-large-xlsr-53-russian",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "sk",
+      "model": "comodoro/wav2vec2-xls-r-300m-sk-cv8",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "sl",
+      "model": "anton-l/wav2vec2-large-xlsr-53-slovenian",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "sv",
+      "model": "KBLab/wav2vec2-large-voxrex-swedish",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "te",
+      "model": "anuragshas/wav2vec2-large-xlsr-53-telugu",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "tl",
+      "model": "Khalsuu/filipino-wav2vec2-l-xls-r-300m-official",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "tr",
+      "model": "mpoyraz/wav2vec2-xls-r-300m-cv7-turkish",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "uk",
+      "model": "Yehor/wav2vec2-xls-r-300m-uk-with-small-lm",
+      "family": "huggingface",
+      "representative": true,
+      "status": "untested"
+    },
+    {
+      "language": "ur",
+      "model": "kingabzpro/wav2vec2-large-xls-r-300m-Urdu",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "vi",
+      "model": "nguyenvulebinh/wav2vec2-base-vi-vlsp2020",
+      "family": "huggingface",
+      "representative": false,
+      "status": "untested"
+    },
+    {
+      "language": "zh",
+      "model": "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn",
+      "family": "huggingface",
+      "representative": true,
+      "status": "untested"
+    }
+  ],
+  "ui_languages": [
+    "auto",
+    "de",
+    "en",
+    "es",
+    "fr",
+    "it"
+  ]
+}
