@@ -22,6 +22,8 @@ int wxctc_compute_wildcard(wxctc_context* context, const float* emission, uint64
 int wxctc_compute_segments(wxctc_context* context, const float* emission, uint64_t emission_elements, const int32_t* tokens, uint64_t token_elements, uint32_t frames, uint32_t vocabulary, int32_t blank, uint32_t wildcard, wxctc_segment* segments, uint32_t segment_capacity, wxctc_result* result, char* error_code, uint32_t error_capacity);
 // Optional ABI v1 extension for nonpositive log emissions; -infinity is supported, NaN/+infinity are rejected, and ties select the first column.
 int wxctc_row_max(wxctc_context* context, const float* emission, uint64_t emission_elements, uint32_t frames, uint32_t vocabulary, float* values, int64_t* indices, uint32_t output_capacity, wxctc_max_result* result, char* error_code, uint32_t error_capacity);
+// Optional ABI v1 extension: binary64 min/max skipping NaN; empty/all-NaN returns NaN; negative zero is rejected to avoid runtime-dependent tie semantics.
+int wxctc_timestamp_bounds(wxctc_context* context, const uint64_t* values, uint64_t count, uint64_t* output, uint32_t output_capacity, wxctc_max_result* result, char* error_code, uint32_t error_capacity);
 // Calls on one context are serialized; destroy only after all calls have returned, without racing a new call.
 void wxctc_destroy(wxctc_context* context);
 

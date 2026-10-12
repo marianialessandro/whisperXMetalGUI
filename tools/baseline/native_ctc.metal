@@ -246,3 +246,33 @@ kernel void ctc_backtrack_compact(device const float* emission [[buffer(0)]], de
     }
     path[0] = j == 0 ? float(length) : -1;
 }
+
+// Binary64 timestamp comparisons use integer keys; no floating-point narrowing or arithmetic is performed.
+kernel void ctc_timestamp_bounds(device const ulong* values [[buffer(0)]], constant Dimensions& dimensions [[buffer(1)]], device ulong* output [[buffer(2)]], uint lane [[thread_position_in_threadgroup]]) {
+    threadgroup ulong minima[256], maxima[256];
+    threadgroup uint counts[256], invalid[256];
+    ulong low = ~0ul, high = 0ul;
+    uint count = 0, bad = 0;
+    for (uint i = lane; i < dimensions.count; i += 256) {
+        ulong bits = values[i], magnitude = bits & 0x7ffffffffffffffful;
+        if (magnitude > 0x7ff0000000000000ul) continue;
+        if (bits == 0x8000000000000000ul) { bad = 1; continue; }
+        ulong key = (bits >> 63) ? ~bits : bits ^ 0x8000000000000000ul;
+        low = min(low, key); high = max(high, key); ++count;
+    }
+    minima[lane] = low; maxima[lane] = high; counts[lane] = count; invalid[lane] = bad;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride /= 2) {
+        if (lane < stride) {
+            minima[lane] = min(minima[lane], minima[lane + stride]); maxima[lane] = max(maxima[lane], maxima[lane + stride]);
+            counts[lane] += counts[lane + stride]; invalid[lane] |= invalid[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        ulong low_key = minima[0], high_key = maxima[0];
+        output[0] = counts[0] == 0 ? 0x7ff8000000000000ul : ((low_key >> 63) ? low_key ^ 0x8000000000000000ul : ~low_key);
+        output[1] = counts[0] == 0 ? 0x7ff8000000000000ul : ((high_key >> 63) ? high_key ^ 0x8000000000000000ul : ~high_key);
+        output[2] = invalid[0];
+    }
+}

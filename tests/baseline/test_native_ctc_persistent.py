@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import whisperx.alignment as alignment
 from tools.baseline.native_ctc import NativeCTC
+from tools.baseline.native_timestamp_bounds import native_timestamp_bounds
 from tools.baseline.ctc_alignment_trial import persistent_metal_ctc, native_wildcard_max
 from tools.baseline.native_ctc_fused import DeferredWildcard, fused_wildcard_preparation
 
@@ -46,6 +47,41 @@ class PersistentNativeCTCTests(unittest.TestCase):
         self.assertEqual(record["command_buffers_per_run"], 2)
         self.assertGreater(record["computation_gpu_seconds"], 0)
         return record
+
+    def test_timestamp_bounds_exact_binary64_missing_values_and_scoped_pandas(self):
+        import pandas as pd
+        generator = np.random.default_rng(923)
+        cases = [np.asarray([], dtype=np.float64), np.array([np.nan, np.nan]), np.array([0., np.nan, 1e-300, 1e300, -1e-300, -1e300, np.inf, -np.inf]), generator.normal(size=513), generator.normal(size=32768)[::2], np.array([np.nextafter(1., 2.), 1.])]
+        original_pd = alignment.pd
+        with NativeCTC(self.library, self.identity) as context:
+            for values in cases:
+                bounds, record = context.timestamp_bounds(values)
+                for actual, expected in zip(bounds, [pd.Series(values).min(), pd.Series(values).max()]):
+                    if np.isnan(expected): self.assertTrue(np.isnan(actual))
+                    else: self.assertEqual(actual.tobytes(), np.float64(expected).tobytes())
+                self.assertGreater(record["computation_gpu_seconds"], 0)
+                self.assertEqual(record["command_buffers_per_run"], 1)
+            with self.assertRaisesRegex(ValueError, "negative_zero"): context.timestamp_bounds(np.array([-0., 0.]))
+            with self.assertRaisesRegex(ValueError, "format_invalid"): context.timestamp_bounds(np.zeros(32769))
+            records = []
+            rows = [{"char": "a", "start": 1.001, "end": 2.002, "score": .3, "word-idx": 0}, {"char": "?", "start": None, "end": None, "score": None, "word-idx": 1}]
+            with native_timestamp_bounds(alignment, context, records):
+                frame = alignment.pd.DataFrame(rows)
+                self.assertEqual(frame.loc[frame["word-idx"] == 0]["start"].min(), 1.001)
+                self.assertEqual(frame[frame["char"] != " "]["end"].max(), 2.002)
+                self.assertTrue(np.isnan(frame.loc[frame["word-idx"] == 1]["start"].min()))
+                self.assertEqual(frame["score"].mean(), pd.DataFrame(rows)["score"].mean())
+                self.assertEqual(frame["word-idx"].max(), 1)
+                all_missing = alignment.pd.DataFrame([rows[1]])
+                self.assertTrue(np.isnan(all_missing["start"].min()))
+                self.assertIs(type(alignment.pd.Series([1.])), pd.Series)
+                with self.assertRaisesRegex(ValueError, "options_not_supported"): frame["start"].min(skipna=False)
+            self.assertEqual(len(records), 4)
+            self.assertIs(alignment.pd, original_pd)
+            with self.assertRaisesRegex(ValueError, "negative_zero"):
+                with native_timestamp_bounds(alignment, context, []): alignment.pd.DataFrame([{**rows[0], "start": -0.}])["start"].min()
+            self.assertIs(alignment.pd, original_pd)
+        with self.assertRaisesRegex(ValueError, "native_context_closed"): context.timestamp_bounds(np.array([1.]))
 
     def test_buffer_growth_reuse_and_sentinel_paths_match_original(self):
         generator = np.random.default_rng(43)

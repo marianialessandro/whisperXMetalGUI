@@ -2,6 +2,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include "native_checks.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -15,6 +16,7 @@ struct Timing { uint64_t wall_ns; double gpu_seconds; };
 struct NativePoint { int32_t token; int32_t frame; float score; };
 struct NativeSegment { int32_t start; int32_t end; double score; };
 struct NativeResult { std::vector<NativePoint> path; bool found; std::vector<Timing> timings; uint64_t dp_bytes; uint64_t allocated_bytes; std::vector<NativeSegment> segments; int32_t path_length; };
+struct NativeBoundsResult { uint64_t minimum, maximum; Timing timing; uint64_t allocated_bytes; };
 struct NativeMaxResult { std::vector<float> values; std::vector<uint32_t> indices; std::vector<Timing> timings; uint64_t allocated_bytes; };
 
 static void encode(id<MTLCommandBuffer> command, id<MTLComputePipelineState> pipeline, NSArray<id<MTLBuffer>>* buffers, const Dimensions& dimensions, NSUInteger dimension_index, NSUInteger grid, NSUInteger group, NSString* label) {
@@ -50,13 +52,13 @@ class NativeCTCContext {
     id<MTLLibrary> library_;
     id<MTLComputePipelineState> max_pipeline_;
     id<MTLComputePipelineState> wildcard_validate_, wildcard_expand_;
-    id<MTLComputePipelineState> segment_pipeline_;
+    id<MTLComputePipelineState> segment_pipeline_, bounds_pipeline_;
     NSMutableArray<id<MTLComputePipelineState>>* pipelines_;
     NSArray<NSString*>* names_;
     id<MTLBuffer> e_, t_, invalid_, prefix_, rows_, path_, decisions_, endpoint_;
     id<MTLBuffer> max_values_, max_indices_;
     id<MTLBuffer> expanded_;
-    id<MTLBuffer> segment_bounds_, segment_means_;
+    id<MTLBuffer> segment_bounds_, segment_means_, bounds_input_, bounds_output_;
     bool compact_, batched_;
     std::mutex mutex_;
 
@@ -65,7 +67,7 @@ class NativeCTCContext {
         require(buffer != nil, "metal_allocation_failed");
     }
 
-    uint64_t allocated_bytes() const { return e_.length + t_.length + invalid_.length + prefix_.length + rows_.length + path_.length + decisions_.length + endpoint_.length + max_values_.length + max_indices_.length + expanded_.length + segment_bounds_.length + segment_means_.length; }
+    uint64_t allocated_bytes() const { return e_.length + t_.length + invalid_.length + prefix_.length + rows_.length + path_.length + decisions_.length + endpoint_.length + max_values_.length + max_indices_.length + expanded_.length + segment_bounds_.length + segment_means_.length + bounds_input_.length + bounds_output_.length; }
 
     void pipeline(id<MTLComputePipelineState> __strong& state, NSString* name) {
         if (state != nil) return;
@@ -158,6 +160,18 @@ public:
             }
         }
         return result;
+    }
+
+    NativeBoundsResult timestamp_bounds(const uint64_t* values, uint64_t count) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(values != nullptr && count <= 32768, "timestamp_shape_invalid");
+        pipeline(bounds_pipeline_, @"ctc_timestamp_bounds");
+        reserve(bounds_input_, std::max(uint64_t(8), count * 8)); reserve(bounds_output_, 24);
+        if (count) std::memcpy(bounds_input_.contents, values, count * 8);
+        auto timing = execute(queue_, bounds_pipeline_, @[bounds_input_, bounds_output_], {0, 0, static_cast<uint32_t>(count), 0}, 1, 256, 256, @"ctc_timestamp_bounds");
+        const uint64_t* output = static_cast<const uint64_t*>(bounds_output_.contents);
+        require(output[2] == 0, "timestamp_negative_zero_not_supported");
+        return {output[0], output[1], timing, allocated_bytes()};
     }
 
     NativeMaxResult row_max(const float* emission, uint64_t emission_elements, uint32_t frames, uint32_t vocabulary) {

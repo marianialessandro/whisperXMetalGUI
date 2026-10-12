@@ -122,6 +122,22 @@ class NativeCTC:
             if result.abi_version != 1: raise ValueError("native_result_invalid")
             return values, indices, {"scope": "experimental_wildcard_row_max", "frames": frames, "vocabulary": vocabulary, "kernel": "ctc_row_max", "dispatch_completed": True, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "logical_cpu_to_native_emission_bytes": emission.nbytes, "logical_output_readback_bytes": frames * 12, "physical_copy_bytes": None, "transport": "synchronous_in_memory_c_abi", "command_buffers_per_run": 2, "validation_wall_ns": result.validation_wall_ns, "computation_wall_ns": result.computation_wall_ns, "validation_gpu_seconds": result.validation_gpu_seconds, "computation_gpu_seconds": result.computation_gpu_seconds, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
 
+    def timestamp_bounds(self, values):
+        import numpy as np
+        if not isinstance(values, np.ndarray) or values.dtype != np.float64 or values.ndim != 1 or values.size > 32768: raise ValueError("native_timestamp_format_invalid")
+        with self._lock:
+            if not self._context.value: raise ValueError("native_context_closed")
+            started = time.perf_counter_ns()
+            values = np.ascontiguousarray(values)
+            output, result, error = np.empty(2, dtype=np.uint64), MaxResult(), ct.create_string_buffer(128)
+            function = self._library.wxctc_timestamp_bounds
+            function.argtypes = [ct.c_void_p, ct.POINTER(ct.c_uint64), ct.c_uint64, ct.POINTER(ct.c_uint64), ct.c_uint32, ct.POINTER(MaxResult), ct.POINTER(ct.c_char), ct.c_uint32]
+            function.restype = ct.c_int
+            status = function(self._context, values.ctypes.data_as(ct.POINTER(ct.c_uint64)), values.size, output.ctypes.data_as(ct.POINTER(ct.c_uint64)), 2, ct.byref(result), error, len(error))
+            if status: raise ValueError(error.value.decode("ascii"))
+            if result.abi_version != 1: raise ValueError("native_result_invalid")
+            return output.view(np.float64), {"scope": "experimental_timestamp_bounds", "elements": values.size, "kernel": "ctc_timestamp_bounds", "dispatch_completed": True, "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "computation_wall_ns": result.computation_wall_ns, "computation_gpu_seconds": result.computation_gpu_seconds, "logical_cpu_to_native_bytes": values.nbytes, "logical_output_readback_bytes": 24, "physical_copy_bytes": None, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
+
     def close(self):
         with self._lock:
             if self._context.value:

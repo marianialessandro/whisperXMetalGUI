@@ -161,6 +161,7 @@ def main(argv=None):
     parser.add_argument("--native-wildcard-max", action="store_true", help="Optional trial-only interception of CPU FP32 max(dim=1) using native Metal; requires native-persistent. Mask/gather/concatenation and max readback still use the original CPU boundary.")
     parser.add_argument("--native-fused-wildcard", action="store_true", help="Optional trial-only deferred wildcard preparation; native Metal expands the source emission and runs CTC without intermediate wildcard readback. Requires native-persistent; excludes --native-wildcard-max.")
     parser.add_argument("--native-character-segments", action="store_true", help="Optional GPU character bounds/means and segment-only readback; requires native-persistent and pinned CPython 3.12 sum semantics. Word reductions/timestamp scaling remain original.")
+    parser.add_argument("--native-timestamp-bounds", action="store_true", help="Optional Metal binary64 timestamp min/max for word/sentence character subsets; requires native-persistent. Means, timestamp scaling and interpolation remain original; negative zero fails explicitly.")
     args = parser.parse_args(argv)
     if not 1 <= args.replicas <= 10: parser.error("replicas must be between 1 and 10")
     if args.ctc_backend == "native" and (args.native_binary is None or args.native_binary_sha256 is None): parser.error("native backend requires binary and its expected SHA256")
@@ -170,6 +171,7 @@ def main(argv=None):
     if args.native_wildcard_max and args.ctc_backend != "native-persistent": parser.error("--native-wildcard-max requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.ctc_backend != "native-persistent": parser.error("--native-fused-wildcard requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.native_wildcard_max: parser.error("wildcard modes are mutually exclusive")
+    if args.native_timestamp_bounds and args.ctc_backend != "native-persistent": parser.error("--native-timestamp-bounds requires --ctc-backend native-persistent")
     if args.native_character_segments and args.ctc_backend != "native-persistent": parser.error("--native-character-segments requires --ctc-backend native-persistent")
     try:
         if args.output_dir.exists() or manifest.sha256(args.audio) != args.audio_sha256 or manifest.sha256(args.segments) != args.segments_sha256:
@@ -184,14 +186,18 @@ def main(argv=None):
         os.environ["PATH"] = str(Path(sys.executable).parent) + ":/usr/bin:/bin"
         spans = []
         wildcard_spans = []
+        timestamp_spans = []
         native_identity = None
         if args.ctc_backend == "native":
             args.native_binary = args.native_binary.resolve(strict=True)
             if manifest.sha256(args.native_binary) != args.native_binary_sha256: raise ValueError("native_binary_hash_mismatch")
             native_identity = {"binary_sha256": args.native_binary_sha256, "shader_sha256": manifest.sha256(Path(__file__).with_name("native_ctc.metal"))}
         @contextlib.contextmanager
-        def candidate_context(records, maximum_records):
+        def candidate_context(records, maximum_records, bounds_records):
             with contextlib.ExitStack() as scopes:
+                if args.native_timestamp_bounds:
+                    from tools.baseline.native_timestamp_bounds import native_timestamp_bounds
+                    scopes.enter_context(native_timestamp_bounds(alignment, persistent, bounds_records))
                 if args.native_fused_wildcard:
                     from tools.baseline.native_ctc_fused import fused_wildcard_preparation
                     scopes.enter_context(fused_wildcard_preparation(max(metadata["dictionary"].values()) + 1))
@@ -212,7 +218,7 @@ def main(argv=None):
             model, metadata = whisperx.load_align_model(args.language, "mps")
             if args.warmup:
                 alignment.align(original["segments"], model, metadata, audio, "mps", return_char_alignments=args.return_char_alignments)
-                with candidate_context([], []): alignment.align(original["segments"], model, metadata, audio, "mps", return_char_alignments=args.return_char_alignments)
+                with candidate_context([], [], []): alignment.align(original["segments"], model, metadata, audio, "mps", return_char_alignments=args.return_char_alignments)
                 torch.mps.synchronize()
             baseline_times, candidate_times, matches, orders = [], [], [], []
             for replica in range(args.replicas):
@@ -222,7 +228,7 @@ def main(argv=None):
                 for backend in order:
                     torch.mps.synchronize()
                     started = time.perf_counter_ns()
-                    with candidate_context(spans, wildcard_spans) if backend == "candidate" else contextlib.nullcontext(): results[backend] = alignment.align(original["segments"], model, metadata, audio, "mps", return_char_alignments=args.return_char_alignments)
+                    with candidate_context(spans, wildcard_spans, timestamp_spans) if backend == "candidate" else contextlib.nullcontext(): results[backend] = alignment.align(original["segments"], model, metadata, audio, "mps", return_char_alignments=args.return_char_alignments)
                     torch.mps.synchronize()
                     elapsed = time.perf_counter_ns() - started
                     (baseline_times if backend == "original" else candidate_times).append(elapsed)
@@ -241,13 +247,19 @@ def main(argv=None):
         report["native_character_segments_enabled"] = args.native_character_segments
         report["return_char_alignments"] = args.return_char_alignments
         report["native_character_segments_dispatch_count"] = sum(record.get("character_segments_gpu") is True for record in spans)
+        report["native_timestamp_bounds_enabled"], report["timestamp_bounds_spans"] = args.native_timestamp_bounds, timestamp_spans
+        report["native_timestamp_bounds_dispatch_count"] = len(timestamp_spans)
+        if args.native_timestamp_bounds:
+            import numpy as np
+            report["timestamp_bounds_reference_runtime"] = {"pandas": alignment.pd.__version__, "numpy": np.__version__, "policy": "binary64_min_max_skipna_negative_zero_rejected"}
         if args.ctc_backend == "native": report["residuals"][1] = "private_npz_and_native_process_startup_per_segment"
         if args.ctc_backend == "native-persistent": report["residuals"][1] = "cpu_to_native_shared_buffer_copy_per_segment"
         if args.native_wildcard_max: report["residuals"][-1] = "cpu_wildcard_mask_gather_concat_and_max_readback"
         if args.native_fused_wildcard: report["residuals"][-1] = "cpu_wildcard_mask_and_token_metadata"
         if args.native_character_segments: report["residuals"][2] = "cpu_word_reductions_and_character_timestamp_scaling"
+        if args.native_timestamp_bounds: report["residuals"][2] = "cpu_word_means_character_timestamp_scaling_interpolation_and_dataframe_selection"
         with (args.output_dir / "comparison.json").open("x") as output: json.dump(report, output, indent=2)
-        print(json.dumps({key: value for key, value in report.items() if key not in ("ctc_spans", "wildcard_spans")}))
+        print(json.dumps({key: value for key, value in report.items() if key not in ("ctc_spans", "wildcard_spans", "timestamp_bounds_spans")}))
         return 0 if all(matches) else 2
     except (OSError, ValueError, RuntimeError, KeyError, StopIteration, AttributeError, subprocess.TimeoutExpired):
         print(json.dumps({"status": "trial_failed", "code": "ctc_alignment_trial_failed", "full_baseline_gate_passed": False}))
