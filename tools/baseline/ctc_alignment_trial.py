@@ -163,6 +163,7 @@ def main(argv=None):
     parser.add_argument("--native-character-segments", action="store_true", help="Optional GPU character bounds/means and segment-only readback; requires native-persistent and pinned CPython 3.12 sum semantics. Word reductions/timestamp scaling remain original.")
     parser.add_argument("--native-timestamp-bounds", action="store_true", help="Optional Metal binary64 timestamp min/max for word/sentence character subsets; requires native-persistent. Means, timestamp scaling and interpolation remain original; negative zero fails explicitly.")
     parser.add_argument("--native-timestamp-bounds-batched", action="store_true", help="Optional shared-input Metal timestamp min/max batch per character frame; requires native-persistent and excludes --native-timestamp-bounds. Uses original tokenizer spans and word metadata; means/interpolation remain original.")
+    parser.add_argument("--native-timestamp-fast-frames", action="store_true", help="Optional Pandas 3.0.6 manager constructors avoiding subclass reconstruction in batched timestamp mode; requires --native-timestamp-bounds-batched. Preserves snapshot checks and copy-on-write semantics.")
     args = parser.parse_args(argv)
     if not 1 <= args.replicas <= 10: parser.error("replicas must be between 1 and 10")
     if args.ctc_backend == "native" and (args.native_binary is None or args.native_binary_sha256 is None): parser.error("native backend requires binary and its expected SHA256")
@@ -172,6 +173,7 @@ def main(argv=None):
     if args.native_wildcard_max and args.ctc_backend != "native-persistent": parser.error("--native-wildcard-max requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.ctc_backend != "native-persistent": parser.error("--native-fused-wildcard requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.native_wildcard_max: parser.error("wildcard modes are mutually exclusive")
+    if args.native_timestamp_fast_frames and not args.native_timestamp_bounds_batched: parser.error("--native-timestamp-fast-frames requires --native-timestamp-bounds-batched")
     if args.native_timestamp_bounds_batched and args.ctc_backend != "native-persistent": parser.error("--native-timestamp-bounds-batched requires --ctc-backend native-persistent")
     if args.native_timestamp_bounds_batched and args.native_timestamp_bounds: parser.error("timestamp bounds modes are mutually exclusive")
     if args.native_timestamp_bounds and args.ctc_backend != "native-persistent": parser.error("--native-timestamp-bounds requires --ctc-backend native-persistent")
@@ -200,7 +202,7 @@ def main(argv=None):
             with contextlib.ExitStack() as scopes:
                 if args.native_timestamp_bounds_batched:
                     from tools.baseline.native_timestamp_bounds import native_timestamp_bounds_batched
-                    scopes.enter_context(native_timestamp_bounds_batched(alignment, persistent, bounds_records))
+                    scopes.enter_context(native_timestamp_bounds_batched(alignment, persistent, bounds_records, fast_frames=args.native_timestamp_fast_frames))
                 if args.native_timestamp_bounds:
                     from tools.baseline.native_timestamp_bounds import native_timestamp_bounds
                     scopes.enter_context(native_timestamp_bounds(alignment, persistent, bounds_records))
@@ -255,6 +257,7 @@ def main(argv=None):
         report["native_character_segments_dispatch_count"] = sum(record.get("character_segments_gpu") is True for record in spans)
         report["native_timestamp_bounds_enabled"], report["timestamp_bounds_spans"] = args.native_timestamp_bounds, timestamp_spans
         report["native_timestamp_bounds_dispatch_count"] = len(timestamp_spans)
+        report["native_timestamp_fast_frames_enabled"] = args.native_timestamp_fast_frames
         report["native_timestamp_bounds_batched_enabled"] = args.native_timestamp_bounds_batched
         report["native_timestamp_bounds_query_count"] = sum(record.get("queries", 1) for record in timestamp_spans)
         report["native_timestamp_bounds_queries_consumed"] = sum(record.get("queries_consumed", 1) for record in timestamp_spans)

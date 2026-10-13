@@ -142,6 +142,44 @@ class PersistentNativeCTCTests(unittest.TestCase):
             self.assertIs(alignment.pd, original_pd)
             self.assertIs(alignment.nltk_load, loader)
 
+    def test_fast_batch_constructors_preserve_metadata_dtypes_and_copy_on_write(self):
+        import pandas as pd
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        rows = [{"char": char, "start": None if i == 2 else float(i), "end": None if i == 2 else float(i + 1), "score": .3, "word-idx": word} for i, (char, word) in enumerate(zip("a ? b", [0, 1, 1, 2, 2]))]
+        tokenizer = SimpleNamespace(span_tokenize=lambda text: iter([(0, 3), (3, 5)]))
+        reference = pd.DataFrame(rows)
+        original_pd = alignment.pd
+        with NativeCTC(self.library, self.identity) as context, patch.object(alignment, "nltk_load", return_value=tokenizer) as loader:
+            for fast in (False, True):
+                with self.subTest(fast=fast), native_timestamp_bounds_batched(alignment, context, [], fast_frames=fast):
+                    list(alignment.nltk_load("test").span_tokenize("a ? b"))
+                    frame = alignment.pd.DataFrame(rows)
+                    frame["sentence-idx"] = None
+                    expected = reference.assign(**{"sentence-idx": None})
+                    subset = frame.loc[frame["word-idx"] == 0]
+                    pd.testing.assert_frame_equal(pd.DataFrame(subset), expected.loc[expected["word-idx"] == 0])
+                    self.assertEqual(subset["start"].name, "start")
+                    self.assertEqual(subset["start"].min(), 0.)
+                    self.assertEqual(subset["end"].max(), 1.)
+                    self.assertEqual(frame["word-idx"].unique().tolist(), [0, 1, 2])
+                    self.assertEqual(frame["score"].mean(), reference["score"].mean())
+                    projected = frame.loc[[0]][["char", "start", "end", "score"]]
+                    projected.loc[0, "start"] = 9.
+                    self.assertEqual(frame.loc[0, "start"], 0.)
+                    self.assertEqual(frame.loc[[0]]["start"].min(), 0.)
+                    with self.assertRaisesRegex(ValueError, "snapshot_changed"): projected["start"].min()
+                    self.assertEqual(frame.loc[[2]][["start", "end"]].fillna(-1).to_dict("records"), [{"start": -1., "end": -1.}])
+                    self.assertEqual(len(frame["start"].iloc[:2]), 2)
+                    with self.assertRaisesRegex(ValueError, "subset_not_registered"): frame["start"].iloc[:2].min()
+                self.assertIs(alignment.pd, original_pd)
+                self.assertIs(alignment.nltk_load, loader)
+            with patch.object(original_pd, "__version__", "unsupported"):
+                with self.assertRaisesRegex(ValueError, "runtime_not_supported"):
+                    with native_timestamp_bounds_batched(alignment, context, [], fast_frames=True): pass
+            self.assertIs(alignment.pd, original_pd)
+            self.assertIs(alignment.nltk_load, loader)
+
     def test_buffer_growth_reuse_and_sentinel_paths_match_original(self):
         generator = np.random.default_rng(43)
         large = torch.log_softmax(torch.from_numpy(generator.normal(size=(341, 38)).astype(np.float32)), dim=-1)

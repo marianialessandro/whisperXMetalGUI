@@ -59,6 +59,12 @@ Each character frame uploads its start/end columns once for the batch. The scope
 
 Reports retain `native_timestamp_bounds_dispatch_count` for actual batch dispatches and add query/consumption counts. Logical transfer includes timestamp bytes plus CSR metadata; readback is 16 bytes per unique subset plus a four-byte validation word, excluding ABI metadata and physical copies. This does not eliminate character readback, CPU scaling/rounding, snapshot checks or the upload from CPU; retaining timestamps across the complete character/word pipeline remains subsequent work. Word means, interpolation and production defaults remain original.
 
+## Optional Pandas constructor optimization
+
+Add `--native-timestamp-fast-frames` with `--native-timestamp-bounds-batched` to avoid Pandas subclass reconstruction through temporary base Series/DataFrame objects. The adapter constructs its scoped subclasses directly from the managers already supplied by Pandas, then leaves column names, metadata finalization and copy-on-write behavior to the original caller. The option supports the inspected Pandas 3.0.6 runtime only; a different version fails explicitly before installing hooks because these manager methods are private APIs. The existing batched path remains available without the option.
+
+This reduces CPU adapter overhead for the existing Metal kernels; it does not move another numerical operator to GPU, change transfers, remove snapshot validation or keep timestamps resident between pipeline stages. Reports record the flag globally and on each batch. Regression tests cover numeric/string dtypes, column names, selection and projection, missing values, original means, cache invalidation, parent isolation after modifying a derived frame, hook restoration and the runtime guard. All runs remain direct CLI processes without UI.
+
 ## Lifecycle and verification
 
 The development ABI in `native_ctc_bridge.h` returns zero on success and nonzero with a fixed error code on failure. Input pointers and declared lengths must remain valid until a synchronous call returns. Output capacity must cover `frames`. Calls on one context serialize; finish all calls before destroying it and never race destruction with a new call. The Python wrapper's context manager and lock enforce compute/close ordering. No CPU fallback is invoked when native validation fails.

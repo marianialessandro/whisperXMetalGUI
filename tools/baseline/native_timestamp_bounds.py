@@ -47,8 +47,9 @@ def native_timestamp_bounds(alignment, context, records):
 
 
 @contextlib.contextmanager
-def native_timestamp_bounds_batched(alignment, context, records):
+def native_timestamp_bounds_batched(alignment, context, records, fast_frames=False):
     original, original_load = alignment.pd, alignment.nltk_load
+    if fast_frames and original.__version__ != "3.0.6": raise ValueError("native_timestamp_fast_frames_runtime_not_supported")
     sentence_spans = {}
 
     class TokenizerProxy:
@@ -68,6 +69,12 @@ def native_timestamp_bounds_batched(alignment, context, records):
 
         @property
         def _constructor(self): return BatchSeries
+
+        def _constructor_from_mgr(self, mgr, axes):
+            if not fast_frames: return super()._constructor_from_mgr(mgr, axes)
+            series = BatchSeries._from_mgr(mgr, axes)
+            series._name = None
+            return series
 
         def _bounds(self, method, axis, skipna, numeric_only, kwargs):
             if self.name not in ("start", "end"): return getattr(super(), method)(axis=axis, skipna=skipna, numeric_only=numeric_only, **kwargs)
@@ -94,6 +101,16 @@ def native_timestamp_bounds_batched(alignment, context, records):
         @property
         def _constructor_sliced(self): return BatchSeries
 
+        def _constructor_from_mgr(self, mgr, axes):
+            if not fast_frames: return super()._constructor_from_mgr(mgr, axes)
+            return BatchFrame._from_mgr(mgr, axes=axes)
+
+        def _constructor_sliced_from_mgr(self, mgr, axes):
+            if not fast_frames: return super()._constructor_sliced_from_mgr(mgr, axes)
+            series = BatchSeries._from_mgr(mgr, axes)
+            series._name = None
+            return series
+
     def prepare(data):
         text = "".join(row["char"] for row in data)
         if text not in sentence_spans or len(data) > 32768: raise ValueError("native_timestamp_batch_sentence_metadata_missing")
@@ -118,6 +135,7 @@ def native_timestamp_bounds_batched(alignment, context, records):
             snapshots.append(values[selection].tobytes())
         bounds, record = context.timestamp_bounds_batch(values, np.asarray(indices, dtype=np.uint32), np.asarray(offsets, dtype=np.uint32))
         record["queries_consumed"] = 0
+        record["fast_frames"] = fast_frames
         records.append(record)
         cache = {key: (bounds[i], snapshots[i]) for i, key in enumerate(queries)}
         frame = BatchFrame(data)
