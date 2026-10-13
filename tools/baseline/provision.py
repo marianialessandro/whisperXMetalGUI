@@ -3,12 +3,15 @@
 import argparse
 import ast
 import contextlib
+import ctypes
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import struct
+import stat
 import subprocess
 import sys
 import tempfile
@@ -125,6 +128,8 @@ def npz_headers(path):
 
 
 def inspect_spec(spec):
+    if spec.get("transport") == "torch_hub_source":
+        return inspect_torch_source(spec)
     if spec.get("transport") == "torch_hub":
         return inspect_torch_spec(spec)
     identity = model_identity(Path(spec["cache_root"]), spec["repository"], spec["revision"], spec["files"])
@@ -197,6 +202,7 @@ def inspect_torch_spec(spec):
 
 
 def provision_spec(spec, token=None, downloader=None):
+    if spec.get("transport") == "torch_hub_source": raise ProvisionError("torch_hub_source_explicit_installation_required")
     if spec.get("transport") == "torch_hub":
         raise ProvisionError("torch_hub_explicit_acquisition_required")
     if not spec.get("license_verified") or not spec.get("license_source") or not re.fullmatch(r"[0-9a-f]{40}", spec.get("revision", "")):
@@ -235,6 +241,108 @@ def provision_spec(spec, token=None, downloader=None):
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, response, code, message, headers, new_url):
         raise ProvisionError("model_download_redirect_rejected")
+
+
+def torch_source_target(spec):
+    required = {"LICENSE", "hubconf.py", "src/silero_vad/model.py", "src/silero_vad/utils_vad.py", "src/silero_vad/data/silero_vad.jit", ".baseline-source-revision"}
+    files = spec.get("files")
+    if spec.get("transport") != "torch_hub_source" or spec.get("repository") != "snakers4/silero-vad" or spec.get("role") != "vad" or not isinstance(spec.get("revision"), str) or not re.fullmatch(r"[0-9a-f]{40}", spec["revision"]): raise ProvisionError("torch_source_spec_invalid")
+    if not isinstance(files, list) or not 0 < len(files) <= 4096 or any(not isinstance(name, str) or Path(name).is_absolute() or ".." in Path(name).parts or "\\" in name or not Path(name).parts for name in files) or len(set(files)) != len(files) or not required.issubset(files): raise ProvisionError("model_path_invalid")
+    if not isinstance(spec.get("sha256"), dict) or any(not isinstance(spec["sha256"].get(name), str) or not re.fullmatch(r"[0-9a-f]{64}", spec["sha256"][name]) for name in files): raise ProvisionError("model_expected_hash_missing")
+    return contained(Path(spec["cache_root"]), "hub/snakers4_silero-vad_master")
+
+
+def inspect_torch_source(spec):
+    result = {"repository": spec.get("repository"), "revision": spec.get("revision"), "status": "prerequisite_missing", "files": [], "loadability_verified": False, "native_conversion_proven": False}
+    try:
+        target = torch_source_target(spec)
+        if not target.is_dir(): return {**result, "code": "model_file_missing"}
+        if target.is_symlink(): raise ProvisionError("model_path_invalid")
+        observed = set()
+        entries = 0
+        for path in target.rglob("*"):
+            entries += 1
+            if entries > 8192: raise ProvisionError("torch_source_tree_mismatch")
+            if path.is_symlink(): raise ProvisionError("model_path_invalid")
+            if path.is_file(): observed.add(path.relative_to(target).as_posix())
+            if len(observed) > 4096: raise ProvisionError("torch_source_tree_mismatch")
+        if observed != set(spec["files"]): raise ProvisionError("torch_source_tree_mismatch")
+        total_bytes = 0
+        for name in spec["files"]:
+            path = contained(Path(spec["cache_root"]), Path("hub/snakers4_silero-vad_master") / name)
+            if not path.is_file() or path.stat().st_size > 32 * 1024 * 1024: raise ProvisionError("model_file_missing")
+            total_bytes += path.stat().st_size
+            if total_bytes > 128 * 1024 * 1024: raise ProvisionError("torch_source_tree_mismatch")
+            digest = sha256(path)
+            if digest != spec["sha256"][name]: raise ProvisionError("model_hash_mismatch")
+            result["files"].append({"name": name, "sha256": digest, "bytes": path.stat().st_size})
+        if (target / ".baseline-source-revision").read_text() != spec["revision"] + "\n": raise ProvisionError("torch_source_revision_mismatch")
+    except ProvisionError as error:
+        return {**result, "code": str(error)}
+    except (OSError, BaselineError, ValueError, TypeError):
+        return {**result, "code": "torch_source_inspection_failed"}
+    return {**result, "status": "files_verified", "roles": ["vad"]}
+
+
+def rename_directory_exclusive(source, target):
+    if sys.platform != "darwin": raise ProvisionError("torch_source_atomic_install_platform_unsupported")
+    library = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    rename = library.renamex_np
+    rename.argtypes, rename.restype = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint], ctypes.c_int
+    if rename(os.fsencode(source), os.fsencode(target), 0x00000004) != 0:
+        raise ProvisionError("model_acquisition_conflict" if ctypes.get_errno() == errno.EEXIST else "torch_source_publication_failed")
+
+
+def install_torch_source(spec, archive_path):
+    target = torch_source_target(spec)
+    if spec.get("license_verified") is not True or spec.get("license_source") != "https://raw.githubusercontent.com/snakers4/silero-vad/" + spec["revision"] + "/LICENSE": raise ProvisionError("model_authorization_or_revision_missing")
+    if target.exists():
+        report = inspect_torch_source(spec)
+        if report["status"] != "files_verified": raise ProvisionError(report["code"])
+        return {**report, "acquisition_status": "already_verified"}
+    archive_path = Path(archive_path)
+    if spec.get("source") != "https://codeload.github.com/snakers4/silero-vad/zip/" + spec["revision"] or archive_path.stat().st_size > 32 * 1024 * 1024 or sha256(archive_path) != spec.get("archive_sha256"): raise ProvisionError("torch_source_archive_mismatch")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with tempfile.TemporaryDirectory(prefix=".baseline-source-", dir=target.parent) as temporary, zipfile.ZipFile(archive_path) as archive:
+            staging = Path(temporary) / "snapshot"
+            staging.mkdir()
+            prefix = "silero-vad-" + spec["revision"] + "/"
+            entries = archive.infolist()
+            if len(entries) > 8192 or sum(entry.file_size for entry in entries) > 128 * 1024 * 1024: raise ProvisionError("torch_source_archive_invalid")
+            files = {}
+            for entry in entries:
+                if not entry.filename.startswith(prefix) or entry.flag_bits & 1 or stat.S_ISLNK(entry.external_attr >> 16) or entry.file_size > 32 * 1024 * 1024: raise ProvisionError("torch_source_archive_invalid")
+                if entry.is_dir(): continue
+                name = entry.filename.removeprefix(prefix)
+                if name not in spec["files"] or name in files or entry.file_size > max(entry.compress_size, 1) * 256: raise ProvisionError("torch_source_archive_invalid")
+                files[name] = entry
+            if set(files) != set(spec["files"]) - {".baseline-source-revision"}: raise ProvisionError("torch_source_tree_mismatch")
+            for name, entry in files.items():
+                path = staging / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                digest = hashlib.sha256()
+                with archive.open(entry) as source, path.open("xb") as output:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                        output.write(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+                if digest.hexdigest() != spec["sha256"][name]: raise ProvisionError("model_hash_mismatch")
+            marker = (spec["revision"] + "\n").encode()
+            if hashlib.sha256(marker).hexdigest() != spec["sha256"][".baseline-source-revision"]: raise ProvisionError("torch_source_revision_mismatch")
+            with (staging / ".baseline-source-revision").open("xb") as output:
+                output.write(marker)
+                output.flush()
+                os.fsync(output.fileno())
+            rename_directory_exclusive(staging, target)
+    except ProvisionError:
+        raise
+    except Exception:
+        raise ProvisionError("torch_source_install_failed") from None
+    report = inspect_torch_source(spec)
+    if report["status"] != "files_verified": raise ProvisionError(report["code"])
+    return {**report, "acquisition_status": "installed_verified_source_snapshot"}
 
 
 def provision_torch_spec(spec, observe_hash=False, opener=None):
@@ -303,7 +411,7 @@ def provision_torch_spec(spec, observe_hash=False, opener=None):
 
 
 def bind_default_reference(spec):
-    if spec.get("transport") == "torch_hub": raise ProvisionError("torch_hub_has_no_huggingface_reference")
+    if spec.get("transport") in ("torch_hub", "torch_hub_source"): raise ProvisionError("torch_hub_has_no_huggingface_reference")
     if spec.get("license_verified") is not True or not spec.get("license_source", "").startswith("https://"): raise ProvisionError("model_authorization_or_revision_missing")
     result = inspect_spec(spec)
     if result["status"] != "files_verified": raise ProvisionError(result.get("code", "model_not_verified"))
@@ -336,16 +444,18 @@ def main(argv=None):
     parser.add_argument("--bind-default-ref", action="store_true", help="Optional explicit cache metadata write after file/hash/license verification: create missing HF refs/main at the declared revision, never overwrite a conflicting ref. Torch Hub is unchanged; preflight remains offline.")
     parser.add_argument("--download-torch", action="store_true", help="Explicitly allow official HTTPS Torch checkpoint acquisition during download, with pinned SHA256 verification and no checkpoint loading or overwrite.")
     parser.add_argument("--observe-torch-hash", action="store_true", help="With download --download-torch only: record the first official acquisition hash for an unpinned new checkpoint; exit 2 until the observed digest is explicitly pinned in the specs. Never a published checksum or verified role.")
+    parser.add_argument("--install-torch-source", type=Path, help="Optional explicit download-mode installation of a hash-pinned official Silero GitHub ZIP into an absent Torch Hub master cache, using bounded verified extraction and macOS exclusive atomic directory publication. No source execution or checkpoint loading.")
     parser.add_argument("command", choices=("preflight", "download"), help="preflight verifies HF/torch_hub files without model loading or Keychain/network; download defaults to pinned HF snapshots only, with explicit --download-torch required for Torch acquisition.")
     args = parser.parse_args(argv)
     if args.download_torch and args.command != "download" or args.observe_torch_hash and not args.download_torch: parser.error("Torch acquisition options require download --download-torch")
+    if args.install_torch_source and args.command != "download": parser.error("Torch source installation requires download")
     try:
         specs = json.loads(args.specs.read_text())
         token = read_credential(args.bridge) if args.command == "download" and any(spec.get("gated") for spec in specs) and args.bridge else None
         with open(os.devnull, "w") as sink, contextlib.redirect_stderr(sink):
-            reports = [inspect_spec(spec) if args.command == "preflight" else provision_torch_spec(spec, args.observe_torch_hash) if spec.get("transport") == "torch_hub" and args.download_torch else provision_spec(spec, token) for spec in specs]
+            reports = [inspect_spec(spec) if args.command == "preflight" else install_torch_source(spec, args.install_torch_source) if spec.get("transport") == "torch_hub_source" and args.install_torch_source else provision_torch_spec(spec, args.observe_torch_hash) if spec.get("transport") == "torch_hub" and args.download_torch else provision_spec(spec, token) for spec in specs]
             if args.bind_default_ref:
-                reports = [bind_default_reference(spec) if spec.get("transport") != "torch_hub" else report for spec, report in zip(specs, reports)]
+                reports = [bind_default_reference(spec) if spec.get("transport") not in ("torch_hub", "torch_hub_source") else report for spec, report in zip(specs, reports)]
         report = sanitize({"status": "files_verified" if reports and all(report["status"] == "files_verified" for report in reports) else "prerequisite_missing", "models": reports}, secrets=[token] if token else [])
         token = None
         print(json.dumps(report))

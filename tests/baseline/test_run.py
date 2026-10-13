@@ -15,6 +15,34 @@ from tools.baseline import run, corpus
 
 
 class RunnerTests(unittest.TestCase):
+    def test_source_vad_requires_loader_evidence_routes_torch_cache_and_skips_hf_refs(self):
+        checkpoint = "src/silero_vad/data/silero_vad.jit"
+        spec = {"transport": "torch_hub_source", "role": "vad", "repository": "snakers4/silero-vad", "revision": "a" * 40, "cache_root": "/private/torch", "torch_version": "2.8.0", "sha256": {checkpoint: "b" * 64}, "license_verified": True, "license_source": "https://official.test/LICENSE"}
+        record = {"role": "vad", "repository": spec["repository"], "revision": spec["revision"], "torch_version": spec["torch_version"], "cache_branch": "master", "checkpoint_sha256": "b" * 64, "source_tree_digest": run.vad_inventory.tree_digest(spec), "checkpoint_loaded": False, "status": "default_cached_source_verified"}
+        selection = {"status": "selection_inventory_verified", "models": [record]}
+        error = {"code": "worker_vad_selection_unverified", "repository": spec["repository"]}
+        self.assertEqual(run.model_cache_roots([spec]), (None, Path(spec["cache_root"]).resolve()))
+        with tempfile.TemporaryDirectory() as directory, patch.object(run.provision, "inspect_spec", return_value={"status": "files_verified", "roles": ["vad"]}), patch.object(run.manifest, "contained", side_effect=AssertionError("source caches have no HF refs")):
+            arguments = ({"assets": [], "cases": []}, corpus.expected_coverage(Path(__file__).resolve().parents[2]), {"licenses": []}, Path(directory), [spec])
+            self.assertIn(error, run.preflight(*arguments)["missing"])
+            report = run.preflight(*arguments, vad_selection=selection)
+            self.assertNotIn(error, report["missing"])
+            self.assertNotIn({"code": "required_model_role_undeclared", "role": "vad"}, report["missing"])
+            self.assertEqual(report["status"], "prerequisite_missing")
+
+    def test_optional_hf_selection_gate_rejects_missing_evidence_and_preserves_default_behavior(self):
+        spec = {"repository": "org/hf", "role": "alignment_ja", "cache_root": "/private/cache", "revision": "a" * 40, "files": ["config.json", "preprocessor_config.json", "vocab.json", "model.safetensors"], "sha256": {name: "b" * 64 for name in ("config.json", "preprocessor_config.json", "vocab.json")}, "transformers_version": "4.test", "license_verified": True, "license_source": "https://official.test/license"}
+        record = {"role": spec["role"], "repository": spec["repository"], "revision": spec["revision"], "transformers_version": spec["transformers_version"], "checkpoint": "model.safetensors", "checkpoint_loaded": False, "metadata_sha256": spec["sha256"], "status": "default_selection_and_processor_config_verified"}
+        selection = {"status": "selection_inventory_verified", "models": [record]}
+        error = {"code": "worker_alignment_selection_unverified", "repository": spec["repository"]}
+        with tempfile.TemporaryDirectory() as directory, patch.object(run.provision, "inspect_spec", return_value={"status": "files_verified"}), patch.object(run.manifest, "contained", side_effect=OSError()):
+            arguments = ({"assets": [], "cases": []}, corpus.expected_coverage(Path(__file__).resolve().parents[2]), {"licenses": []}, Path(directory), [spec])
+            self.assertNotIn(error, run.preflight(*arguments)["missing"])
+            self.assertIn(error, run.preflight(*arguments, verify_hf_alignment=True)["missing"])
+            self.assertNotIn(error, run.preflight(*arguments, alignment_selection=selection, verify_hf_alignment=True)["missing"])
+            record["metadata_sha256"] = {}
+            self.assertIn(error, run.preflight(*arguments, alignment_selection=selection, verify_hf_alignment=True)["missing"])
+
     def group_lifecycle(self, interrupt):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

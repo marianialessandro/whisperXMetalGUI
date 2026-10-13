@@ -10,7 +10,7 @@ import sys
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from tools.baseline import contracts, corpus, manifest, provision, metrics, freeze, alignment_inventory
+from tools.baseline import contracts, corpus, manifest, provision, metrics, freeze, alignment_inventory, vad_inventory
 
 
 class RunError(ValueError):
@@ -21,6 +21,7 @@ def model_cache_roots(model_specs):
     roots = {"huggingface": set(), "torch_hub": set()}
     for spec in model_specs:
         transport = spec.get("transport", "huggingface")
+        if transport == "torch_hub_source": transport = "torch_hub"
         if transport not in roots:
             raise RunError("model_cache_transport_unsupported")
         roots[transport].add(Path(spec["cache_root"]).resolve())
@@ -29,7 +30,7 @@ def model_cache_roots(model_specs):
     return tuple(next(iter(roots[name]), None) for name in ("huggingface", "torch_hub"))
 
 
-def preflight(catalog, coverage, licenses, evidence_root, model_specs, alignment_selection=None):
+def preflight(catalog, coverage, licenses, evidence_root, model_specs, alignment_selection=None, verify_hf_alignment=False, vad_selection=None):
     corpus_report = corpus.preflight(catalog, coverage, licenses, evidence_root, evidence_root)
     models = [provision.inspect_spec(spec) for spec in model_specs]
     missing = list(corpus_report["missing"])
@@ -52,10 +53,15 @@ def preflight(catalog, coverage, licenses, evidence_root, model_specs, alignment
     for spec in model_specs:
         if spec.get("license_verified") is not True or not spec.get("license_source", "").startswith("https://"):
             missing.append({"code": "model_license_unverified", "repository": spec["repository"]})
+        if spec.get("transport") == "torch_hub_source":
+            if not vad_inventory.matches_spec(spec, vad_selection): missing.append({"code": "worker_vad_selection_unverified", "repository": spec["repository"]})
+            continue
         if spec.get("transport") == "torch_hub":
             if not alignment_inventory.matches_spec(spec, alignment_selection):
                 missing.append({"code": "worker_alignment_selection_unverified", "repository": spec["repository"]})
             continue
+        if verify_hf_alignment and str(spec.get("role", "")).startswith("alignment_") and not alignment_inventory.matches_spec(spec, alignment_selection):
+            missing.append({"code": "worker_alignment_selection_unverified", "repository": spec["repository"]})
         try:
             reference = manifest.contained(Path(spec["cache_root"]), Path("models--" + spec["repository"].replace("/", "--")) / "refs/main")
             verified = reference.is_file() and reference.read_text().strip() == spec["revision"]
@@ -69,6 +75,7 @@ def preflight(catalog, coverage, licenses, evidence_root, model_specs, alignment
         missing.append({"code": str(error)})
     report = {"status": "prerequisite_missing" if missing else "prerequisites_verified", "missing": missing, "models": models, "gpu_placement_certified": False}
     if alignment_selection is not None: report["alignment_selection"] = alignment_selection
+    if vad_selection is not None: report["vad_selection"] = vad_selection
     return report
 
 
@@ -193,6 +200,7 @@ def main(argv=None):
     parser.add_argument("--licenses", type=Path, required=True)
     parser.add_argument("--evidence-root", type=Path, required=True, help="Existing private corpus/evidence directory; no personal catalog or outputs.")
     parser.add_argument("--model-specs", type=Path, required=True)
+    parser.add_argument("--verify-hf-alignment", action="store_true", help="Optional stronger offline gate: verify declared HF alignment defaults, pinned processor metadata and installed Transformers version in the selected runtime. No neural checkpoints are loaded; legacy Torch-only inspection stays unchanged without this flag.")
     parser.add_argument("--bridge", type=Path, help="Private Keychain pipe for voices; never token argv/env/file.")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("preflight", help="Offline corpus/model gate and Torch default/config inspection in the selected runtime; no checkpoint loading, network or Keychain.")
@@ -226,16 +234,20 @@ def main(argv=None):
     try:
         catalog, coverage, licenses, specs = [json.loads(path.read_text()) for path in (args.corpus, args.coverage, args.licenses, args.model_specs)]
         selection = None
-        if args.command in ("preflight", "run", "full-gate", "calibrate", "freeze") and any(spec.get("transport") == "torch_hub" for spec in specs):
+        vad_selection = None
+        if args.command in ("preflight", "run", "full-gate", "calibrate", "freeze") and (any(spec.get("transport") == "torch_hub" for spec in specs) or args.verify_hf_alignment):
             imports = args.source_root if args.baseline_source == "gui-checkout" else args.source_root / "Contents/Resources"
-            selection = alignment_inventory.inspect_runtime(args.runtime, imports, args.model_specs)
+            selection = alignment_inventory.inspect_runtime(args.runtime, imports, args.model_specs, include_hf=True) if args.verify_hf_alignment else alignment_inventory.inspect_runtime(args.runtime, imports, args.model_specs)
+        if args.command in ("preflight", "run", "full-gate", "calibrate", "freeze") and any(spec.get("transport") == "torch_hub_source" for spec in specs):
+            imports = args.source_root if args.baseline_source == "gui-checkout" else args.source_root / "Contents/Resources"
+            vad_selection = vad_inventory.inspect_runtime(args.runtime, imports, args.model_specs)
         if args.command == "evaluate":
             result = metrics.evaluate_case(catalog, licenses, args.evidence_root, args.case_id, args.result, args.speaker_turns)
             identity = freeze.seal(args.evidence_root, args.output, result)
             print(json.dumps({"status": "evaluated_not_certified", "case_id": args.case_id, "sha256": identity}))
             return 0
         if args.command in ("calibrate", "freeze"):
-            prerequisites = preflight(catalog, coverage, licenses, args.evidence_root, specs, selection)
+            prerequisites = preflight(catalog, coverage, licenses, args.evidence_root, specs, selection, verify_hf_alignment=args.verify_hf_alignment, vad_selection=vad_selection)
             if prerequisites["missing"]:
                 print(json.dumps(prerequisites))
                 return 2
@@ -263,7 +275,7 @@ def main(argv=None):
             reports = [provision.provision_spec(spec, token) for spec in specs]
             print(json.dumps(manifest.sanitize({"status": "files_verified", "models": reports}, secrets=[token] if token else [])))
             return 0
-        report = preflight(catalog, coverage, licenses, args.evidence_root, specs, selection)
+        report = preflight(catalog, coverage, licenses, args.evidence_root, specs, selection, verify_hf_alignment=args.verify_hf_alignment, vad_selection=vad_selection)
         if args.command in ("preflight", "full-gate") or report["missing"]:
             if args.command == "full-gate" and not report["missing"]:
                 frozen = freeze.verify_frozen(args.evidence_root, args.frozen, args.sha256, coverage)

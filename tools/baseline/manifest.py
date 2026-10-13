@@ -196,7 +196,7 @@ def collect(selection, source_root, runtime, reference_root, model_specs=(), set
     if not installed: prerequisites.append(failure("runtime_metadata_missing"))
     if not runtime_manifest.is_file(): prerequisites.append(failure("runtime_manifest_missing"))
     from tools.baseline import provision
-    models = [provision.inspect_spec(spec) if spec.get("transport") == "torch_hub" or "components" in spec else model_identity(spec["cache_root"], spec["repository"], spec["revision"], spec["files"]) for spec in model_specs]
+    models = [provision.inspect_spec(spec) if spec.get("transport") in ("torch_hub", "torch_hub_source") or "components" in spec else model_identity(spec["cache_root"], spec["repository"], spec["revision"], spec["files"]) for spec in model_specs]
     if not models: prerequisites.append(failure("model_inventory_missing"))
     for model in models:
         if model["status"] not in ("identified", "files_verified"): prerequisites.append(failure(model["code"]))

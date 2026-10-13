@@ -11,7 +11,7 @@ import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from tools.baseline import manifest, provision, ctc_metal_probe
+from tools.baseline import manifest, provision, ctc_metal_probe, alignment_inventory
 from tools.baseline.offline_worker import deny_python_network
 from tools.baseline.native_ctc import NativeCTC
 
@@ -153,9 +153,11 @@ def main(argv=None):
     parser.add_argument("--audio-sha256", required=True)
     parser.add_argument("--segments", type=Path, required=True, help="Private hash-verified ASR original JSON; never independent word/speaker ground truth.")
     parser.add_argument("--segments-sha256", required=True)
-    parser.add_argument("--segments-origin", choices=("asr", "dataset-transcript"), default="asr", help="Optional input provenance: legacy ASR result, or official dataset text with explicit segment bounds. Dataset bounds are not independent reviewed word/speaker annotations; no ASR is executed by this alignment trial.")
-    parser.add_argument("--language", choices=("it", "en", "fr", "de"), required=True, help="Selected Torch default alignment language; IT/EN legacy trials remain unchanged. FR/DE require their own verified checkpoint specs.")
-    parser.add_argument("--torch-specs", type=Path, required=True)
+    parser.add_argument("--segments-origin", choices=("asr", "dataset-transcript", "synthetic-text"), default="asr", help="Optional input provenance: legacy ASR result, official dataset text, or controlled synthetic text with explicit segment bounds. Dataset/synthetic bounds are not independent reviewed word/speaker annotations; no ASR is executed by this alignment trial.")
+    parser.add_argument("--language", choices=("it", "en", "fr", "de", "ja", "zh", "ar", "uk", "no"), required=True, help="Selected default alignment language; legacy Torch trials remain unchanged. HF languages require their own verified --hf-specs inventory.")
+    models = parser.add_mutually_exclusive_group(required=True)
+    models.add_argument("--torch-specs", type=Path, help="Legacy pinned Torch bundle inventory.")
+    models.add_argument("--hf-specs", type=Path, help="Optional alternative: pinned HF checkpoint plus verified processor metadata/runtime/default repository and matching refs/main; no download during the trial.")
     parser.add_argument("--output-dir", type=Path, required=True, help="New private output directory for both aligned results and explicit partial comparison.")
     parser.add_argument("--replicas", type=int, default=1, help="Optional 1–10 same-loaded-model replicas with alternating original/candidate order; no cold-process benchmark claim.")
     parser.add_argument("--warmup", action="store_true", help="Run both paths once outside timings before the recorded replicas.")
@@ -219,13 +221,20 @@ def main(argv=None):
     try:
         if args.output_dir.exists() or manifest.sha256(args.audio) != args.audio_sha256 or manifest.sha256(args.segments) != args.segments_sha256:
             raise ValueError("trial_inputs_or_destination_invalid")
-        specs = json.loads(args.torch_specs.read_text())
+        specs = json.loads((args.hf_specs or args.torch_specs).read_text())
         spec = next(item for item in specs if item.get("role") == "alignment_" + args.language)
+        if spec.get("transport", "huggingface") != ("huggingface" if args.hf_specs else "torch_hub"): raise ValueError("trial_alignment_transport_not_supported")
         if spec.get("license_verified") is not True or provision.inspect_spec(spec)["status"] != "files_verified":
             raise ValueError("trial_alignment_checkpoint_not_verified")
+        if args.hf_specs:
+            with deny_python_network(): records, source_digest = alignment_inventory.collect_huggingface(Path(__file__).resolve().parents[2], [spec])
+            if len(records) != 1 or not alignment_inventory.matches_spec(spec, {"status": "selection_inventory_verified", "models": records}): raise ValueError("trial_hf_alignment_selection_not_verified")
+            reference = manifest.contained(Path(spec["cache_root"]), Path("models--" + spec["repository"].replace("/", "--")) / "refs/main")
+            if not reference.is_file() or reference.read_text().strip() != spec["revision"]: raise ValueError("trial_hf_default_revision_not_verified")
         original = json.loads(args.segments.read_text())
         args.output_dir.mkdir(parents=True)
-        os.environ.update(TORCH_HOME=spec["cache_root"], HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_HUB_DISABLE_IMPLICIT_TOKEN="1")
+        os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_HUB_DISABLE_IMPLICIT_TOKEN="1")
+        os.environ["HF_HUB_CACHE" if args.hf_specs else "TORCH_HOME"] = spec["cache_root"]
         os.environ["PATH"] = str(Path(sys.executable).parent) + ":/usr/bin:/bin"
         spans = []
         wildcard_spans = []
@@ -283,7 +292,7 @@ def main(argv=None):
                 from tools.baseline.native_interpolation import synthetic_sentence_gaps
                 resources.enter_context(synthetic_sentence_gaps(alignment))
             audio = whisperx.load_audio(str(args.audio))
-            model, metadata = whisperx.load_align_model(args.language, "mps")
+            model, metadata = whisperx.load_align_model(args.language, "mps", model_dir=spec["cache_root"], model_cache_only=True) if args.hf_specs else whisperx.load_align_model(args.language, "mps")
             if args.warmup:
                 alignment.align(original["segments"], model, metadata, audio, "mps", return_char_alignments=args.return_char_alignments)
                 with candidate_context([], [], [], [], [], []): alignment.align(original["segments"], model, metadata, audio, "mps", return_char_alignments=args.return_char_alignments)
@@ -306,9 +315,10 @@ def main(argv=None):
         for name, result in (("original-aligned.json", baseline), ("metal-ctc-aligned.json", candidate)):
             with (args.output_dir / name).open("x") as output: json.dump(result, output, ensure_ascii=False, indent=2)
         report = {"scope": "experimental_ctc_alignment_only", "status": "aligned_exactly_equal" if all(matches) else "aligned_mismatch", "source_audio_sha256": args.audio_sha256, "asr_result_sha256": args.segments_sha256, "original_completion_ns": baseline_ns, "metal_trial_completion_ns": candidate_ns, "timing_scope": "one_original_then_one_candidate_same_loaded_model_not_speedup_benchmark" if args.replicas == 1 else "alternating_same_loaded_model_alignment_only", "original_replicas_ns": baseline_times, "candidate_replicas_ns": candidate_times, "orders": orders, "all_replicas_exactly_equal": all(matches), "warmup_performed": args.warmup, "ctc_spans": spans, "residuals": ["original_mps_to_cpu_emission_boundary", "cpu_to_mlx_probe_bridge", "cpu_word_char_timestamp_reductions", "cpu_wildcard_column_reduction"], "quality_certified": False, "production_backend": False, "full_baseline_gate_passed": False}
-        if args.segments_origin == "dataset-transcript":
+        if args.segments_origin != "asr":
             report["segments_sha256"] = report.pop("asr_result_sha256")
-            report.update(segments_origin="official_dataset_text_with_explicit_unreviewed_segment_bounds", independent_word_speaker_ground_truth=False, asr_performed=False)
+            report.update(segments_origin="official_dataset_text_with_explicit_unreviewed_segment_bounds" if args.segments_origin == "dataset-transcript" else "controlled_synthetic_text_not_asr_or_ground_truth", independent_word_speaker_ground_truth=False, asr_performed=False)
+        if args.hf_specs: report.update(alignment_selection_verified=True, alignment_source_sha256=source_digest, alignment_model_revision=spec["revision"], alignment_processor_metadata_sha256=records[0]["metadata_sha256"], alignment_dictionary_sha256=records[0]["dictionary_sha256"])
         report["ctc_backend"], report["native_identity"] = args.ctc_backend, native_identity
         report["native_context_initialization_wall_ns"] = native_setup_ns
         report["native_wildcard_max_enabled"], report["wildcard_spans"] = args.native_wildcard_max, wildcard_spans
