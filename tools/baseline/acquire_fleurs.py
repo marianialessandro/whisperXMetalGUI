@@ -10,6 +10,7 @@ import sys
 import subprocess
 import tempfile
 import os
+import re
 from urllib.request import urlopen
 import wave
 
@@ -19,7 +20,7 @@ from tools.baseline.manifest import sha256
 
 REVISION = "70bb2e84b976b7e960aa89f1c648e09c59f894dd"
 CARD_HASH = "688f79f2a5c731af3796e9f683eb02f9b3f09d040decd8c5625d0f37098e71c6"
-CONFIGS = {"it": "it_it", "en": "en_us"}
+CONFIGS = {"it": "it_it", "en": "en_us", "fr": "fr_fr", "de": "de_de"}
 
 
 def read_public(url, limit=2 * 1024 * 1024):
@@ -57,7 +58,18 @@ def audio_info(path):
     return {"sample_rate": int(info["streams"][0]["sample_rate"]), "channels": int(info["streams"][0]["channels"]), "duration": float(info["format"]["duration"]), "codec": info["streams"][0]["codec_name"]}
 
 
-def acquire_language(language, evidence_root, count=2):
+def legal_text(root, cached_sha256=None):
+    if cached_sha256 is None:
+        return read_public("https://groups.inf.ed.ac.uk/ami/corpus/license.shtml")
+    require(isinstance(cached_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", cached_sha256), "license_cache_hash_invalid")
+    path = safe_target(root, "licenses/CC-BY-4.0.html")
+    require(path.is_file() and 0 < path.stat().st_size <= 2 * 1024 * 1024, "license_cache_invalid")
+    data = path.read_bytes()
+    require(hashlib.sha256(data).hexdigest() == cached_sha256 and b"Attribution 4.0" in data, "license_cache_mismatch")
+    return data
+
+
+def acquire_language(language, evidence_root, count=2, cached_license_sha256=None, raw_metadata=False):
     require(language in CONFIGS and 1 <= count <= 10, "selection_invalid")
     root = Path(evidence_root)
     require(root.is_dir() and not root.is_symlink(), "evidence_root_invalid")
@@ -65,7 +77,7 @@ def acquire_language(language, evidence_root, count=2):
     base = "https://huggingface.co/datasets/google/fleurs/resolve/" + REVISION + "/"
     card = read_public("https://huggingface.co/datasets/google/fleurs/raw/" + REVISION + "/README.md")
     require(hashlib.sha256(card).hexdigest() == CARD_HASH and b"cc-by-4.0" in card, "license_card_mismatch")
-    legal = read_public("https://groups.inf.ed.ac.uk/ami/corpus/license.shtml")
+    legal = legal_text(root, cached_license_sha256)
     require(b"Attribution 4.0" in legal, "license_text_invalid")
     keep_document(root, "licenses/fleurs-card.md", card)
     keep_document(root, "licenses/CC-BY-4.0.html", legal)
@@ -75,13 +87,15 @@ def acquire_language(language, evidence_root, count=2):
     require(entry is not None and entry.get("lfs", {}).get("oid"), "official_archive_identity_missing")
     asset = {"id": "fleurs-" + language + "-dev-archive", "path": "archives/" + language + "-dev.tar.gz", "url": base + archive_path, "revision": REVISION, "sha256": entry["lfs"]["oid"], "max_bytes": entry["size"], "license_id": "fleurs-cc-by-4.0"}
     license = {"id": asset["license_id"], "verified": True, "revision": REVISION, "source": "https://huggingface.co/datasets/google/fleurs/raw/" + REVISION + "/README.md", "text_path": "licenses/CC-BY-4.0.html", "text_sha256": hashlib.sha256(legal).hexdigest(), "legal_text_source": "https://groups.inf.ed.ac.uk/ami/corpus/license.shtml", "attribution": "FLEURS: Conneau et al. (2022), Google, Few-shot Learning Evaluation of Universal Representations of Speech. CC BY 4.0. Selected unmodified development recordings.", "rights": {"download": True, "derive": True, "share": True}, "asset_ids": [asset["id"]], "dataset_card_sha256": CARD_HASH}
+    if cached_license_sha256 is not None: license["legal_text_acquisition"] = "explicit_hash_verified_private_cache"
     archive = safe_target(root, asset["path"])
     if archive.exists():
         require(sha256(archive) == asset["sha256"], "existing_archive_mismatch")
     else:
         print(json.dumps({"stage": "acquisition", "language": language, "bytes": asset["max_bytes"]}), flush=True)
         acquire(asset, license, root, root)
-    metadata = read_public(base + "data/" + config + "/dev.tsv")
+    metadata_base = base.replace("/resolve/", "/raw/") if raw_metadata else base
+    metadata = read_public(metadata_base + "data/" + config + "/dev.tsv")
     keep_document(root, "metadata/" + language + "-dev.tsv", metadata)
     candidates = sorted(csv.reader(io.StringIO(metadata.decode()), delimiter="\t"), key=lambda row: row[1])[:count]
     require(all(len(row) >= 5 and row[1].endswith(".wav") and Path(row[1]).name == row[1] for row in candidates), "source_metadata_invalid")
@@ -119,9 +133,11 @@ def main(argv=None):
     parser.add_argument("--evidence-root", type=Path, required=True, help="Existing private directory; archives and samples never overwrite existing data.")
     parser.add_argument("--language", choices=CONFIGS, required=True)
     parser.add_argument("--count", type=int, default=2, help="1–10 deterministic clips; the first acquisition downloads one full official dev archive (IT 289 MB, EN 171 MB).")
+    parser.add_argument("--cached-license-sha256", help="Optional exact SHA256 of previously acquired licenses/CC-BY-4.0.html in the evidence root; reuse that bounded, hash-verified legal text instead of fetching it again. The pinned dataset card is still fetched and verified.")
+    parser.add_argument("--raw-metadata", action="store_true", help="Fetch the TSV from the official raw endpoint at the same fixed revision; optional alternative to the legacy resolve endpoint when it is rate limited. Audio archive URL/hash checks stay unchanged.")
     args = parser.parse_args(argv)
     try:
-        result = acquire_language(args.language, args.evidence_root, args.count)
+        result = acquire_language(args.language, args.evidence_root, args.count, args.cached_license_sha256, args.raw_metadata)
         print(json.dumps({"status": result["status"], "language": args.language, "clips": len(result["audio"]), "quality_certified": False}))
         return 0
     except (OSError, ValueError, KeyError, TypeError, StopIteration, wave.Error, subprocess.SubprocessError):

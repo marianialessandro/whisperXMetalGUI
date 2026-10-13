@@ -153,7 +153,8 @@ def main(argv=None):
     parser.add_argument("--audio-sha256", required=True)
     parser.add_argument("--segments", type=Path, required=True, help="Private hash-verified ASR original JSON; never independent word/speaker ground truth.")
     parser.add_argument("--segments-sha256", required=True)
-    parser.add_argument("--language", choices=("it", "en"), required=True)
+    parser.add_argument("--segments-origin", choices=("asr", "dataset-transcript"), default="asr", help="Optional input provenance: legacy ASR result, or official dataset text with explicit segment bounds. Dataset bounds are not independent reviewed word/speaker annotations; no ASR is executed by this alignment trial.")
+    parser.add_argument("--language", choices=("it", "en", "fr", "de"), required=True, help="Selected Torch default alignment language; IT/EN legacy trials remain unchanged. FR/DE require their own verified checkpoint specs.")
     parser.add_argument("--torch-specs", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True, help="New private output directory for both aligned results and explicit partial comparison.")
     parser.add_argument("--replicas", type=int, default=1, help="Optional 1–10 same-loaded-model replicas with alternating original/candidate order; no cold-process benchmark claim.")
@@ -305,6 +306,9 @@ def main(argv=None):
         for name, result in (("original-aligned.json", baseline), ("metal-ctc-aligned.json", candidate)):
             with (args.output_dir / name).open("x") as output: json.dump(result, output, ensure_ascii=False, indent=2)
         report = {"scope": "experimental_ctc_alignment_only", "status": "aligned_exactly_equal" if all(matches) else "aligned_mismatch", "source_audio_sha256": args.audio_sha256, "asr_result_sha256": args.segments_sha256, "original_completion_ns": baseline_ns, "metal_trial_completion_ns": candidate_ns, "timing_scope": "one_original_then_one_candidate_same_loaded_model_not_speedup_benchmark" if args.replicas == 1 else "alternating_same_loaded_model_alignment_only", "original_replicas_ns": baseline_times, "candidate_replicas_ns": candidate_times, "orders": orders, "all_replicas_exactly_equal": all(matches), "warmup_performed": args.warmup, "ctc_spans": spans, "residuals": ["original_mps_to_cpu_emission_boundary", "cpu_to_mlx_probe_bridge", "cpu_word_char_timestamp_reductions", "cpu_wildcard_column_reduction"], "quality_certified": False, "production_backend": False, "full_baseline_gate_passed": False}
+        if args.segments_origin == "dataset-transcript":
+            report["segments_sha256"] = report.pop("asr_result_sha256")
+            report.update(segments_origin="official_dataset_text_with_explicit_unreviewed_segment_bounds", independent_word_speaker_ground_truth=False, asr_performed=False)
         report["ctc_backend"], report["native_identity"] = args.ctc_backend, native_identity
         report["native_context_initialization_wall_ns"] = native_setup_ns
         report["native_wildcard_max_enabled"], report["wildcard_spans"] = args.native_wildcard_max, wildcard_spans

@@ -3,6 +3,7 @@
 import argparse
 import ast
 import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.request
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -19,6 +22,9 @@ from tools.baseline.manifest import BaselineError, contained, model_identity, sa
 
 class ProvisionError(ValueError):
     pass
+
+
+TORCH_MAX_BYTES = 1024 ** 3
 
 
 @contextlib.contextmanager
@@ -226,6 +232,76 @@ def provision_spec(spec, token=None, downloader=None):
     return result
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        raise ProvisionError("model_download_redirect_rejected")
+
+
+def provision_torch_spec(spec, observe_hash=False, opener=None):
+    """Acquire opaque official checkpoint bytes without deserialization or replacement."""
+    files = spec.get("files")
+    if spec.get("transport") != "torch_hub" or not isinstance(files, list) or len(files) != 1 or not isinstance(files[0], str) or not re.fullmatch(r"[A-Za-z0-9_.-]+\.(pt|pth)", files[0]): raise ProvisionError("model_path_invalid")
+    name = files[0]
+    source = "https://download.pytorch.org/torchaudio/models/" + name
+    repository, role = spec.get("repository"), spec.get("role")
+    if spec.get("source") != source or not isinstance(repository, str) or not repository.startswith("torchaudio/") or not isinstance(role, str) or not role.startswith("alignment_"): raise ProvisionError("model_source_invalid")
+    license_source, revision = spec.get("license_source"), spec.get("revision")
+    if spec.get("license_verified") is not True or not isinstance(license_source, str) or not license_source.startswith("https://") or not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision): raise ProvisionError("model_authorization_or_revision_missing")
+    hashes = spec.get("sha256", {})
+    if not isinstance(hashes, dict): raise ProvisionError("model_expected_hash_missing")
+    expected = hashes.get(name, "")
+    if observe_hash:
+        if expected: raise ProvisionError("model_observation_requires_unpinned_spec")
+    elif not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected): raise ProvisionError("model_expected_hash_missing")
+    target = contained(Path(spec["cache_root"]), Path("hub/checkpoints") / name)
+    if target.exists():
+        if observe_hash: raise ProvisionError("model_observation_requires_new_acquisition")
+        result = inspect_torch_spec(spec)
+        if result["status"] != "files_verified": raise ProvisionError(result["code"])
+        return {**result, "acquisition_status": "already_verified"}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".baseline-torch-", dir=target.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            if opener is None: opener = urllib.request.build_opener(NoRedirect()).open
+            started = time.monotonic()
+            with opener(urllib.request.Request(source, headers={"Accept-Encoding": "identity"}), timeout=30) as response:
+                if response.geturl() != source or response.status != 200 or response.headers.get("Content-Encoding", "identity") != "identity": raise ProvisionError("model_download_response_invalid")
+                raw_length = response.headers.get("Content-Length")
+                length = int(raw_length) if raw_length is not None else None
+                limit = TORCH_MAX_BYTES
+                if length is not None and not 0 < length <= limit: raise ProvisionError("model_download_size_invalid")
+                digest, size = hashlib.sha256(), 0
+                while True:
+                    if time.monotonic() - started > 600: raise ProvisionError("model_download_timeout")
+                    chunk = response.read(1024 * 1024)
+                    if not chunk: break
+                    size += len(chunk)
+                    if size > limit: raise ProvisionError("model_download_size_invalid")
+                    digest.update(chunk)
+                    output.write(chunk)
+                if size == 0 or length is not None and size != length: raise ProvisionError("model_download_size_invalid")
+                observed = digest.hexdigest()
+                if not observe_hash and observed != expected: raise ProvisionError("model_hash_mismatch")
+                output.flush()
+                os.fsync(output.fileno())
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            raise ProvisionError("model_acquisition_conflict") from None
+    except ProvisionError:
+        raise
+    except Exception:
+        raise ProvisionError("model_download_failed") from None
+    finally:
+        os.unlink(temporary)
+    if observe_hash:
+        return {"repository": spec["repository"], "revision": spec["revision"], "status": "acquired_hash_observed_unpinned", "files": [{"name": name, "sha256": observed, "bytes": size}], "hash_provenance": "observed_official_https_first_acquisition_not_published_checksum", "source_revision_scope": "upstream_training_repository_not_download_content", "loadability_verified": False, "native_conversion_proven": False}
+    result = inspect_torch_spec(spec)
+    if result["status"] != "files_verified": raise ProvisionError(result["code"])
+    return {**result, "acquisition_status": "downloaded_and_verified"}
+
+
 def bind_default_reference(spec):
     if spec.get("transport") == "torch_hub": raise ProvisionError("torch_hub_has_no_huggingface_reference")
     if spec.get("license_verified") is not True or not spec.get("license_source", "").startswith("https://"): raise ProvisionError("model_authorization_or_revision_missing")
@@ -258,13 +334,16 @@ def main(argv=None):
     parser.add_argument("--specs", type=Path, required=True, help="Declared repositories, full revisions, required files, expected hashes and individually verified license/access records.")
     parser.add_argument("--bridge", type=Path, help="Development bridge compiled under the private evidence directory; used only for explicit gated downloads.")
     parser.add_argument("--bind-default-ref", action="store_true", help="Optional explicit cache metadata write after file/hash/license verification: create missing HF refs/main at the declared revision, never overwrite a conflicting ref. Torch Hub is unchanged; preflight remains offline.")
-    parser.add_argument("command", choices=("preflight", "download"), help="preflight verifies HF/torch_hub files without model loading or Keychain/network; download provisions pinned HF snapshots only; torch_hub checkpoints require separate explicit acquisition.")
+    parser.add_argument("--download-torch", action="store_true", help="Explicitly allow official HTTPS Torch checkpoint acquisition during download, with pinned SHA256 verification and no checkpoint loading or overwrite.")
+    parser.add_argument("--observe-torch-hash", action="store_true", help="With download --download-torch only: record the first official acquisition hash for an unpinned new checkpoint; exit 2 until the observed digest is explicitly pinned in the specs. Never a published checksum or verified role.")
+    parser.add_argument("command", choices=("preflight", "download"), help="preflight verifies HF/torch_hub files without model loading or Keychain/network; download defaults to pinned HF snapshots only, with explicit --download-torch required for Torch acquisition.")
     args = parser.parse_args(argv)
+    if args.download_torch and args.command != "download" or args.observe_torch_hash and not args.download_torch: parser.error("Torch acquisition options require download --download-torch")
     try:
         specs = json.loads(args.specs.read_text())
         token = read_credential(args.bridge) if args.command == "download" and any(spec.get("gated") for spec in specs) and args.bridge else None
         with open(os.devnull, "w") as sink, contextlib.redirect_stderr(sink):
-            reports = [inspect_spec(spec) if args.command == "preflight" else provision_spec(spec, token) for spec in specs]
+            reports = [inspect_spec(spec) if args.command == "preflight" else provision_torch_spec(spec, args.observe_torch_hash) if spec.get("transport") == "torch_hub" and args.download_torch else provision_spec(spec, token) for spec in specs]
             if args.bind_default_ref:
                 reports = [bind_default_reference(spec) if spec.get("transport") != "torch_hub" else report for spec, report in zip(specs, reports)]
         report = sanitize({"status": "files_verified" if reports and all(report["status"] == "files_verified" for report in reports) else "prerequisite_missing", "models": reports}, secrets=[token] if token else [])

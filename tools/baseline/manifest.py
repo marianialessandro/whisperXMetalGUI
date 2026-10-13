@@ -27,6 +27,7 @@ SAFE_KEYS |= frozenset("loadability_verified native_conversion_proven tensors ha
 SAFE_KEYS |= frozenset("seed deterministic_algorithms_forced".split())
 SAFE_KEYS |= frozenset("default_reference_status".split())
 SAFE_KEYS |= frozenset("roles components_verified component_config_sha256".split())
+SAFE_KEYS |= frozenset("acquisition_status hash_provenance source_revision_scope".split())
 
 
 def failure(code, error=None):
