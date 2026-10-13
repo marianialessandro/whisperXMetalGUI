@@ -159,11 +159,13 @@ def main(argv=None):
     parser.add_argument("--replicas", type=int, default=1, help="Optional 1–10 same-loaded-model replicas with alternating original/candidate order; no cold-process benchmark claim.")
     parser.add_argument("--warmup", action="store_true", help="Run both paths once outside timings before the recorded replicas.")
     parser.add_argument("--return-char-alignments", action="store_true", help="Include original character-level JSON in both outputs and exact comparison; default preserves the word-only trial.")
-    parser.add_argument("--ctc-backend", choices=("mlx", "native", "native-persistent"), default="mlx", help="Optional experimental CTC backend; native uses a private NPZ subprocess per segment; native-persistent uses one in-memory C ABI context for all segments, with setup reported separately.")
+    parser.add_argument("--ctc-backend", choices=("mlx", "native", "native-persistent", "native-mps"), default="mlx", help="Optional experimental CTC backend; native uses a private NPZ subprocess per segment; native-persistent uses one in-memory C ABI context; native-mps borrows pending MPS emissions directly. Setup is reported separately.")
     parser.add_argument("--native-binary", type=Path, help="Explicit prebuilt native_ctc_probe executable, required with native backend.")
     parser.add_argument("--native-binary-sha256", help="Expected SHA256 of the native executable, required with native backend.")
     parser.add_argument("--native-library", type=Path, help="Explicit prebuilt native CTC dylib, required with native-persistent backend.")
     parser.add_argument("--native-library-sha256", help="Expected SHA256 of the native dylib, required with native-persistent backend.")
+    parser.add_argument("--mps-library", type=Path, help="Optional pinned Torch interop dylib built by mps_storage_probe.py; required with native-mps backend.")
+    parser.add_argument("--mps-library-sha256", help="Expected SHA256 of the Torch interop dylib, required with native-mps backend.")
     parser.add_argument("--native-wildcard-max", action="store_true", help="Optional trial-only interception of CPU FP32 max(dim=1) using native Metal; requires native-persistent. Mask/gather/concatenation and max readback still use the original CPU boundary.")
     parser.add_argument("--native-fused-wildcard", action="store_true", help="Optional trial-only deferred wildcard preparation; native Metal expands the source emission and runs CTC without intermediate wildcard readback. Requires native-persistent; excludes --native-wildcard-max.")
     parser.add_argument("--native-character-segments", action="store_true", help="Optional GPU character bounds/means and segment-only readback; requires native-persistent and pinned CPython 3.12 sum semantics. Word reductions/timestamp scaling remain original.")
@@ -186,6 +188,8 @@ def main(argv=None):
     if args.ctc_backend != "native" and (args.native_binary is not None or args.native_binary_sha256 is not None): parser.error("native binary options require --ctc-backend native")
     if args.ctc_backend == "native-persistent" and (args.native_library is None or args.native_library_sha256 is None): parser.error("native-persistent backend requires library and its expected SHA256")
     if args.ctc_backend != "native-persistent" and (args.native_library is not None or args.native_library_sha256 is not None): parser.error("native library options require --ctc-backend native-persistent")
+    if args.ctc_backend == "native-mps" and (args.mps_library is None or args.mps_library_sha256 is None): parser.error("native-mps backend requires interop library and its expected SHA256")
+    if args.ctc_backend != "native-mps" and (args.mps_library is not None or args.mps_library_sha256 is not None): parser.error("MPS library options require --ctc-backend native-mps")
     if args.native_wildcard_max and args.ctc_backend != "native-persistent": parser.error("--native-wildcard-max requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.ctc_backend != "native-persistent": parser.error("--native-fused-wildcard requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.native_wildcard_max: parser.error("wildcard modes are mutually exclusive")
@@ -240,7 +244,10 @@ def main(argv=None):
                     from tools.baseline.native_ctc_fused import fused_wildcard_preparation
                     scopes.enter_context(fused_wildcard_preparation(max(metadata["dictionary"].values()) + 1))
                 if args.native_wildcard_max: scopes.enter_context(native_wildcard_max(persistent, maximum_records))
-                if args.ctc_backend == "native-persistent": scopes.enter_context(persistent_metal_ctc(alignment, records, persistent, args.native_character_segments, args.native_character_rounding, round_records, args.native_resident_character_rounding))
+                if args.ctc_backend == "native-mps":
+                    from tools.baseline.native_mps_ctc import native_mps_ctc
+                    scopes.enter_context(native_mps_ctc(alignment, mps_context, records))
+                elif args.ctc_backend == "native-persistent": scopes.enter_context(persistent_metal_ctc(alignment, records, persistent, args.native_character_segments, args.native_character_rounding, round_records, args.native_resident_character_rounding))
                 else: scopes.enter_context(native_metal_ctc(alignment, records, args.native_binary, args.native_binary_sha256) if args.ctc_backend == "native" else metal_ctc(alignment, records))
                 yield
         native_setup_ns = None
@@ -248,6 +255,11 @@ def main(argv=None):
             if args.ctc_backend == "native-persistent":
                 persistent = resources.enter_context(NativeCTC(args.native_library, args.native_library_sha256))
                 native_identity, native_setup_ns = persistent.identity, persistent.initialization_wall_ns
+            if args.ctc_backend == "native-mps":
+                from tools.baseline.mps_storage_probe import MPSCTC
+                kernels = Path(__file__).with_name("native_ctc.metal")
+                mps_context = resources.enter_context(MPSCTC(args.mps_library, args.mps_library_sha256, kernels, manifest.sha256(kernels)))
+                native_identity, native_setup_ns = mps_context.identity, mps_context.initialization_wall_ns
             import whisperx
             import whisperx.alignment as alignment
             import torch
@@ -316,6 +328,8 @@ def main(argv=None):
             report["timestamp_bounds_reference_runtime"] = {"pandas": alignment.pd.__version__, "numpy": np.__version__, "policy": "binary64_min_max_skipna_negative_zero_rejected"}
         if args.ctc_backend == "native": report["residuals"][1] = "private_npz_and_native_process_startup_per_segment"
         if args.ctc_backend == "native-persistent": report["residuals"][1] = "cpu_to_native_shared_buffer_copy_per_segment"
+        report["native_mps_emission_handoff_enabled"] = args.ctc_backend == "native-mps"
+        if args.ctc_backend == "native-mps": report["residuals"] = ["mps_producer_wait_and_two_native_ctc_completions", "cpu_final_ctc_path_character_word_reductions_scaling_rounding_interpolation", "cpu_mask_and_token_metadata", "cpu_final_path_and_result_readback"]
         if args.native_wildcard_max: report["residuals"][-1] = "cpu_wildcard_mask_gather_concat_and_max_readback"
         if args.native_fused_wildcard: report["residuals"][-1] = "cpu_wildcard_mask_and_token_metadata"
         if args.native_character_segments: report["residuals"][2] = "cpu_word_reductions_and_character_timestamp_scaling"

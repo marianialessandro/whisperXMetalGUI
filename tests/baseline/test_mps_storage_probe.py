@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import contextlib
 from pathlib import Path
 import platform
 import subprocess
@@ -13,7 +14,8 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from tools.baseline.mps_storage_probe import MPSStorageProbe, build_library
+from tools.baseline.mps_storage_probe import MPSStorageProbe, MPSCTC, build_library
+from tools.baseline.native_mps_ctc import native_mps_ctc
 
 
 @unittest.skipUnless(platform.system() == "Darwin" and torch.__version__ == "2.8.0" and torch.backends.mps.is_available(), "Pinned Torch and Apple Metal required")
@@ -100,6 +102,91 @@ class MPSStorageProbeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "output_exists"): build_library(link)
             self.assertTrue(link.is_symlink())
             self.assertFalse(target.exists())
+
+    def ctc_context(self):
+        kernels = Path(__file__).resolve().parents[2] / "tools/baseline/native_ctc.metal"
+        return MPSCTC(self.library, self.identity, kernels, hashlib.sha256(kernels.read_bytes()).hexdigest())
+
+    def ctc_compare(self, context, emission, tokens, blank=0, wildcard=False):
+        import whisperx.alignment as alignment
+        reference = emission.cpu()
+        if wildcard:
+            mask = torch.ones(reference.shape[1], dtype=torch.bool)
+            mask[blank] = False
+            reference = torch.cat([reference, reference[:, mask].max(dim=1).values.unsqueeze(1)], dim=1)
+        expected = alignment.backtrack(alignment.get_trellis(reference, tokens, blank), reference, tokens, blank)
+        actual, record = context.compute(emission, tokens, blank, wildcard=wildcard)
+        if expected is None: self.assertIsNone(actual)
+        else:
+            self.assertEqual([(row[0], row[1]) for row in actual], [(point.token_index, point.time_index) for point in expected])
+            for row, point in zip(actual, expected): self.assertAlmostEqual(row[2], point.score, delta=16 * np.finfo(np.float32).eps)
+        self.assertEqual(record["borrowed_source_storage_offset_bytes"], emission.storage_offset() * 4)
+        self.assertEqual(record["logical_emission_host_readback_bytes"], 0)
+        self.assertEqual(record["logical_cpu_to_native_emission_bytes"], 0)
+        self.assertEqual(record["command_buffers_per_run"], 2)
+        self.assertGreater(record["computation_gpu_seconds"], 0)
+        return actual
+
+    def test_borrowed_ctc_offsets_wildcards_growth_and_impossible_paths(self):
+        generator = torch.Generator().manual_seed(341)
+        with self.ctc_context() as context:
+            for rows, columns, tokens, blank, wildcard in ((19, 6, [1, 2, 2, 4], 0, False), (341, 38, [1, 2, 3, 38, 4], 0, True), (127, 7, [0, 1, 7, 0], 3, True), (17, 4, [0, 2], 1, False)):
+                emission = torch.randn((rows + 3, columns), generator=generator).to("mps").log_softmax(dim=1)[2:rows + 2]
+                self.ctc_compare(context, emission, tokens, blank, wildcard)
+            self.ctc_compare(context, torch.full((9, 4), -np.inf, device="mps"), [1, 2])
+            with self.assertRaisesRegex(RuntimeError, "input_values_invalid"): context.compute(torch.tensor([[-1., np.nan], [-2., -1.]], device="mps"), [1])
+            self.ctc_compare(context, torch.tensor([[-1., -2.], [-2., -1.], [-1., -3.]], device="mps"), [1])
+        context.close()
+        with self.assertRaisesRegex(ValueError, "context_closed"): context.compute(torch.zeros((2, 3), device="mps"), [1])
+
+    def test_borrowed_ctc_guards_and_native_close_reject_stale_calls(self):
+        with self.ctc_context() as context:
+            valid = torch.full((7, 4), -1., device="mps")
+            for value in (valid.cpu(), valid.T, valid.half(), valid.clone().requires_grad_(), torch._neg_view(valid)):
+                with self.assertRaisesRegex(RuntimeError, "mps_ctc_tensor_not_supported"): context.compute(value, [1, 2])
+            for tokens in ([True], [2**32], [1.], np.array([1], dtype=np.int32)):
+                with self.assertRaisesRegex(ValueError, "token_metadata_invalid"): context.compute(valid, tokens)
+            with self.assertRaisesRegex(RuntimeError, "shape_or_blank_invalid"): context.compute(valid, [1], blank=4)
+            with self.assertRaisesRegex(RuntimeError, "input_values_invalid"): context.compute(valid, [-1])
+            native = context.context
+            context.close()
+            with self.assertRaisesRegex(RuntimeError, "context_closed"): native.compute(valid, torch.tensor([1], dtype=torch.int32), 0, False)
+
+    def test_scoped_live_emission_transport_and_restore_without_cpu_matrix(self):
+        import whisperx.alignment as alignment
+        original_trellis, original_backtrack = alignment.get_trellis, alignment.backtrack
+        for wildcard, inference in ((False, False), (True, False), (False, True), (True, True)):
+            records = []
+            logits = torch.randn((1, 37, 6), generator=torch.Generator().manual_seed(915)).to("mps")
+            tokens = [1, 2, 6, 3] if wildcard else [1, 2, 3]
+            with self.ctc_context() as context:
+                with native_mps_ctc(alignment, context, records):
+                    with torch.inference_mode() if inference else contextlib.nullcontext(): scores = torch.log_softmax(logits, dim=-1)
+                    emission = scores[0].cpu().detach()
+                    self.assertEqual(emission.base_emission.device.type, "mps")
+                    if wildcard:
+                        mask = torch.ones(6, dtype=torch.bool); mask[0] = False
+                        emission = torch.cat([emission, emission[:, mask].max(dim=1).values.unsqueeze(1)], dim=1)
+                    trellis = alignment.get_trellis(emission, tokens, 0)
+                    actual = alignment.backtrack(trellis, emission, tokens, 0)
+                    with self.assertRaises((ValueError, RuntimeError)): emission.numpy()
+                expected = self.ctc_compare(context, torch.log_softmax(logits, dim=-1)[0], tokens, wildcard=wildcard)
+                self.assertEqual([(p.token_index, p.time_index, p.score) for p in actual], expected)
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]["wildcard_fused"], wildcard)
+                with self.assertRaisesRegex(ValueError, "handoff_missing"):
+                    with native_mps_ctc(alignment, context, []): alignment.get_trellis(torch.zeros((7, 6)), [1])
+            self.assertIs(alignment.get_trellis, original_trellis)
+            self.assertIs(alignment.backtrack, original_backtrack)
+
+    def test_native_borrowed_ranges_and_resident_invalidation_under_sanitizers(self):
+        root = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "borrowed-harness"
+            subprocess.run(["xcrun", "clang++", "-std=c++17", "-O1", "-g", "-fobjc-arc", "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-Wno-deprecated-declarations", str(root / "tests/fixtures/baseline/mps_ctc_storage.mm"), "-I", str(root / "tools/baseline"), "-framework", "Foundation", "-framework", "Metal", "-o", str(binary)], capture_output=True, check=True, timeout=60)
+            result = subprocess.run([str(binary), str(root / "tools/baseline/native_ctc.metal")], capture_output=True, text=True, check=True, timeout=30)
+            self.assertIn("borrowed_storage_sanitizer_verified", result.stdout)
+            self.assertNotIn("runtime error", result.stderr)
 
     def test_cli_help_and_captured_emissions_report(self):
         root = Path(__file__).resolve().parents[2]

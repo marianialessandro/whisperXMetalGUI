@@ -9,6 +9,7 @@ import sys
 import tempfile
 import os
 import threading
+import time
 
 import torch
 
@@ -33,7 +34,7 @@ def build_library(output):
         subprocess.run(["xcrun", "install_name_tool", "-change", "@loader_path/libtorch_cpu.dylib", str(package / "lib/libtorch_cpu.dylib"), "-change", "@loader_path/libc10.dylib", str(package / "lib/libc10.dylib"), str(staged)], check=True, capture_output=True, timeout=20)
         subprocess.run(["codesign", "--force", "--sign", "-", str(staged)], check=True, capture_output=True, timeout=20)
         os.link(staged, output)
-    return {"library_sha256": hashlib.sha256(output.read_bytes()).hexdigest(), "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(), "torch_version": torch.__version__, "scope": "development_only_local_torch_linkage"}
+    return {"library_sha256": hashlib.sha256(output.read_bytes()).hexdigest(), "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(), "core_sha256": hashlib.sha256(source.with_name("native_ctc_core.hpp").read_bytes()).hexdigest(), "torch_version": torch.__version__, "scope": "development_only_local_torch_linkage"}
 
 
 class MPSStorageProbe:
@@ -55,6 +56,41 @@ class MPSStorageProbe:
         maxima, indices, metrics = torch.ops.whisperx_mps_probe.row_max(tensor)
         wait, wall, gpu, offset, source_bytes, readback, setup = metrics.tolist()
         return maxima, indices, {"scope": "development_mps_storage_row_max", "torch_version": torch.__version__, "library_sha256": self.library_sha256, "producer_completion_wait_seconds": wait, "completion_wall_seconds": wall, "computation_gpu_seconds": gpu, "pipeline_setup_included": bool(setup), "source_storage_offset_bytes": int(offset), "source_logical_bytes": int(source_bytes), "logical_emission_host_readback_bytes": 0, "logical_emission_reupload_bytes": 0, "logical_final_result_readback_bytes": int(readback), "physical_copy_bytes": None, "command_buffers_per_run": 1, "synchronization": "mps_stream_commit_and_wait_then_private_metal_queue_wait", "input_lifetime": "owning_tensor_and_strong_buffer_until_completion", "quality_certified": False, "production_backend": False}
+
+
+class MPSCTC:
+    def __init__(self, library, expected_sha256, kernels, kernels_sha256):
+        probe = MPSStorageProbe(library, expected_sha256)
+        kernels = Path(kernels).resolve(strict=True)
+        if kernels.stat().st_size > 1024 * 1024 or hashlib.sha256(kernels.read_bytes()).hexdigest() != kernels_sha256: raise ValueError("mps_ctc_shader_identity_invalid")
+        self.lock = threading.RLock()
+        started = time.perf_counter_ns()
+        self.context = torch.classes.whisperx_mps_probe.CTC(kernels.read_text())
+        self.initialization_wall_ns = time.perf_counter_ns() - started
+        self.identity = {"library_sha256": probe.library_sha256, "shader_sha256": kernels_sha256, "torch_version": torch.__version__}
+
+    def __enter__(self): return self
+
+    def __exit__(self, *args): self.close()
+
+    def close(self):
+        with self.lock:
+            if self.context is not None:
+                self.context.close()
+                self.context = None
+
+    def compute(self, emission, tokens, blank=0, wildcard=False):
+        with self.lock:
+            runtime_check()
+            if self.context is None: raise ValueError("mps_ctc_context_closed")
+            if not isinstance(tokens, (list, tuple)) or not 0 < len(tokens) <= 32768 or any(type(token) is not int or not -(2**31) <= token < 2**31 for token in tokens) or type(blank) is not int or not -(2**31) <= blank < 2**31 or type(wildcard) is not bool: raise ValueError("mps_ctc_token_metadata_invalid")
+            started = time.perf_counter_ns()
+            native_tokens = torch.tensor(tokens, dtype=torch.int32, device="cpu")
+            path, metrics = self.context.compute(emission, native_tokens, blank, wildcard)
+            found, wait, wall, validation_gpu, compute_gpu, dp_bytes, allocated, offset, readback = metrics.tolist()
+            points = [(int(row[0]), int(row[1]), row[2]) for row in path.tolist()] if found else None
+            record = {"scope": "experimental_native_mps_ctc", "frames": emission.shape[0], "vocabulary": emission.shape[1], "tokens": len(tokens), "wildcard_fused": wildcard, "producer_completion_wait_seconds": wait, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_completion_wall_ns": int(wall * 1e9), "validation_gpu_seconds": validation_gpu, "computation_gpu_seconds": compute_gpu, "command_buffers_per_run": 2, "dp_logical_storage_bytes": int(dp_bytes), "native_owned_buffer_bytes": int(allocated), "borrowed_source_storage_offset_bytes": int(offset), "logical_emission_host_readback_bytes": 0, "logical_cpu_to_native_emission_bytes": 0, "logical_token_upload_bytes": len(tokens) * 4, "logical_final_path_and_control_readback_bytes": int(readback), "physical_copy_bytes": None, "source_lifetime": "owning_tensor_and_strong_metal_reference_until_completion", "synchronization": "mps_producer_wait_then_two_native_ctc_completions", "quality_certified": False, "production_backend": False}
+            return points, record
 
 
 def probe_npz(args):

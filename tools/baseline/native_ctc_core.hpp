@@ -22,11 +22,11 @@ struct NativeBatchBoundsResult { std::vector<uint64_t> bounds; Timing timing; ui
 struct NativeBoundsResult { uint64_t minimum, maximum; Timing timing; uint64_t allocated_bytes; };
 struct NativeMaxResult { std::vector<float> values; std::vector<uint32_t> indices; std::vector<Timing> timings; uint64_t allocated_bytes; };
 
-static void encode(id<MTLCommandBuffer> command, id<MTLComputePipelineState> pipeline, NSArray<id<MTLBuffer>>* buffers, const Dimensions& dimensions, NSUInteger dimension_index, NSUInteger grid, NSUInteger group, NSString* label) {
+static void encode(id<MTLCommandBuffer> command, id<MTLComputePipelineState> pipeline, NSArray<id<MTLBuffer>>* buffers, const Dimensions& dimensions, NSUInteger dimension_index, NSUInteger grid, NSUInteger group, NSString* label, NSUInteger first_buffer_offset = 0) {
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "metal_encoder_creation_failed");
     encoder.label = label; [encoder setComputePipelineState:pipeline];
-    NSUInteger index = 0;
-    for (id<MTLBuffer> buffer in buffers) { if (index == dimension_index) ++index; [encoder setBuffer:buffer offset:0 atIndex:index++]; }
+    NSUInteger index = 0, ordinal = 0;
+    for (id<MTLBuffer> buffer in buffers) { if (index == dimension_index) ++index; [encoder setBuffer:buffer offset:ordinal++ == 0 ? first_buffer_offset : 0 atIndex:index++]; }
     [encoder setBytes:&dimensions length:sizeof(dimensions) atIndex:dimension_index];
     [encoder dispatchThreads:MTLSizeMake(grid, 1, 1) threadsPerThreadgroup:MTLSizeMake(group, 1, 1)];
     [encoder endEncoding];
@@ -40,11 +40,11 @@ static Timing complete(id<MTLCommandBuffer> command, std::chrono::steady_clock::
     return {static_cast<uint64_t>(wall), command.GPUEndTime - command.GPUStartTime};
 }
 
-static Timing execute(id<MTLCommandQueue> queue, id<MTLComputePipelineState> pipeline, NSArray<id<MTLBuffer>>* buffers, const Dimensions& dimensions, NSUInteger dimension_index, NSUInteger grid, NSUInteger group, NSString* label) {
+static Timing execute(id<MTLCommandQueue> queue, id<MTLComputePipelineState> pipeline, NSArray<id<MTLBuffer>>* buffers, const Dimensions& dimensions, NSUInteger dimension_index, NSUInteger grid, NSUInteger group, NSString* label, NSUInteger first_buffer_offset = 0) {
     auto started = std::chrono::steady_clock::now();
     id<MTLCommandBuffer> command = [queue commandBuffer]; require(command != nil, "metal_command_creation_failed");
     command.label = label;
-    encode(command, pipeline, buffers, dimensions, dimension_index, grid, group, label);
+    encode(command, pipeline, buffers, dimensions, dimension_index, grid, group, label, first_buffer_offset);
     return complete(command, started);
 }
 
@@ -101,15 +101,17 @@ public:
         queue_ = [device_ newCommandQueue]; require(queue_ != nil, "metal_queue_creation_failed");
     }
 
-    NativeResult compute(const float* emission, uint64_t emission_elements, const int32_t* tokens, uint64_t token_elements, const Dimensions& source, bool wildcard = false, bool segments = false, bool resident = false) {
+    NativeResult compute(const float* emission, uint64_t emission_elements, const int32_t* tokens, uint64_t token_elements, const Dimensions& source, bool wildcard = false, bool segments = false, bool resident = false, id<MTLBuffer> borrowed_emission = nil, uint64_t borrowed_offset = 0) {
         std::lock_guard<std::mutex> guard(mutex_);
         resident_generation_ = 0; rounded_generation_ = 0;
         require(!resident || segments, "resident_requires_segments");
         Dimensions d = source;
-        require(emission != nullptr && tokens != nullptr && d.frames > 0 && d.frames <= 32768 && d.vocabulary > 0 && d.vocabulary <= uint64_t(1) << 24 && d.count > 0 && d.count <= d.frames, "input_shape_invalid");
+        require((emission != nullptr || borrowed_emission != nil) && tokens != nullptr && d.frames > 0 && d.frames <= 32768 && d.vocabulary > 0 && d.vocabulary <= uint64_t(1) << 24 && d.count > 0 && d.count <= d.frames, "input_shape_invalid");
         uint64_t elements = uint64_t(d.frames) * d.vocabulary, cells = uint64_t(d.frames + 1) * (d.count + 1);
         require(emission_elements == elements && token_elements == d.count, "input_lengths_invalid");
         require(elements * 4 <= 64 * 1024 * 1024 && cells <= 16 * 1024 * 1024, "input_budget_invalid");
+        require(borrowed_emission != nil || borrowed_offset == 0, "borrowed_offset_without_buffer");
+        if (borrowed_emission != nil) require(borrowed_emission.device == device_ && borrowed_offset % 4 == 0 && borrowed_offset <= borrowed_emission.length && elements * 4 <= borrowed_emission.length - borrowed_offset, "borrowed_emission_range_or_device_invalid");
         if (wildcard) {
             require(batched_ && d.vocabulary >= 2 && uint64_t(d.frames) * (d.vocabulary + 1) * 4 <= 64 * 1024 * 1024, "wildcard_shape_or_budget_invalid");
             pipeline(wildcard_validate_, @"ctc_validate_wildcard"); pipeline(wildcard_expand_, @"ctc_expand_wildcard");
@@ -121,15 +123,19 @@ public:
             reserve(segment_bounds_, uint64_t(d.count) * 8); reserve(segment_means_, uint64_t(d.count) * 8);
         }
         uint64_t dp_bytes = compact_ ? 2 * uint64_t(d.count + 1) * 4 : cells * 4;
-        reserve(e_, elements * 4); reserve(t_, uint64_t(d.count) * 4); reserve(invalid_, 4);
+        if (borrowed_emission == nil) reserve(e_, elements * 4);
+        reserve(t_, uint64_t(d.count) * 4); reserve(invalid_, 4);
         reserve(prefix_, uint64_t(d.frames + 1) * 4); reserve(rows_, dp_bytes); reserve(path_, (1 + uint64_t(d.frames) * 3) * 4);
         if (compact_) { reserve(decisions_, uint64_t(d.frames) * d.count); reserve(endpoint_, 4); }
-        std::memcpy(e_.contents, emission, elements * 4); std::memcpy(t_.contents, tokens, uint64_t(d.count) * 4);
+        if (borrowed_emission == nil) std::memcpy(e_.contents, emission, elements * 4);
+        id<MTLBuffer> source_emission = borrowed_emission != nil ? borrowed_emission : e_;
+        std::memcpy(t_.contents, tokens, uint64_t(d.count) * 4);
         *static_cast<uint32_t*>(invalid_.contents) = 0;
         std::vector<Timing> timings;
-        timings.push_back(execute(queue_, wildcard ? wildcard_validate_ : pipelines_[0], @[e_, t_, invalid_], d, 2, elements, 256, wildcard ? @"ctc_validate_wildcard" : names_[0]));
+        timings.push_back(execute(queue_, wildcard ? wildcard_validate_ : pipelines_[0], @[source_emission, t_, invalid_], d, 2, elements, 256, wildcard ? @"ctc_validate_wildcard" : names_[0], borrowed_offset));
         require(*static_cast<uint32_t*>(invalid_.contents) == 0, "input_values_invalid");
-        id<MTLBuffer> input = wildcard ? expanded_ : e_;
+        id<MTLBuffer> input = wildcard ? expanded_ : source_emission;
+        const uint64_t input_offset = wildcard ? 0 : borrowed_offset;
         if (wildcard) ++d.vocabulary;
         NSArray<id<MTLBuffer>>* trellis = compact_ ? @[input, t_, prefix_, rows_, decisions_, endpoint_] : @[input, t_, prefix_, rows_];
         NSArray<id<MTLBuffer>>* backtrack = compact_ ? @[input, t_, rows_, path_, decisions_, endpoint_] : @[input, t_, rows_, path_];
@@ -138,16 +144,16 @@ public:
             id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "metal_command_creation_failed");
             command.label = wildcard ? @"ctc_wildcard_prefix_trellis_backtrack" : @"ctc_prefix_trellis_backtrack";
             // Default tracked buffers preserve dependencies between sequential encoders.
-            if (wildcard) encode(command, wildcard_expand_, @[e_, expanded_], source, 1, uint64_t(d.frames) * 256, 256, @"ctc_expand_wildcard");
-            encode(command, pipelines_[1], @[input, prefix_], d, 1, 1, 1, names_[1]);
-            encode(command, pipelines_[2], trellis, d, 2, 256, 256, names_[2]);
-            encode(command, pipelines_[3], backtrack, d, 2, 1, 1, names_[3]);
+            if (wildcard) encode(command, wildcard_expand_, @[source_emission, expanded_], source, 1, uint64_t(d.frames) * 256, 256, @"ctc_expand_wildcard", borrowed_offset);
+            encode(command, pipelines_[1], @[input, prefix_], d, 1, 1, 1, names_[1], input_offset);
+            encode(command, pipelines_[2], trellis, d, 2, 256, 256, names_[2], input_offset);
+            encode(command, pipelines_[3], backtrack, d, 2, 1, 1, names_[3], input_offset);
             if (segments) encode(command, segment_pipeline_, @[path_, segment_bounds_, segment_means_], d, 1, d.count, 256, @"ctc_merge_repeats");
             timings.push_back(complete(command, started));
         } else {
-            timings.push_back(execute(queue_, pipelines_[1], @[e_, prefix_], d, 1, 1, 1, names_[1]));
-            timings.push_back(execute(queue_, pipelines_[2], trellis, d, 2, 256, 256, names_[2]));
-            timings.push_back(execute(queue_, pipelines_[3], backtrack, d, 2, 1, 1, names_[3]));
+            timings.push_back(execute(queue_, pipelines_[1], @[input, prefix_], d, 1, 1, 1, names_[1], input_offset));
+            timings.push_back(execute(queue_, pipelines_[2], trellis, d, 2, 256, 256, names_[2], input_offset));
+            timings.push_back(execute(queue_, pipelines_[3], backtrack, d, 2, 1, 1, names_[3], input_offset));
         }
         const float* packed = static_cast<const float*>(path_.contents);
         require(std::isfinite(packed[0]) && packed[0] >= -1 && packed[0] <= d.frames, "gpu_path_invalid");

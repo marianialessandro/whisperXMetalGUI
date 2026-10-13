@@ -10,7 +10,7 @@ class DeferredWildcard(torch.Tensor):
     @staticmethod
     def __new__(cls, base, blank, kind):
         frames, vocabulary = base.shape
-        shapes = {"masked": (frames, vocabulary - 1), "value": (frames,), "indices": (frames,), "column": (frames, 1), "expanded": (frames, vocabulary + 1)}
+        shapes = {"base": (frames, vocabulary), "masked": (frames, vocabulary - 1), "value": (frames,), "indices": (frames,), "column": (frames, 1), "expanded": (frames, vocabulary + 1)}
         return torch.Tensor._make_wrapper_subclass(cls, shapes[kind], dtype=torch.int64 if kind == "indices" else torch.float32, device="cpu", requires_grad=False)
 
     def __init__(self, base, blank, kind):
@@ -25,6 +25,18 @@ class DeferredWildcard(torch.Tensor):
         if func == torch.ops.aten.detach.default and isinstance(args[0], cls):
             item = args[0]
             return cls(item.base_emission, item.blank, item.kind)
+        if func == torch.ops.aten.slice.Tensor:
+            item = args[0]
+            dimension, start, end, step = (*args[1:], *[0, 0, 2**63 - 1, 1][len(args) - 1:])
+            if item.kind == "base" and not kwargs and dimension == 0 and start == 0 and end >= item.shape[0] and step == 1: return cls(item.base_emission, item.blank, "base")
+        if func == torch.ops.aten.index.Tensor:
+            item, selectors = args[:2]
+            if item.kind == "base" and not kwargs and len(selectors) == 2 and selectors[0] is None:
+                mask = selectors[1]
+                if mask is not None and mask.device.type == "cpu" and mask.dtype == torch.bool and mask.ndim == 1 and len(mask) == item.shape[1]:
+                    excluded = np.flatnonzero(~mask.detach().numpy())
+                    if len(excluded) == 1: return cls(item.base_emission, int(excluded[0]), "masked")
+            raise ValueError("fused_wildcard_mask_unsupported")
         if func == torch.ops.aten.max.dim:
             item = args[0]
             dimension = args[1] if len(args) > 1 else kwargs.get("dim")
@@ -40,6 +52,7 @@ class DeferredWildcard(torch.Tensor):
             if len(tensors) == 2 and dimension == 1 and isinstance(tensors[1], cls) and tensors[1].kind == "column":
                 base, column = tensors
                 original = column.base_emission
+                if isinstance(base, cls) and base.kind == "base" and base.base_emission is original: return cls(original, column.blank, "expanded")
                 if not isinstance(base, cls) and base.shape == original.shape and base.stride() == original.stride() and base.data_ptr() == original.data_ptr():
                     return cls(base, column.blank, "expanded")
                 raise ValueError("fused_wildcard_base_identity_mismatch")

@@ -1,12 +1,14 @@
 from pathlib import Path
 import sys
 import unittest
+import contextlib
+import io
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import mlx.core as mx
 import torch
 import whisperx.alignment as alignment
-from tools.baseline.ctc_alignment_trial import metal_ctc
+from tools.baseline.ctc_alignment_trial import metal_ctc, main
 
 
 @unittest.skipUnless(mx.metal.is_available(), "Metal hardware required")
@@ -34,6 +36,13 @@ class ScopedAlignmentTrialTests(unittest.TestCase):
                 alignment.get_trellis(torch.zeros((3, 2), dtype=torch.float32), [])
         self.assertIs(alignment.get_trellis, trellis_function)
         self.assertIs(alignment.backtrack, backtrack_function)
+
+    def test_additive_mps_backend_flags_reject_missing_or_cross_backend_inputs(self):
+        required = ["--audio", "missing", "--audio-sha256", "0" * 64, "--segments", "missing", "--segments-sha256", "0" * 64, "--language", "it", "--torch-specs", "missing", "--output-dir", "missing"]
+        invalid = [["--ctc-backend", "native-mps"], ["--mps-library", "missing", "--mps-library-sha256", "0" * 64], ["--ctc-backend", "native-persistent"], ["--ctc-backend", "native-mps", "--mps-library", "missing", "--mps-library-sha256", "0" * 64, "--native-character-segments"]]
+        for arguments in invalid:
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error: main([*required, *arguments])
+            self.assertEqual(error.exception.code, 2)
 
 
 if __name__ == "__main__":
