@@ -7,8 +7,9 @@ import scipy
 
 
 @contextlib.contextmanager
-def native_nearest_interpolation(alignment, context, records, batched_frames=False):
+def native_nearest_interpolation(alignment, context, records, batched_frames=False, retained_frames=False):
     if pd.__version__ != "3.0.6" or scipy.__version__ != "1.15.3" or not isinstance(records, list): raise ValueError("native_nearest_runtime_or_records_not_supported")
+    if retained_frames and not batched_frames: raise ValueError("native_retained_nearest_requires_paired_frames")
     original, original_pd = alignment.interpolate_nans, alignment.pd
     def interpolate(series, method="nearest"):
         if method == "ignore": return series
@@ -49,11 +50,12 @@ def native_nearest_interpolation(alignment, context, records, batched_frames=Fal
             if args or kwargs or len(data) > 32768: raise ValueError("native_nearest_pair_frame_not_supported")
             frame = InterpolationFrame(data)
             if any(frame[column].dtype != np.dtype("float64") for column in ("start", "end")): return original_pd.DataFrame(data)
-            values = np.column_stack([frame[column].to_numpy(dtype=np.float64) for column in ("start", "end")])
-            filled, record = context.interpolate_nearest_pair(values)
+            columns = [frame[column].to_numpy(dtype=np.float64) for column in ("start", "end")]
+            fingerprints = [column.tobytes() for column in columns]
+            filled, record = context.interpolate_retained_pair(data) if retained_frames else context.interpolate_nearest_pair(np.column_stack(columns))
             record.update(scope="experimental_nearest_subsegment_pair", columns_consumed=0)
             records.append(record)
-            frame._native_nearest_pair_cache = {column: (values[:, i].tobytes(), filled[:, i]) for i, column in enumerate(("start", "end"))}, tuple(frame.index), record
+            frame._native_nearest_pair_cache = {column: (fingerprints[i], filled[:, i]) for i, column in enumerate(("start", "end"))}, tuple(frame.index), record
             return frame
 
         def __getattr__(self, name): return getattr(original_pd, name)

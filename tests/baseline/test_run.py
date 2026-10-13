@@ -11,6 +11,30 @@ from tools.baseline import run, corpus
 
 
 class RunnerTests(unittest.TestCase):
+    def test_cache_routes_are_transport_specific_and_inventory_order_independent(self):
+        specs = [{"transport": "torch_hub", "cache_root": "/private/torch"}, {"cache_root": "/private/hf"}, {"cache_root": "/private/hf"}]
+        expected = (Path("/private/hf").resolve(), Path("/private/torch").resolve())
+        self.assertEqual(run.model_cache_roots(specs), expected)
+        self.assertEqual(run.model_cache_roots(list(reversed(specs))), expected)
+        self.assertEqual(run.model_cache_roots(specs[:1]), (None, expected[1]))
+        with self.assertRaisesRegex(run.RunError, "model_cache_topology_unresolved"):
+            run.model_cache_roots(specs + [{"cache_root": "/private/other-hf"}])
+        with self.assertRaisesRegex(run.RunError, "model_cache_transport_unsupported"):
+            run.model_cache_roots([{"transport": "unknown", "cache_root": "/private/cache"}])
+
+    def test_execute_passes_both_cache_roots_to_the_offline_child(self):
+        import types
+        received = []
+        event = {"event": "completed", "output": "/private/output", "result": "/private/output/result.json", "warnings": []}
+        child = types.SimpleNamespace(communicate=lambda payload, timeout: (json.dumps(event).encode(), None), returncode=0)
+        def launch(arguments, **options):
+            received.append(options["env"])
+            return child
+        with patch.object(run.subprocess, "Popen", launch):
+            run.execute(Path("/runtime/bin/python"), [], {"output": "/private/output"}, 3, Path("/private/hf"), Path("/private/torch"))
+        self.assertEqual(received[0]["HF_HUB_CACHE"], "/private/hf")
+        self.assertEqual(received[0]["TORCH_HOME"], "/private/torch")
+
     def test_full_preflight_keeps_missing_corpus_and_models_explicit(self):
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory:
@@ -18,6 +42,18 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(report["status"], "prerequisite_missing")
         self.assertIn({"code": "model_inventory_missing"}, report["missing"])
         self.assertFalse(report["gpu_placement_certified"])
+
+    def test_torch_selection_requires_live_inventory_and_never_uses_huggingface_refs(self):
+        spec = {"transport": "torch_hub", "repository": "torchaudio/BUNDLE", "role": "alignment_it", "cache_root": "/private/torch", "files": ["weights.pth"], "license_verified": True, "license_source": "https://example.org/license", "torchaudio_version": "2.8.0", "bundle_config": {"layers": 2}, "labels": ["-", "a"]}
+        selection = {"status": "selection_inventory_verified", "models": [{**spec, "checkpoint": "weights.pth", "checkpoint_loaded": False, "status": "default_selection_and_config_verified"}]}
+        with tempfile.TemporaryDirectory() as directory, patch.object(run.provision, "inspect_spec", return_value={"status": "files_verified"}), patch.object(run.manifest, "contained", side_effect=AssertionError("Torch inventories have no Hugging Face refs")):
+            arguments = ({"assets": [], "cases": []}, corpus.expected_coverage(Path(__file__).resolve().parents[2]), {"licenses": []}, Path(directory), [spec])
+            missing = run.preflight(*arguments)["missing"]
+            self.assertIn({"code": "worker_alignment_selection_unverified", "repository": spec["repository"]}, missing)
+            verified = run.preflight(*arguments, alignment_selection=selection)
+            self.assertNotIn({"code": "worker_alignment_selection_unverified", "repository": spec["repository"]}, verified["missing"])
+            self.assertEqual(verified["status"], "prerequisite_missing")
+            self.assertIn({"case_id": "it_short", "code": "case_missing"}, verified["missing"])
 
     def test_paired_output_comparison_detects_export_changes(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -190,8 +190,18 @@ public:
     }
 
     std::tuple<at::Tensor, at::Tensor> stats(int64_t generation, int64_t count, const at::Tensor& parameters, const at::Tensor& indices, const at::Tensor& offsets, const at::Tensor& modes, bool rounded) {
+        auto [output, metrics, handle] = stats_work(generation, count, parameters, indices, offsets, modes, rounded, false);
+        return {output, metrics};
+    }
+
+    std::tuple<at::Tensor, at::Tensor, at::Tensor> stats_retained(int64_t generation, int64_t count, const at::Tensor& parameters, const at::Tensor& indices, const at::Tensor& offsets, const at::Tensor& modes, bool rounded) {
+        return stats_work(generation, count, parameters, indices, offsets, modes, rounded, true);
+    }
+
+    std::tuple<at::Tensor, at::Tensor, at::Tensor> stats_work(int64_t generation, int64_t count, const at::Tensor& parameters, const at::Tensor& indices, const at::Tensor& offsets, const at::Tensor& modes, bool rounded, bool retain) {
         std::lock_guard<std::mutex> guard(mutex_);
         TORCH_CHECK(core_ != nullptr, "mps_ctc_context_closed");
+        core_->invalidate_statistics();
         TORCH_CHECK(generation > 0 && count > 0 && count <= 32768, "mps_ctc_resident_handle_invalid");
         TORCH_CHECK(parameters.device().type() == c10::DeviceType::CPU && parameters.scalar_type() == at::kUInt64 && parameters.dim() == 1 && parameters.numel() == 2 && parameters.is_contiguous(), "mps_ctc_scale_parameters_invalid");
         for (const auto& tensor : {indices, offsets, modes}) TORCH_CHECK(tensor.device().type() == c10::DeviceType::CPU && tensor.scalar_type() == at::kUInt32 && tensor.dim() == 1 && tensor.is_contiguous(), "mps_ctc_statistics_metadata_invalid");
@@ -201,8 +211,26 @@ public:
             auto output = at::empty({modes.numel() * (rounded ? 4 : 3)}, at::TensorOptions().dtype(at::kDouble).device(at::kCPU));
             const uint32_t empty_index = 0;
             const uint32_t* index_data = indices.numel() ? indices.data_ptr<uint32_t>() : &empty_index;
-            auto completed = core_->alignment_stats_batch(nullptr, (count + 1) * 3, count + 1, index_data, indices.numel(), offsets.data_ptr<uint32_t>(), offsets.numel(), modes.data_ptr<uint32_t>(), modes.numel(), reinterpret_cast<uint64_t*>(output.data_ptr<double>()), output.numel(), generation, bits[0], bits[1], rounded);
-            return {output, observation(completed)};
+            auto completed = core_->alignment_stats_batch(nullptr, (count + 1) * 3, count + 1, index_data, indices.numel(), offsets.data_ptr<uint32_t>(), offsets.numel(), modes.data_ptr<uint32_t>(), modes.numel(), reinterpret_cast<uint64_t*>(output.data_ptr<double>()), output.numel(), generation, bits[0], bits[1], rounded, retain);
+            at::Tensor handle;
+            if (retain) {
+                handle = at::empty({2}, at::TensorOptions().dtype(at::kLong).device(at::kCPU));
+                handle.data_ptr<int64_t>()[0] = completed.generation; handle.data_ptr<int64_t>()[1] = completed.queries;
+            }
+            return {output, observation(completed), handle};
+        }
+    }
+
+    std::tuple<at::Tensor, at::Tensor, at::Tensor> nearest_retained(int64_t generation, const at::Tensor& mapping) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        TORCH_CHECK(core_ != nullptr, "mps_ctc_context_closed");
+        TORCH_CHECK(generation > 0 && mapping.device().type() == c10::DeviceType::CPU && mapping.scalar_type() == at::kUInt32 && mapping.dim() == 1 && mapping.is_contiguous() && mapping.numel() > 0 && mapping.numel() <= 65536 && mapping.numel() % 2 == 0, "mps_ctc_retained_mapping_invalid");
+        @autoreleasepool {
+            auto output = at::empty({mapping.numel()}, at::TensorOptions().dtype(at::kDouble).device(at::kCPU));
+            auto completed = core_->interpolate_retained_statistics(generation, mapping.data_ptr<uint32_t>(), mapping.numel(), reinterpret_cast<uint64_t*>(output.data_ptr<double>()), output.numel());
+            auto counts = at::empty({2, 2}, at::TensorOptions().dtype(at::kLong).device(at::kCPU));
+            for (int index = 0; index < 4; ++index) counts.data_ptr<int64_t>()[index] = completed.counts[index];
+            return {output, counts, observation({completed.timing, completed.allocated_bytes})};
         }
     }
 
@@ -227,5 +255,5 @@ public:
         return tensor;
     }
 };
-static auto mps_ctc_class = torch::class_<MPSCTC>("whisperx_mps_probe", "CTC").def(torch::init<std::string>()).def("compute", &MPSCTC::compute).def("prepare", &MPSCTC::prepare).def("scale", &MPSCTC::scale).def("stats", &MPSCTC::stats).def("nearest", &MPSCTC::nearest).def("close", &MPSCTC::close);
+static auto mps_ctc_class = torch::class_<MPSCTC>("whisperx_mps_probe", "CTC").def(torch::init<std::string>()).def("compute", &MPSCTC::compute).def("prepare", &MPSCTC::prepare).def("scale", &MPSCTC::scale).def("stats", &MPSCTC::stats).def("stats_retained", &MPSCTC::stats_retained).def("nearest", &MPSCTC::nearest).def("nearest_retained", &MPSCTC::nearest_retained).def("close", &MPSCTC::close);
 }

@@ -103,9 +103,9 @@ class MPSStorageProbeTests(unittest.TestCase):
             self.assertTrue(link.is_symlink())
             self.assertFalse(target.exists())
 
-    def ctc_context(self):
+    def ctc_context(self, retain_timestamps=False):
         kernels = Path(__file__).resolve().parents[2] / "tools/baseline/native_ctc.metal"
-        return MPSCTC(self.library, self.identity, kernels, hashlib.sha256(kernels.read_bytes()).hexdigest())
+        return MPSCTC(self.library, self.identity, kernels, hashlib.sha256(kernels.read_bytes()).hexdigest(), retain_timestamps=retain_timestamps)
 
     def ctc_compare(self, context, emission, tokens, blank=0, wildcard=False):
         import whisperx.alignment as alignment
@@ -296,6 +296,59 @@ class MPSStorageProbeTests(unittest.TestCase):
                 self.assertEqual(records[0]["filled_missing_counts"], [1, 1])
                 frame.loc[1, "start"] = 8.
                 with self.assertRaisesRegex(ValueError, "snapshot_changed"): alignment.interpolate_nans(frame["start"])
+            self.assertIs(alignment.pd, original_pd)
+            self.assertIs(alignment.interpolate_nans, original_interpolate)
+
+    def test_retained_statistics_timestamp_metadata_gather_and_stale_rejection(self):
+        import pandas as pd
+        from whisperx.utils import interpolate_nans
+        from tools.baseline.resident_timestamps import ResidentTimestamp
+        with self.ctc_context(retain_timestamps=True) as context:
+            emission = torch.full((19, 6), -1., device="mps")
+            resident, _ = context.prepare_segments(emission, [1, 2])
+            values, _ = context.scale_round_segments(resident, .02, 0.)
+            indices = np.array([0, 1], dtype=np.uint32)
+            offsets, modes = np.array([0, 1, 1, 2], dtype=np.uint32), np.array([7, 7, 7], dtype=np.uint32)
+            stats, _, record = context.alignment_stats_resident_rounded(values, indices, offsets, modes)
+            self.assertTrue(record["statistics_retained_gpu"])
+            rows = [{"start": stats[index, 0], "end": stats[index, 1]} for index in (1, 0, 1, 2, 1)]
+            self.assertIsInstance(rows[0]["start"], ResidentTimestamp)
+            output, record = context.interpolate_retained_pair(rows)
+            for column, key in enumerate(("start", "end")):
+                reference = interpolate_nans(pd.Series([row[key] for row in rows]), "nearest").to_numpy()
+                self.assertEqual(output[:, column].tobytes(), reference.tobytes())
+            self.assertEqual(record["logical_timestamp_values_upload_bytes"], 0)
+            self.assertEqual(record["logical_cpu_to_native_bytes"], len(rows) * 8)
+            self.assertEqual(record["filled_missing_counts"], [3, 3])
+            changed = [dict(row) for row in rows]
+            original = changed[1]["start"]
+            changed[1]["start"] = ResidentTimestamp(float(original) + 1., context, original.generation, original.position)
+            with self.assertRaisesRegex(ValueError, "timestamp_changed"): context.interpolate_retained_pair(changed)
+            with self.assertRaisesRegex(RuntimeError, "indices_invalid"): context.context.nearest_retained(original.generation, torch.tensor([2, 1], dtype=torch.uint32))
+            context.interpolate_nearest(np.array([np.nan, 1.]))
+            context.interpolate_retained_pair(rows)
+            context.alignment_stats_resident_rounded(values, indices, offsets, modes)
+            with self.assertRaisesRegex(ValueError, "metadata_invalid"): context.interpolate_retained_pair(rows)
+            context.compute(emission, [1, 2])
+            with self.assertRaisesRegex(ValueError, "snapshot_missing"): context.interpolate_retained_pair(rows)
+
+    def test_retained_timestamp_frame_adapter_uses_completed_values_and_restores(self):
+        import whisperx.alignment as alignment
+        from tools.baseline.native_interpolation import native_nearest_interpolation
+        original_pd, original_interpolate = alignment.pd, alignment.interpolate_nans
+        with self.ctc_context(retain_timestamps=True) as context:
+            resident, _ = context.prepare_segments(torch.full((19, 6), -1., device="mps"), [1, 2])
+            values, _ = context.scale_round_segments(resident, .02, 0.)
+            stats, _, _ = context.alignment_stats_resident_rounded(values, np.array([0, 1], dtype=np.uint32), np.array([0, 1, 1, 2], dtype=np.uint32), np.array([7, 7, 7], dtype=np.uint32))
+            rows = [{"text": "x", "words": [], "start": stats[index, 0], "end": stats[index, 1]} for index in (0, 1, 2)]
+            records = []
+            with native_nearest_interpolation(alignment, context, records, batched_frames=True, retained_frames=True):
+                frame = alignment.pd.DataFrame(rows)
+                for column in ("start", "end"):
+                    actual = alignment.interpolate_nans(frame[column])
+                    expected = original_interpolate(original_pd.DataFrame(rows)[column])
+                    self.assertEqual(actual.to_numpy().tobytes(), expected.to_numpy().tobytes())
+                self.assertEqual(records[0]["logical_timestamp_values_upload_bytes"], 0)
             self.assertIs(alignment.pd, original_pd)
             self.assertIs(alignment.interpolate_nans, original_interpolate)
 

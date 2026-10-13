@@ -10,6 +10,7 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -192,10 +193,38 @@ def provision_spec(spec, token=None, downloader=None):
     return result
 
 
+def bind_default_reference(spec):
+    if spec.get("transport") == "torch_hub": raise ProvisionError("torch_hub_has_no_huggingface_reference")
+    if spec.get("license_verified") is not True or not spec.get("license_source", "").startswith("https://"): raise ProvisionError("model_authorization_or_revision_missing")
+    result = inspect_spec(spec)
+    if result["status"] != "files_verified": raise ProvisionError(result.get("code", "model_not_verified"))
+    target = contained(Path(spec["cache_root"]), Path("models--" + spec["repository"].replace("/", "--")) / "refs/main")
+    if target.exists():
+        if target.read_text().strip() != spec["revision"]: raise ProvisionError("model_default_reference_conflict")
+        return {**result, "default_reference_status": "already_pinned"}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".baseline-ref-", dir=target.parent)
+    try:
+        with os.fdopen(descriptor, "w") as output:
+            output.write(spec["revision"])
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            os.link(temporary, target)
+            status = "created_from_verified_snapshot"
+        except FileExistsError:
+            if target.read_text().strip() != spec["revision"]: raise ProvisionError("model_default_reference_conflict")
+            status = "already_pinned"
+    finally:
+        os.unlink(temporary)
+    return {**result, "default_reference_status": status}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--specs", type=Path, required=True, help="Declared repositories, full revisions, required files, expected hashes and individually verified license/access records.")
     parser.add_argument("--bridge", type=Path, help="Development bridge compiled under the private evidence directory; used only for explicit gated downloads.")
+    parser.add_argument("--bind-default-ref", action="store_true", help="Optional explicit cache metadata write after file/hash/license verification: create missing HF refs/main at the declared revision, never overwrite a conflicting ref. Torch Hub is unchanged; preflight remains offline.")
     parser.add_argument("command", choices=("preflight", "download"), help="preflight verifies HF/torch_hub files without model loading or Keychain/network; download provisions pinned HF snapshots only; torch_hub checkpoints require separate explicit acquisition.")
     args = parser.parse_args(argv)
     try:
@@ -203,6 +232,8 @@ def main(argv=None):
         token = read_credential(args.bridge) if args.command == "download" and any(spec.get("gated") for spec in specs) and args.bridge else None
         with open(os.devnull, "w") as sink, contextlib.redirect_stderr(sink):
             reports = [inspect_spec(spec) if args.command == "preflight" else provision_spec(spec, token) for spec in specs]
+            if args.bind_default_ref:
+                reports = [bind_default_reference(spec) if spec.get("transport") != "torch_hub" else report for spec, report in zip(specs, reports)]
         report = sanitize({"status": "files_verified" if reports and all(report["status"] == "files_verified" for report in reports) else "prerequisite_missing", "models": reports}, secrets=[token] if token else [])
         token = None
         print(json.dumps(report))

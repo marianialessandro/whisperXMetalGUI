@@ -10,14 +10,26 @@ import sys
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from tools.baseline import contracts, corpus, manifest, provision, metrics, freeze
+from tools.baseline import contracts, corpus, manifest, provision, metrics, freeze, alignment_inventory
 
 
 class RunError(ValueError):
     pass
 
 
-def preflight(catalog, coverage, licenses, evidence_root, model_specs):
+def model_cache_roots(model_specs):
+    roots = {"huggingface": set(), "torch_hub": set()}
+    for spec in model_specs:
+        transport = spec.get("transport", "huggingface")
+        if transport not in roots:
+            raise RunError("model_cache_transport_unsupported")
+        roots[transport].add(Path(spec["cache_root"]).resolve())
+    if any(len(group) > 1 for group in roots.values()):
+        raise RunError("model_cache_topology_unresolved")
+    return tuple(next(iter(roots[name]), None) for name in ("huggingface", "torch_hub"))
+
+
+def preflight(catalog, coverage, licenses, evidence_root, model_specs, alignment_selection=None):
     corpus_report = corpus.preflight(catalog, coverage, licenses, evidence_root, evidence_root)
     models = [provision.inspect_spec(spec) for spec in model_specs]
     missing = list(corpus_report["missing"])
@@ -36,6 +48,10 @@ def preflight(catalog, coverage, licenses, evidence_root, model_specs):
     for spec in model_specs:
         if spec.get("license_verified") is not True or not spec.get("license_source", "").startswith("https://"):
             missing.append({"code": "model_license_unverified", "repository": spec["repository"]})
+        if spec.get("transport") == "torch_hub":
+            if not alignment_inventory.matches_spec(spec, alignment_selection):
+                missing.append({"code": "worker_alignment_selection_unverified", "repository": spec["repository"]})
+            continue
         try:
             reference = manifest.contained(Path(spec["cache_root"]), Path("models--" + spec["repository"].replace("/", "--")) / "refs/main")
             verified = reference.is_file() and reference.read_text().strip() == spec["revision"]
@@ -43,9 +59,13 @@ def preflight(catalog, coverage, licenses, evidence_root, model_specs):
             verified = False
         if not verified:
             missing.append({"code": "worker_default_revision_unverified", "repository": spec["repository"]})
-    if len({str(Path(spec["cache_root"]).resolve()) for spec in model_specs}) > 1:
-        missing.append({"code": "model_cache_topology_unresolved"})
-    return {"status": "prerequisite_missing" if missing else "prerequisites_verified", "missing": missing, "models": models, "gpu_placement_certified": False}
+    try:
+        model_cache_roots(model_specs)
+    except RunError as error:
+        missing.append({"code": str(error)})
+    report = {"status": "prerequisite_missing" if missing else "prerequisites_verified", "missing": missing, "models": models, "gpu_placement_certified": False}
+    if alignment_selection is not None: report["alignment_selection"] = alignment_selection
+    return report
 
 
 def stop_child(child):
@@ -162,7 +182,7 @@ def main(argv=None):
     parser.add_argument("--model-specs", type=Path, required=True)
     parser.add_argument("--bridge", type=Path, help="Private Keychain pipe for voices; never token argv/env/file.")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("preflight", help="Offline corpus/model full gate; never network or Keychain.")
+    sub.add_parser("preflight", help="Offline corpus/model gate and Torch default/config inspection in the selected runtime; no checkpoint loading, network or Keychain.")
     sub.add_parser("provision", help="Explicit pinned download separate from measured runs; individual credentials via bridge only.")
     run = sub.add_parser("run", help="Full gate must pass before selected case; original and adapter in separate cold processes, shared warm disk cache, never warm-model claim.")
     run.add_argument("--case", required=True)
@@ -192,13 +212,17 @@ def main(argv=None):
     if args.command == "run" and args.seed is not None and not 0 <= args.seed < 2 ** 32: parser.error("seed must be between 0 and 2**32-1")
     try:
         catalog, coverage, licenses, specs = [json.loads(path.read_text()) for path in (args.corpus, args.coverage, args.licenses, args.model_specs)]
+        selection = None
+        if args.command in ("preflight", "run", "full-gate", "calibrate", "freeze") and any(spec.get("transport") == "torch_hub" for spec in specs):
+            imports = args.source_root if args.baseline_source == "gui-checkout" else args.source_root / "Contents/Resources"
+            selection = alignment_inventory.inspect_runtime(args.runtime, imports, args.model_specs)
         if args.command == "evaluate":
             result = metrics.evaluate_case(catalog, licenses, args.evidence_root, args.case_id, args.result, args.speaker_turns)
             identity = freeze.seal(args.evidence_root, args.output, result)
             print(json.dumps({"status": "evaluated_not_certified", "case_id": args.case_id, "sha256": identity}))
             return 0
         if args.command in ("calibrate", "freeze"):
-            prerequisites = preflight(catalog, coverage, licenses, args.evidence_root, specs)
+            prerequisites = preflight(catalog, coverage, licenses, args.evidence_root, specs, selection)
             if prerequisites["missing"]:
                 print(json.dumps(prerequisites))
                 return 2
@@ -226,7 +250,7 @@ def main(argv=None):
             reports = [provision.provision_spec(spec, token) for spec in specs]
             print(json.dumps(manifest.sanitize({"status": "files_verified", "models": reports}, secrets=[token] if token else [])))
             return 0
-        report = preflight(catalog, coverage, licenses, args.evidence_root, specs)
+        report = preflight(catalog, coverage, licenses, args.evidence_root, specs, selection)
         if args.command in ("preflight", "full-gate") or report["missing"]:
             if args.command == "full-gate" and not report["missing"]:
                 frozen = freeze.verify_frozen(args.evidence_root, args.frozen, args.sha256, coverage)
@@ -250,7 +274,8 @@ def main(argv=None):
         if identity["prerequisites"]:
             raise RunError("source_identity_incomplete")
         manifest.write_evidence(args.evidence_root, "runs/" + run_id + "/manifest.json", identity)
-        result = paired_run(args.runtime, worker, imports, corpus.safe_target(args.evidence_root, asset["path"]), case["settings"], args.evidence_root / "runs" / run_id / "pair", token, args.timeout, Path(specs[0]["cache_root"]).resolve(), args.synchronized, seed=args.seed)
+        cache_root, torch_home = model_cache_roots(specs)
+        result = paired_run(args.runtime, worker, imports, corpus.safe_target(args.evidence_root, asset["path"]), case["settings"], args.evidence_root / "runs" / run_id / "pair", token, args.timeout, cache_root, args.synchronized, torch_home=torch_home, seed=args.seed)
         with corpus.safe_target(args.evidence_root, "runs/" + run_id + "/comparison.json").open("x") as output:
             json.dump(result, output)
         print(json.dumps({"run_id": run_id, "status": result["status"], "gpu_placement_certified": False, "quality_certified": False}))

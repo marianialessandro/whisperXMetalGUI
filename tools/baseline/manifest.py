@@ -23,6 +23,7 @@ PACKAGES = ("torch", "torchaudio", "mlx", "mlx-whisper", "ctranslate2", "faster-
 SAFE_KEYS = frozenset("schema_version run_id status code source selection git_sha reference_sha digest files name sha256 bytes unique_bytes repository revision role format shape dtype hardware machine chip ram_bytes os sdk runtime executable lock runtime_manifest installed loaded packages version models prerequisites settings language quality voices speaker_count hints_sha256 hints_present imported_sources backend precision".split())
 SAFE_KEYS |= frozenset("loadability_verified native_conversion_proven tensors harness".split())
 SAFE_KEYS |= frozenset("seed deterministic_algorithms_forced".split())
+SAFE_KEYS |= frozenset("default_reference_status".split())
 
 
 def failure(code, error=None):

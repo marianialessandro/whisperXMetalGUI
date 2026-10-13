@@ -17,7 +17,7 @@ struct NativePoint { int32_t token; int32_t frame; float score; };
 struct NativeSegment { int32_t start; int32_t end; double score; };
 struct NativeResult { std::vector<NativePoint> path; bool found; std::vector<Timing> timings; uint64_t dp_bytes; uint64_t allocated_bytes; std::vector<NativeSegment> segments; int32_t path_length; uint64_t generation = 0; };
 struct NativeNearestResult { Timing timing; uint64_t allocated_bytes; uint32_t counts[4]; };
-struct NativeDirectStatsResult { Timing timing; uint64_t allocated_bytes; };
+struct NativeDirectStatsResult { Timing timing; uint64_t allocated_bytes; uint64_t generation = 0; uint32_t queries = 0; };
 struct NativeBatchBoundsResult { std::vector<uint64_t> bounds; Timing timing; uint64_t allocated_bytes; };
 struct NativeBoundsResult { uint64_t minimum, maximum; Timing timing; uint64_t allocated_bytes; };
 struct NativeMaxResult { std::vector<float> values; std::vector<uint32_t> indices; std::vector<Timing> timings; uint64_t allocated_bytes; };
@@ -56,12 +56,16 @@ class NativeCTCContext {
     id<MTLComputePipelineState> max_pipeline_;
     id<MTLComputePipelineState> wildcard_validate_, wildcard_expand_;
     id<MTLComputePipelineState> segment_pipeline_, bounds_pipeline_, batch_bounds_pipeline_, word_means_pipeline_, alignment_stats_pipeline_, round3_pipeline_, scale_round_pipeline_, word_round_pipeline_, nearest_neighbors_pipeline_, nearest_fill_pipeline_;
+    id<MTLComputePipelineState> resident_nearest_gather_pipeline_;
     NSMutableArray<id<MTLComputePipelineState>>* pipelines_;
     NSArray<NSString*>* names_;
     id<MTLBuffer> e_, t_, invalid_, prefix_, rows_, path_, decisions_, endpoint_;
     id<MTLBuffer> max_values_, max_indices_;
     id<MTLBuffer> expanded_;
     id<MTLBuffer> segment_bounds_, segment_means_, bounds_input_, bounds_output_, bounds_indices_, bounds_offsets_, stats_modes_, scale_parameters_, rounded_segments_, rounded_words_, nearest_neighbors_, nearest_counts_;
+    id<MTLBuffer> retained_statistics_;
+    uint64_t statistics_counter_ = 0, statistics_generation_ = 0;
+    uint32_t statistics_queries_ = 0;
     uint64_t generation_counter_ = 0, resident_generation_ = 0, rounded_generation_ = 0, rounded_ratio_ = 0, rounded_offset_ = 0;
     uint32_t resident_count_ = 0, resident_frames_ = 0;
     bool compact_, batched_;
@@ -72,7 +76,7 @@ class NativeCTCContext {
         require(buffer != nil, "metal_allocation_failed");
     }
 
-    uint64_t allocated_bytes() const { return e_.length + t_.length + invalid_.length + prefix_.length + rows_.length + path_.length + decisions_.length + endpoint_.length + max_values_.length + max_indices_.length + expanded_.length + segment_bounds_.length + segment_means_.length + bounds_input_.length + bounds_output_.length + bounds_indices_.length + bounds_offsets_.length + stats_modes_.length + scale_parameters_.length + rounded_segments_.length + rounded_words_.length + nearest_neighbors_.length + nearest_counts_.length; }
+    uint64_t allocated_bytes() const { return e_.length + t_.length + invalid_.length + prefix_.length + rows_.length + path_.length + decisions_.length + endpoint_.length + max_values_.length + max_indices_.length + expanded_.length + segment_bounds_.length + segment_means_.length + bounds_input_.length + bounds_output_.length + bounds_indices_.length + bounds_offsets_.length + stats_modes_.length + scale_parameters_.length + rounded_segments_.length + rounded_words_.length + nearest_neighbors_.length + nearest_counts_.length + retained_statistics_.length; }
 
     void pipeline(id<MTLComputePipelineState> __strong& state, NSString* name) {
         if (state != nil) return;
@@ -83,7 +87,8 @@ class NativeCTCContext {
     }
 
 public:
-    void invalidate_resident() { std::lock_guard<std::mutex> guard(mutex_); resident_generation_ = 0; rounded_generation_ = 0; }
+    void invalidate_resident() { std::lock_guard<std::mutex> guard(mutex_); resident_generation_ = 0; rounded_generation_ = 0; statistics_generation_ = 0; }
+    void invalidate_statistics() { std::lock_guard<std::mutex> guard(mutex_); statistics_generation_ = 0; }
 
     NativeCTCContext(const char* shader, uint64_t shader_bytes, bool compact, bool batched) : compact_(compact), batched_(batched) {
         require(shader != nullptr && shader_bytes > 0 && shader_bytes <= 1024 * 1024, "shader_budget_invalid");
@@ -105,7 +110,7 @@ public:
 
     NativeResult compute(const float* emission, uint64_t emission_elements, const int32_t* tokens, uint64_t token_elements, const Dimensions& source, bool wildcard = false, bool segments = false, bool resident = false, id<MTLBuffer> borrowed_emission = nil, uint64_t borrowed_offset = 0) {
         std::lock_guard<std::mutex> guard(mutex_);
-        resident_generation_ = 0; rounded_generation_ = 0;
+        resident_generation_ = 0; rounded_generation_ = 0; statistics_generation_ = 0;
         require(!resident || segments, "resident_requires_segments");
         Dimensions d = source;
         require((emission != nullptr || borrowed_emission != nil) && tokens != nullptr && d.frames > 0 && d.frames <= 32768 && d.vocabulary > 0 && d.vocabulary <= uint64_t(1) << 24 && d.count > 0 && d.count <= d.frames, "input_shape_invalid");
@@ -184,7 +189,7 @@ public:
 
     NativeDirectStatsResult scale_round_segments(uint64_t generation, uint32_t count, uint64_t ratio, uint64_t offset, uint64_t* output, uint32_t capacity) {
         std::lock_guard<std::mutex> guard(mutex_);
-        rounded_generation_ = 0;
+        rounded_generation_ = 0; statistics_generation_ = 0;
         require(generation != 0 && generation == resident_generation_ && count == resident_count_, "resident_segment_generation_invalid");
         require(output != nullptr && capacity >= uint64_t(count) * 3, "resident_segment_output_invalid");
         uint64_t ratio_exponent = ratio >> 52, offset_exponent = offset >> 52;
@@ -236,8 +241,10 @@ public:
         return {{output, output + queries}, timing, allocated_bytes()};
     }
 
-    NativeDirectStatsResult alignment_stats_batch(const uint64_t* values, uint64_t elements, uint32_t rows, const uint32_t* indices, uint64_t index_count, const uint32_t* offsets, uint64_t offset_count, const uint32_t* modes, uint64_t mode_count, uint64_t* caller_output, uint64_t output_capacity, uint64_t generation = 0, uint64_t ratio = 0, uint64_t offset = 0, bool word_rounding = false) {
+    NativeDirectStatsResult alignment_stats_batch(const uint64_t* values, uint64_t elements, uint32_t rows, const uint32_t* indices, uint64_t index_count, const uint32_t* offsets, uint64_t offset_count, const uint32_t* modes, uint64_t mode_count, uint64_t* caller_output, uint64_t output_capacity, uint64_t generation = 0, uint64_t ratio = 0, uint64_t offset = 0, bool word_rounding = false, bool retain_timestamps = false) {
         std::lock_guard<std::mutex> guard(mutex_);
+        statistics_generation_ = 0;
+        if (retain_timestamps) require(statistics_counter_ < INT64_MAX, "resident_statistics_generation_exhausted");
         bool resident = generation != 0;
         if (resident) require(generation == resident_generation_ && generation == rounded_generation_ && ratio == rounded_ratio_ && offset == rounded_offset_ && rows == resident_count_ + 1, "resident_statistics_generation_or_scale_invalid");
         require((resident || values != nullptr) && indices != nullptr && offsets != nullptr && modes != nullptr && rows <= (resident ? 32769u : 32768u) && elements == uint64_t(rows) * 3 && index_count <= 4 * 1024 * 1024 && offset_count >= 2 && offset_count <= 32769 && mode_count == offset_count - 1, "alignment_stats_shape_invalid");
@@ -245,7 +252,9 @@ public:
         require(caller_output != nullptr && output_capacity >= uint64_t(queries) * (word_rounding ? 4 : 3), "alignment_stats_output_invalid");
         pipeline(alignment_stats_pipeline_, @"ctc_alignment_stats_batch");
         if (!resident) reserve(bounds_input_, std::max(uint64_t(8), elements * 8));
-        reserve(bounds_output_, uint64_t(queries) * 24);
+        if (retain_timestamps) reserve(retained_statistics_, uint64_t(queries) * 24);
+        else reserve(bounds_output_, uint64_t(queries) * 24);
+        id<MTLBuffer> statistics_output = retain_timestamps ? retained_statistics_ : bounds_output_;
         reserve(bounds_indices_, std::max(uint64_t(4), index_count * 4)); reserve(bounds_offsets_, offset_count * 4); reserve(stats_modes_, mode_count * 4); reserve(invalid_, 4);
         if (!resident && elements) std::memcpy(bounds_input_.contents, values, elements * 8);
         if (index_count) std::memcpy(bounds_indices_.contents, indices, index_count * 4);
@@ -258,16 +267,42 @@ public:
             auto started = std::chrono::steady_clock::now();
             id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "metal_command_creation_failed");
             command.label = @"ctc_resident_stats_and_word_rounding";
-            encode(command, alignment_stats_pipeline_, @[rounded_segments_, bounds_indices_, bounds_offsets_, stats_modes_, bounds_output_, invalid_], {queries, rows, static_cast<uint32_t>(index_count), 0}, 1, uint64_t(queries) * 256, 256, @"ctc_alignment_stats_batch");
-            encode(command, word_round_pipeline_, @[bounds_output_, rounded_words_], {0, 0, queries, 0}, 1, queries, 256, @"ctc_round_word_means");
+            encode(command, alignment_stats_pipeline_, @[rounded_segments_, bounds_indices_, bounds_offsets_, stats_modes_, statistics_output, invalid_], {queries, rows, static_cast<uint32_t>(index_count), 0}, 1, uint64_t(queries) * 256, 256, @"ctc_alignment_stats_batch");
+            encode(command, word_round_pipeline_, @[statistics_output, rounded_words_], {0, 0, queries, 0}, 1, queries, 256, @"ctc_round_word_means");
             timing = complete(command, started);
-        } else timing = execute(queue_, alignment_stats_pipeline_, @[resident ? rounded_segments_ : bounds_input_, bounds_indices_, bounds_offsets_, stats_modes_, bounds_output_, invalid_], {queries, rows, static_cast<uint32_t>(index_count), 0}, 1, uint64_t(queries) * 256, 256, @"ctc_alignment_stats_batch");
+        } else timing = execute(queue_, alignment_stats_pipeline_, @[resident ? rounded_segments_ : bounds_input_, bounds_indices_, bounds_offsets_, stats_modes_, statistics_output, invalid_], {queries, rows, static_cast<uint32_t>(index_count), 0}, 1, uint64_t(queries) * 256, 256, @"ctc_alignment_stats_batch");
         uint32_t invalid = *static_cast<uint32_t*>(invalid_.contents);
         require(!(invalid & 1), "alignment_stats_metadata_invalid"); require(!(invalid & 2), "timestamp_negative_zero_not_supported"); require(!(invalid & 4), "word_means_values_invalid");
-        const uint64_t* output = static_cast<const uint64_t*>(bounds_output_.contents);
+        const uint64_t* output = static_cast<const uint64_t*>(statistics_output.contents);
         std::memcpy(caller_output, output, uint64_t(queries) * 24);
         if (word_rounding) std::memcpy(caller_output + uint64_t(queries) * 3, rounded_words_.contents, uint64_t(queries) * 8);
-        return {timing, allocated_bytes()};
+        if (retain_timestamps) {
+            statistics_generation_ = ++statistics_counter_; statistics_queries_ = queries;
+        }
+        return {timing, allocated_bytes(), statistics_generation_, queries};
+    }
+
+    NativeNearestResult interpolate_retained_statistics(uint64_t generation, const uint32_t* mapping, uint64_t count, uint64_t* output, uint64_t capacity) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(generation != 0 && generation == statistics_generation_, "resident_nearest_generation_invalid");
+        require(mapping != nullptr && output != nullptr && count > 0 && count % 2 == 0 && count <= 65536 && capacity >= count, "resident_nearest_shape_invalid");
+        pipeline(resident_nearest_gather_pipeline_, @"ctc_resident_nearest_gather"); pipeline(nearest_neighbors_pipeline_, @"ctc_nearest_neighbors"); pipeline(nearest_fill_pipeline_, @"ctc_nearest_fill");
+        reserve(bounds_indices_, count * 4); reserve(bounds_input_, count * 8); reserve(bounds_output_, count * 8); reserve(nearest_neighbors_, count * 8); reserve(nearest_counts_, 16); reserve(invalid_, 4);
+        std::memcpy(bounds_indices_.contents, mapping, count * 4); *static_cast<uint32_t*>(invalid_.contents) = 0;
+        auto started = std::chrono::steady_clock::now();
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "metal_command_creation_failed");
+        command.label = @"ctc_retained_statistics_nearest";
+        Dimensions dimensions{static_cast<uint32_t>(count / 2), statistics_queries_ * 3, static_cast<uint32_t>(count), 0};
+        encode(command, resident_nearest_gather_pipeline_, @[retained_statistics_, bounds_indices_, bounds_input_, invalid_], dimensions, 1, count, 256, @"ctc_resident_nearest_gather");
+        dimensions.vocabulary = 2;
+        encode(command, nearest_neighbors_pipeline_, @[bounds_input_, nearest_neighbors_, nearest_counts_], dimensions, 1, 2, 1, @"ctc_nearest_neighbors");
+        encode(command, nearest_fill_pipeline_, @[bounds_input_, nearest_neighbors_, bounds_output_], dimensions, 1, count, 256, @"ctc_nearest_fill");
+        auto timing = complete(command, started);
+        require(*static_cast<uint32_t*>(invalid_.contents) == 0, "resident_nearest_indices_invalid");
+        std::memcpy(output, bounds_output_.contents, count * 8);
+        NativeNearestResult result{timing, allocated_bytes(), {}};
+        std::memcpy(result.counts, nearest_counts_.contents, 16);
+        return result;
     }
 
     NativeNearestResult interpolate_nearest(const uint64_t* values, uint64_t count, uint64_t* output, uint64_t capacity, uint32_t columns = 1) {

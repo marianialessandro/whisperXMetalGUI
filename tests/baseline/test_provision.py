@@ -17,6 +17,35 @@ from tools.baseline import provision
 
 
 class ProvisionTests(unittest.TestCase):
+    def test_bind_default_reference_requires_verified_snapshot_and_never_overwrites_conflict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = self.spec(root)
+            reference = root / "models--org--model/refs/main"
+            with self.assertRaises(provision.ProvisionError): provision.bind_default_reference({**spec, "sha256": {"weights.bin": "b" * 64}})
+            self.assertFalse(reference.exists())
+            self.assertEqual(provision.bind_default_reference(spec)["default_reference_status"], "created_from_verified_snapshot")
+            self.assertEqual(reference.read_text(), spec["revision"])
+            self.assertEqual(provision.bind_default_reference(spec)["default_reference_status"], "already_pinned")
+            reference.write_text("b" * 40)
+            with self.assertRaisesRegex(provision.ProvisionError, "model_default_reference_conflict"): provision.bind_default_reference(spec)
+            self.assertEqual(reference.read_text(), "b" * 40)
+            with self.assertRaisesRegex(provision.ProvisionError, "torch_hub_has_no_huggingface_reference"): provision.bind_default_reference({**spec, "transport": "torch_hub"})
+            self.assertEqual(list(reference.parent.glob(".baseline-ref-*")), [])
+
+    def test_bind_default_reference_preserves_a_concurrent_writer_and_cleans_its_temporary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = self.spec(root)
+            reference = root / "models--org--model/refs/main"
+            def conflicting_link(source, target):
+                Path(target).write_text("b" * 40)
+                raise FileExistsError()
+            with patch.object(provision.os, "link", conflicting_link), self.assertRaisesRegex(provision.ProvisionError, "model_default_reference_conflict"):
+                provision.bind_default_reference(spec)
+            self.assertEqual(reference.read_text(), "b" * 40)
+            self.assertEqual(list(reference.parent.glob(".baseline-ref-*")), [])
+
     def spec(self, root):
         snapshot = root / "models--org--model/snapshots" / ("a" * 40)
         snapshot.mkdir(parents=True)

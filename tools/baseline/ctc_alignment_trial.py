@@ -169,6 +169,7 @@ def main(argv=None):
     parser.add_argument("--mps-resident-statistics", action="store_true", help="Optional native-mps-only character grouping, resident timestamp scaling/rounding and fused timestamp/word statistics with GPU word rounding; requires a rebuilt Torch extension.")
     parser.add_argument("--mps-nearest-interpolation", action="store_true", help="Optional native-mps-only nearest interpolation in the same context, with GPU missing/filled counters. Supports --mps-interpolation-batched; requires a rebuilt Torch extension.")
     parser.add_argument("--mps-interpolation-batched", action="store_true", help="Optional paired start/end interpolation with the native-mps context; requires --mps-nearest-interpolation.")
+    parser.add_argument("--mps-retained-interpolation", action="store_true", help="Optional native-mps paired nearest from retained GPU statistics; requires MPS resident statistics, nearest interpolation and batching. Uploads timestamp indices instead of values.")
     parser.add_argument("--native-wildcard-max", action="store_true", help="Optional trial-only interception of CPU FP32 max(dim=1) using native Metal; requires native-persistent. Mask/gather/concatenation and max readback still use the original CPU boundary.")
     parser.add_argument("--native-fused-wildcard", action="store_true", help="Optional trial-only deferred wildcard preparation; native Metal expands the source emission and runs CTC without intermediate wildcard readback. Requires native-persistent; excludes --native-wildcard-max.")
     parser.add_argument("--native-character-segments", action="store_true", help="Optional GPU character bounds/means and segment-only readback; requires native-persistent and pinned CPython 3.12 sum semantics. Word reductions/timestamp scaling remain original.")
@@ -196,6 +197,7 @@ def main(argv=None):
     if args.mps_resident_statistics and args.ctc_backend != "native-mps": parser.error("MPS resident statistics require --ctc-backend native-mps")
     if args.mps_nearest_interpolation and args.ctc_backend != "native-mps": parser.error("MPS nearest interpolation requires --ctc-backend native-mps")
     if args.mps_interpolation_batched and not args.mps_nearest_interpolation: parser.error("MPS paired interpolation requires --mps-nearest-interpolation")
+    if args.mps_retained_interpolation and not (args.mps_resident_statistics and args.mps_nearest_interpolation and args.mps_interpolation_batched): parser.error("Retained MPS interpolation requires resident statistics and paired nearest")
     if args.native_wildcard_max and args.ctc_backend != "native-persistent": parser.error("--native-wildcard-max requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.ctc_backend != "native-persistent": parser.error("--native-fused-wildcard requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.native_wildcard_max: parser.error("wildcard modes are mutually exclusive")
@@ -242,7 +244,7 @@ def main(argv=None):
                     scopes.enter_context(native_timestamp_bounds_batched(alignment, mps_context, bounds_records, fast_frames=True, word_means=True, mean_records=word_records, fused_reductions=True, compact_plan=True, resident_reductions=True, word_rounding=True))
                 if args.mps_nearest_interpolation:
                     from tools.baseline.native_interpolation import native_nearest_interpolation
-                    scopes.enter_context(native_nearest_interpolation(alignment, mps_context, interpolate_records, batched_frames=args.mps_interpolation_batched))
+                    scopes.enter_context(native_nearest_interpolation(alignment, mps_context, interpolate_records, batched_frames=args.mps_interpolation_batched, retained_frames=args.mps_retained_interpolation))
                 if args.native_timestamp_bounds_batched:
                     from tools.baseline.native_timestamp_bounds import native_timestamp_bounds_batched
                     scopes.enter_context(native_timestamp_bounds_batched(alignment, persistent, bounds_records, fast_frames=args.native_timestamp_fast_frames, word_means=args.native_word_means, mean_records=word_records, fused_reductions=args.native_fused_reductions, compact_plan=args.native_compact_reduction_plan, resident_reductions=args.native_resident_reductions, word_rounding=args.native_word_rounding))
@@ -270,7 +272,7 @@ def main(argv=None):
             if args.ctc_backend == "native-mps":
                 from tools.baseline.mps_storage_probe import MPSCTC
                 kernels = Path(__file__).with_name("native_ctc.metal")
-                mps_context = resources.enter_context(MPSCTC(args.mps_library, args.mps_library_sha256, kernels, manifest.sha256(kernels)))
+                mps_context = resources.enter_context(MPSCTC(args.mps_library, args.mps_library_sha256, kernels, manifest.sha256(kernels), retain_timestamps=args.mps_retained_interpolation))
                 native_identity, native_setup_ns = mps_context.identity, mps_context.initialization_wall_ns
             import whisperx
             import whisperx.alignment as alignment
@@ -345,6 +347,7 @@ def main(argv=None):
         report["native_mps_emission_handoff_enabled"] = args.ctc_backend == "native-mps"
         report["native_mps_resident_statistics_enabled"] = args.mps_resident_statistics
         report["native_mps_nearest_interpolation_enabled"] = args.mps_nearest_interpolation
+        report["native_mps_retained_interpolation_enabled"] = args.mps_retained_interpolation
         if args.ctc_backend == "native-mps": report["residuals"] = ["mps_producer_wait_and_two_native_ctc_completions", "cpu_final_ctc_path_character_word_reductions_scaling_rounding_interpolation", "cpu_mask_and_token_metadata", "cpu_final_path_and_result_readback"]
         if args.mps_resident_statistics: report["residuals"] = ["mps_producer_wait_and_native_completion_groups", "cpu_ratio_and_metadata_selection_provenance_snapshots_and_csr_mapping", "cpu_final_rounded_character_readback_and_dataframe_construction", "cpu_original_nearest_interpolation"]
         if args.native_wildcard_max: report["residuals"][-1] = "cpu_wildcard_mask_gather_concat_and_max_readback"
@@ -370,6 +373,9 @@ def main(argv=None):
             if not args.mps_resident_statistics: report["residuals"][1] = "cpu_final_ctc_path_character_word_reductions_scaling_rounding"
             report["residuals"].append("cpu_interpolation_series_metadata_and_final_timestamp_upload_readback")
             if args.mps_interpolation_batched: report["residuals"].append("cpu_interpolation_pair_packing_fingerprints_and_output_series_copy")
+        if args.mps_retained_interpolation:
+            report["residuals"] = [entry for entry in report["residuals"] if entry not in ("cpu_interpolation_series_metadata_and_final_timestamp_upload_readback", "cpu_interpolation_pair_packing_fingerprints_and_output_series_copy")]
+            report["residuals"].extend(["cpu_statistics_readback_and_immutable_timestamp_provenance_snapshot", "cpu_paired_interpolation_index_mapping_fingerprints_and_output_readback_copy", "cpu_standalone_word_series_upload_readback_if_requested"])
         with (args.output_dir / "comparison.json").open("x") as output: json.dump(report, output, indent=2)
         print(json.dumps({key: value for key, value in report.items() if key not in ("ctc_spans", "wildcard_spans", "timestamp_bounds_spans", "word_mean_spans", "character_rounding_spans", "interpolation_spans")}))
         return 0 if all(matches) else 2

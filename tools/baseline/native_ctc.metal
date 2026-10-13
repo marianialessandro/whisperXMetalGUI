@@ -3,6 +3,14 @@ using namespace metal;
 
 struct Dimensions { uint frames; uint vocabulary; uint count; int blank; };
 
+kernel void ctc_resident_nearest_gather(device const ulong* source [[buffer(0)]], constant Dimensions& d [[buffer(1)]], device const uint* mapping [[buffer(2)]], device ulong* values [[buffer(3)]], device atomic_uint* invalid [[buffer(4)]], uint index [[thread_position_in_grid]]) {
+    uint position = mapping[index];
+    if (position >= d.vocabulary || position % 3 == 2) {
+        atomic_fetch_or_explicit(invalid, 1u, memory_order_relaxed);
+        values[index] = 0x7ff8000000000000ul;
+    } else values[index] = source[position];
+}
+
 ulong shift_jam(ulong value, uint shift) {
     if (shift == 0) return value;
     if (shift >= 64) return value != 0;

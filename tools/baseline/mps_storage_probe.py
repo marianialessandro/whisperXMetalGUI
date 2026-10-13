@@ -61,12 +61,15 @@ class MPSStorageProbe:
 
 
 class MPSCTC:
-    def __init__(self, library, expected_sha256, kernels, kernels_sha256):
+    def __init__(self, library, expected_sha256, kernels, kernels_sha256, retain_timestamps=False):
+        if type(retain_timestamps) is not bool: raise ValueError("mps_ctc_timestamp_option_invalid")
         probe = MPSStorageProbe(library, expected_sha256)
         kernels = Path(kernels).resolve(strict=True)
         if kernels.stat().st_size > 1024 * 1024 or hashlib.sha256(kernels.read_bytes()).hexdigest() != kernels_sha256: raise ValueError("mps_ctc_shader_identity_invalid")
         self.lock = threading.RLock()
         self._resident_rounded_snapshot = None
+        self._statistics_snapshot = None
+        self.retain_timestamps = retain_timestamps
         started = time.perf_counter_ns()
         self.context = torch.classes.whisperx_mps_probe.CTC(kernels.read_text())
         self.initialization_wall_ns = time.perf_counter_ns() - started
@@ -82,6 +85,7 @@ class MPSCTC:
                 self.context.close()
                 self.context = None
                 self._resident_rounded_snapshot = None
+                self._statistics_snapshot = None
 
     def compute(self, emission, tokens, blank=0, wildcard=False):
         return self._compute(emission, tokens, blank, wildcard, False)
@@ -97,6 +101,7 @@ class MPSCTC:
             if not isinstance(tokens, (list, tuple)) or not 0 < len(tokens) <= 32768 or any(type(token) is not int or not -(2**31) <= token < 2**31 for token in tokens) or type(blank) is not int or not -(2**31) <= blank < 2**31 or type(wildcard) is not bool: raise ValueError("mps_ctc_token_metadata_invalid")
             started = time.perf_counter_ns()
             self._resident_rounded_snapshot = None
+            self._statistics_snapshot = None
             native_tokens = torch.tensor(tokens, dtype=torch.int32, device="cpu")
             path, metrics = (self.context.prepare if resident else self.context.compute)(emission, native_tokens, blank, wildcard)
             found, wait, wall, validation_gpu, compute_gpu, dp_bytes, allocated, offset, readback = metrics.tolist()
@@ -120,6 +125,7 @@ class MPSCTC:
             if self.context is None: raise ValueError("mps_ctc_context_closed")
             started = time.perf_counter_ns()
             self._resident_rounded_snapshot = None
+            self._statistics_snapshot = None
             result, metrics = self.context.scale(segments.generation, segments.count, torch.from_numpy(bits))
             output = result.numpy()
             wall, gpu, allocated = metrics.tolist()
@@ -164,11 +170,46 @@ class MPSCTC:
             started = time.perf_counter_ns()
             generation, count, ratio, offset, reference, selected, mapping, mapped, offsets, modes = resident_statistics_plan(values, indices, offsets, modes, self._resident_rounded_snapshot)
             ready = time.perf_counter_ns()
-            output, metrics = self.context.stats(generation, count, torch.from_numpy(np.array([ratio, offset], dtype=np.uint64)), torch.from_numpy(mapped), torch.from_numpy(offsets), torch.from_numpy(modes), rounded)
+            arguments = (generation, count, torch.from_numpy(np.array([ratio, offset], dtype=np.uint64)), torch.from_numpy(mapped), torch.from_numpy(offsets), torch.from_numpy(modes), rounded)
+            self._statistics_snapshot = None
+            if self.retain_timestamps:
+                output, metrics, handle = self.context.stats_retained(*arguments)
+                stats_generation, queries = handle.tolist()
+                if stats_generation <= 0 or queries != modes.size: raise ValueError("mps_ctc_statistics_handle_invalid")
+            else: output, metrics = self.context.stats(*arguments)
             result = output.numpy()
             wall, gpu, allocated = metrics.tolist()
             record = {"scope": "experimental_mps_resident_fused_stats", "rows": len(values), "resident_rows": count + 1, "queries": modes.size, "index_elements": mapped.size, "dispatch_completed": True, "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "computation_wall_ns": int(wall), "computation_gpu_seconds": gpu, "logical_cpu_to_native_bytes": mapped.nbytes + offsets.nbytes + modes.nbytes, "logical_character_values_upload_bytes": 0, "logical_output_readback_bytes": result.nbytes + 4, "word_rounding_gpu": rounded, "cpu_resident_snapshot_bytes": len(reference), "cpu_resident_snapshot_gather_bytes": selected.nbytes, "cpu_resident_mapping_bytes": mapping.nbytes, "cpu_resident_mapping_wall_ns": ready - started, "physical_copy_bytes": None, "allocated_shared_buffer_bytes": int(allocated)}
-            return result[:modes.size * 3].reshape(-1, 3), result[modes.size * 3:] if rounded else None, record
+            statistics = result[:modes.size * 3].reshape(-1, 3)
+            if self.retain_timestamps:
+                from tools.baseline.resident_timestamps import ResidentStatistics
+                self._statistics_snapshot = stats_generation, modes.size, statistics.tobytes()
+                statistics = ResidentStatistics(statistics, self, stats_generation)
+                record.update(statistics_retained_gpu=True, logical_statistics_handle_metadata_bytes=16, cpu_statistics_snapshot_bytes=statistics.nbytes)
+            return statistics, result[modes.size * 3:] if rounded else None, record
+
+    def interpolate_retained_pair(self, data):
+        from tools.baseline.resident_timestamps import ResidentTimestamp
+        if not isinstance(data, list) or not 0 < len(data) <= 32768: raise ValueError("mps_ctc_retained_pair_shape_invalid")
+        with self.lock:
+            if self.context is None: raise ValueError("mps_ctc_context_closed")
+            if self._statistics_snapshot is None: raise ValueError("mps_ctc_statistics_snapshot_missing")
+            started = time.perf_counter_ns()
+            generation, queries, reference = self._statistics_snapshot
+            mapping = []
+            for column, name in enumerate(("start", "end")):
+                for row in data:
+                    if not isinstance(row, dict): raise ValueError("mps_ctc_retained_timestamp_metadata_invalid")
+                    value = row.get(name)
+                    if not isinstance(value, ResidentTimestamp) or value.owner is not self or value.generation != generation or not 0 <= value.position < queries * 3 or value.position % 3 != column: raise ValueError("mps_ctc_retained_timestamp_metadata_invalid")
+                    if value.tobytes() != reference[value.position * 8:(value.position + 1) * 8]: raise ValueError("mps_ctc_retained_timestamp_changed")
+                    mapping.append(value.position)
+            packed = np.asarray(mapping, dtype=np.uint32)
+            output, counts, metrics = self.context.nearest_retained(generation, torch.from_numpy(packed))
+            result = output.numpy().reshape(2, -1).T
+            wall, gpu, allocated = metrics.tolist()
+            completed_counts = counts.tolist()
+            return result, {"scope": "experimental_mps_retained_nearest", "elements": result.size, "columns": 2, "input_missing_counts": [count[0] for count in completed_counts], "filled_missing_counts": [count[1] for count in completed_counts], "logical_control_readback_bytes": 16, "logical_invalid_control_readback_bytes": 4, "dispatch_completed": True, "command_buffers_per_run": 1, "gpu_kernels": ["ctc_resident_nearest_gather", "ctc_nearest_neighbors", "ctc_nearest_fill"], "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "computation_wall_ns": int(wall), "computation_gpu_seconds": gpu, "logical_cpu_to_native_bytes": packed.nbytes, "logical_timestamp_values_upload_bytes": 0, "logical_output_readback_bytes": result.nbytes, "cpu_retained_timestamp_snapshot_bytes": len(reference), "physical_copy_bytes": None, "allocated_shared_buffer_bytes": int(allocated)}
 
 
 def probe_npz(args):
