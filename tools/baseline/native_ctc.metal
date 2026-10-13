@@ -484,3 +484,22 @@ kernel void ctc_scale_round_segments(device const int2* bounds [[buffer(0)]], co
     output[token * 3 + 1] = python_round3(add_positive_double(multiply_frame_double(scale[0], uint(frames.y)), scale[1]));
     output[token * 3 + 2] = python_round3(score);
 }
+
+// Pinned NumPy rounding for nonnegative score means: rounded binary64 multiply by 1000, rint ties-even, rounded divide by 1000.
+ulong numpy_round3_score(ulong bits) {
+    if (bits == 0 || bits > 0x7ff0000000000000ul) return bits;
+    ulong scaled = multiply_frame_double(bits, 1000);
+    uint shift = 1075 - uint(scaled >> 52);
+    if (shift >= 64) return 0;
+    ulong significand = (scaled & 0xffffffffffffful) | (1ul << 52);
+    ulong integer = significand >> shift, remainder = significand & ((1ul << shift) - 1), halfway = 1ul << (shift - 1);
+    if (remainder > halfway || (remainder == halfway && (integer & 1))) ++integer;
+    if (integer == 0) return 0;
+    uint highest = 63 - uint(clz(integer));
+    ulong integer_bits = (ulong(highest + 1023) << 52) | ((integer << (52 - highest)) & 0xffffffffffffful);
+    return divide_positive_double(integer_bits, 1000);
+}
+
+kernel void ctc_round_word_means(device const ulong* statistics [[buffer(0)]], constant Dimensions& dimensions [[buffer(1)]], device ulong* rounded [[buffer(2)]], uint query [[thread_position_in_grid]]) {
+    if (query < dimensions.count) rounded[query] = numpy_round3_score(statistics[query * 3 + 2]);
+}

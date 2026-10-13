@@ -560,21 +560,64 @@ class PersistentNativeCTCTests(unittest.TestCase):
             originals = alignment.pd, alignment.nltk_load
             frames, reports = [], []
             with patch.object(alignment, "nltk_load", return_value=nltk.tokenize.PunktSentenceTokenizer()):
-                for resident in (False, True):
+                for resident, word_rounding in ((False, False), (True, False), (True, True)):
                     spans, means = [], []
-                    with native_timestamp_bounds_batched(alignment, context, spans, fast_frames=True, word_means=True, mean_records=means, fused_reductions=True, compact_plan=True, resident_reductions=resident):
+                    with native_timestamp_bounds_batched(alignment, context, spans, fast_frames=True, word_means=True, mean_records=means, fused_reductions=True, compact_plan=True, resident_reductions=resident, word_rounding=word_rounding):
                         list(alignment.nltk_load().span_tokenize("a β?"))
                         frame = alignment.pd.DataFrame(data)
                         word = frame.iloc[[2, 3]]
-                        frames.append([frame.start.min(), frame[frame.char != " "].end.max(), word.start.min(), word.end.max(), word.score.mean()])
+                        frames.append([frame.start.min(), frame[frame.char != " "].end.max(), word.start.min(), word.end.max(), word.score.mean(), round(word.score.mean(), 3)])
                         changed = word.copy(); changed.loc[2, "score"] += .001
                         with self.assertRaisesRegex(ValueError, "snapshot_changed"): changed.score.mean()
                     reports.append(spans[0])
             np.testing.assert_array_equal(np.array(frames[0]).view(np.uint64), np.array(frames[1]).view(np.uint64))
+            np.testing.assert_array_equal(np.array(frames[0]).view(np.uint64), np.array(frames[2]).view(np.uint64))
             self.assertLess(reports[1]["logical_cpu_to_native_bytes"], reports[0]["logical_cpu_to_native_bytes"])
             self.assertEqual(originals, (alignment.pd, alignment.nltk_load))
             with self.assertRaisesRegex(ValueError, "require_fused"):
                 with native_timestamp_bounds_batched(alignment, context, [], resident_reductions=True): pass
+
+    def test_numpy_word_rounding_helper_matches_scalar_numpy_ties_and_adjacent_values(self):
+        from unittest.mock import patch
+        generator = np.random.default_rng(687)
+        centers = np.arange(1000, dtype=np.float64) / 1000. + .0005
+        values = np.concatenate([generator.uniform(0, 1, 32768), centers, np.nextafter(centers, 0), np.nextafter(centers, 1), np.array([0., .0005, .0025, 1., np.nan])])
+        source = (self.root / "tools/baseline/native_ctc.metal").read_bytes()
+        source = source.replace(b"kernel void ctc_round3", b"ulong numpy_round3_score(ulong bits);\nkernel void ctc_round3", 1).replace(b"output[index] = python_round3(values[index]);", b"output[index] = numpy_round3_score(values[index]);", 1)
+        original_read = Path.read_bytes
+        with patch.object(Path, "read_bytes", lambda path: source if path.name == "native_ctc.metal" else original_read(path)), NativeCTC(self.library, self.identity) as context:
+            actual, _ = context.round3(values)
+            expected = np.array([round(np.float64(value), 3) for value in values])
+            np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+            self.assertNotEqual(struct.pack("d", float(actual[-4])), struct.pack("d", round(float(values[-4]), 3)))
+
+    def test_word_rounding_preserves_unrounded_gpu_means_and_one_completion_group(self):
+        from tools.baseline.native_timestamp_bounds import NativeRoundedWordMean
+        generator = np.random.default_rng(499)
+        emission = torch.log_softmax(torch.from_numpy(generator.normal(size=(129, 8)).astype(np.float32)), dim=-1).numpy()
+        tokens = generator.integers(1, 8, size=19, dtype=np.int32)
+        with NativeCTC(self.library, self.identity) as context:
+            handle, _ = context.prepare_segments(emission, tokens)
+            values, _ = context.scale_round_segments(handle, .01, 0.)
+            groups = [[], [0], list(range(19)), list(reversed(range(19))), [0, 0, 18]]
+            indices = np.asarray([i for group in groups for i in group], dtype=np.uint32)
+            offsets = np.asarray([0, *np.cumsum([len(group) for group in groups])], dtype=np.uint32)
+            modes = np.array([7, 7, 7, 3, 7], dtype=np.uint32)
+            original, _ = context.alignment_stats_resident(values, indices, offsets, modes)
+            statistics, rounded, record = context.alignment_stats_resident_rounded(values, indices, offsets, modes)
+            np.testing.assert_array_equal(statistics.view(np.uint64), original.view(np.uint64))
+            np.testing.assert_array_equal(rounded.view(np.uint64), np.array([round(mean, 3) for mean in original[:, 2]]).view(np.uint64))
+            self.assertEqual(record["command_buffers_per_run"], 1)
+            self.assertEqual(record["logical_output_readback_bytes"], len(groups) * 32 + 4)
+            self.assertEqual(record["gpu_kernels"], ["ctc_alignment_stats_batch", "ctc_round_word_means"])
+            for mean, result in zip(statistics[:, 2], rounded):
+                native = NativeRoundedWordMean(mean, result)
+                self.assertEqual(struct.pack("d", float(native)), struct.pack("d", float(mean)))
+                self.assertEqual(struct.pack("d", round(native, 3)), struct.pack("d", result))
+                self.assertIs(type(round(native, 3)), np.float64)
+                with self.assertRaisesRegex(ValueError, "digits_not_supported"): round(native, 2)
+            with self.assertRaisesRegex(ValueError, "requires_resident_reductions"):
+                with native_timestamp_bounds_batched(alignment, context, [], word_rounding=True): pass
 
     def test_buffer_growth_reuse_and_sentinel_paths_match_original(self):
         generator = np.random.default_rng(43)

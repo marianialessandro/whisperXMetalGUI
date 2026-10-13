@@ -103,6 +103,11 @@ int main(int argc, char** argv) {
     resident_indices[1] = 1;
     assert(wxctc_alignment_stats_resident(context, generation, 1, 0x3f847ae147ae147bull, 0, resident_indices, 2, resident_offsets, 2, resident_modes, 1, resident_output, 3, &maximum_result, error, sizeof(error)) == 0);
     assert(resident_output[0] == 0 && resident_output[1] == 0x3f847ae147ae147bull && maximum_result.computation_gpu_seconds > 0);
+    uint64_t rounded_statistics[]{123, 456, 789, 999};
+    assert(wxctc_alignment_stats_resident_rounded(context, generation, 1, 0x3f847ae147ae147bull, 0, resident_indices, 2, resident_offsets, 2, resident_modes, 1, rounded_statistics, 3, &maximum_result, error, sizeof(error)) != 0 && rounded_statistics[0] == 123 && rounded_statistics[3] == 999);
+    assert(wxctc_alignment_stats_resident_rounded(context, generation, 1, 0x3f847ae147ae147bull, 0, resident_indices, 2, resident_offsets, 2, resident_modes, 1, rounded_statistics, 4, &maximum_result, error, sizeof(error)) == 0);
+    assert(rounded_statistics[0] == resident_output[0] && rounded_statistics[1] == resident_output[1] && rounded_statistics[2] == resident_output[2]);
+    assert(maximum_result.computation_gpu_seconds > 0);
     uint64_t grown = 0;
     for (int iteration = 0; iteration < 8; ++iteration) {
         std::vector<float> large(256 * 4, -1);

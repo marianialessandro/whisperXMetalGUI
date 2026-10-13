@@ -195,6 +195,13 @@ class NativeCTC:
             return output.view(np.float64), {"scope": "experimental_fused_alignment_stats", "native_host_result_staging_bytes": 0, "native_host_result_memcpy_calls": 1, "rows": values.shape[0], "queries": modes.size, "index_elements": indices.size, "kernel": "ctc_alignment_stats_batch", "dispatch_completed": True, "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "computation_wall_ns": result.computation_wall_ns, "computation_gpu_seconds": result.computation_gpu_seconds, "logical_cpu_to_native_bytes": values.nbytes + indices.nbytes + offsets.nbytes + modes.nbytes, "logical_output_readback_bytes": modes.size * 24 + 4, "physical_copy_bytes": None, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
 
     def alignment_stats_resident(self, values, indices, offsets, modes):
+        statistics, _, record = self._alignment_stats_resident(values, indices, offsets, modes, False)
+        return statistics, record
+
+    def alignment_stats_resident_rounded(self, values, indices, offsets, modes):
+        return self._alignment_stats_resident(values, indices, offsets, modes, True)
+
+    def _alignment_stats_resident(self, values, indices, offsets, modes, word_rounding):
         import numpy as np
         if not isinstance(values, np.ndarray) or values.dtype != np.float64 or values.ndim != 2 or values.shape[1] != 3 or values.shape[0] > 32768 or not isinstance(indices, np.ndarray) or indices.dtype != np.uint32 or indices.ndim != 1 or indices.size > 4 * 1024 * 1024 or not isinstance(offsets, np.ndarray) or offsets.dtype != np.uint32 or offsets.ndim != 1 or not 2 <= offsets.size <= 32769 or not isinstance(modes, np.ndarray) or modes.dtype != np.uint32 or modes.ndim != 1 or modes.size != offsets.size - 1: raise ValueError("native_alignment_stats_format_invalid")
         if np.__version__ != "2.2.6" or np.getbufsize() != 8192: raise ValueError("native_word_means_runtime_not_supported")
@@ -212,14 +219,14 @@ class NativeCTC:
             mapping[~missing] = np.arange(count, dtype=np.uint32)
             mapped, offsets, modes = np.ascontiguousarray(mapping[indices]), np.ascontiguousarray(offsets), np.ascontiguousarray(modes)
             mapping_ready = time.perf_counter_ns()
-            output, result, error = np.empty((modes.size, 3), dtype=np.uint64), MaxResult(), ct.create_string_buffer(128)
-            function = self._library.wxctc_alignment_stats_resident
+            output, result, error = np.empty(modes.size * (4 if word_rounding else 3), dtype=np.uint64), MaxResult(), ct.create_string_buffer(128)
+            function = self._library.wxctc_alignment_stats_resident_rounded if word_rounding else self._library.wxctc_alignment_stats_resident
             function.argtypes = [ct.c_void_p, ct.c_uint64, ct.c_uint32, ct.c_uint64, ct.c_uint64, ct.POINTER(ct.c_uint32), ct.c_uint64, ct.POINTER(ct.c_uint32), ct.c_uint64, ct.POINTER(ct.c_uint32), ct.c_uint64, ct.POINTER(ct.c_uint64), ct.c_uint32, ct.POINTER(MaxResult), ct.POINTER(ct.c_char), ct.c_uint32]
             function.restype = ct.c_int
             status = function(self._context, generation, count, ratio, offset, mapped.ctypes.data_as(ct.POINTER(ct.c_uint32)), mapped.size, offsets.ctypes.data_as(ct.POINTER(ct.c_uint32)), offsets.size, modes.ctypes.data_as(ct.POINTER(ct.c_uint32)), modes.size, output.ctypes.data_as(ct.POINTER(ct.c_uint64)), output.size, ct.byref(result), error, len(error))
             if status: raise ValueError(error.value.decode("ascii"))
             if result.abi_version != 1: raise ValueError("native_result_invalid")
-            return output.view(np.float64), {"scope": "experimental_resident_fused_stats", "native_host_result_staging_bytes": 0, "native_host_result_memcpy_calls": 1, "rows": len(values), "resident_rows": count + 1, "queries": modes.size, "index_elements": mapped.size, "kernel": "ctc_alignment_stats_batch", "dispatch_completed": True, "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "computation_wall_ns": result.computation_wall_ns, "computation_gpu_seconds": result.computation_gpu_seconds, "logical_cpu_to_native_bytes": mapped.nbytes + offsets.nbytes + modes.nbytes, "logical_character_values_upload_bytes": 0, "logical_output_readback_bytes": modes.size * 24 + 4, "cpu_resident_snapshot_bytes": len(reference), "cpu_resident_snapshot_gather_bytes": selected.nbytes, "cpu_resident_mapping_bytes": mapping.nbytes, "cpu_resident_mapping_wall_ns": mapping_ready - started, "physical_copy_bytes": None, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
+            return output[:modes.size * 3].view(np.float64).reshape(-1, 3), output[modes.size * 3:].view(np.float64) if word_rounding else None, {"scope": "experimental_resident_fused_stats", "native_host_result_staging_bytes": 0, "native_host_result_memcpy_calls": 2 if word_rounding else 1, "rows": len(values), "resident_rows": count + 1, "queries": modes.size, "index_elements": mapped.size, "kernel": "ctc_alignment_stats_batch", "dispatch_completed": True, "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "computation_wall_ns": result.computation_wall_ns, "computation_gpu_seconds": result.computation_gpu_seconds, "logical_cpu_to_native_bytes": mapped.nbytes + offsets.nbytes + modes.nbytes, "logical_character_values_upload_bytes": 0, "logical_output_readback_bytes": output.nbytes + 4, "word_rounding_gpu": word_rounding, "gpu_kernels": ["ctc_alignment_stats_batch", "ctc_round_word_means"] if word_rounding else ["ctc_alignment_stats_batch"], "cpu_resident_snapshot_bytes": len(reference), "cpu_resident_snapshot_gather_bytes": selected.nbytes, "cpu_resident_mapping_bytes": mapping.nbytes, "cpu_resident_mapping_wall_ns": mapping_ready - started, "physical_copy_bytes": None, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
 
     def scale_round_segments(self, segments, ratio, offset):
         import numpy as np

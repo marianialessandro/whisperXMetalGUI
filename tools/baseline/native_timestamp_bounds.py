@@ -47,14 +47,27 @@ def native_timestamp_bounds(alignment, context, records):
         alignment.pd = original
 
 
+class NativeRoundedWordMean(np.float64):
+    """A real unrounded GPU mean whose three-decimal round result was completed in the same command group."""
+    def __new__(cls, value, rounded):
+        instance = super().__new__(cls, value)
+        instance._native_rounded = np.float64(rounded)
+        return instance
+
+    def __round__(self, ndigits=None):
+        if type(ndigits) is not int or ndigits != 3: raise ValueError("native_word_round_digits_not_supported")
+        return self._native_rounded
+
+
 @contextlib.contextmanager
-def native_timestamp_bounds_batched(alignment, context, records, fast_frames=False, word_means=False, mean_records=None, fused_reductions=False, compact_plan=False, resident_reductions=False):
+def native_timestamp_bounds_batched(alignment, context, records, fast_frames=False, word_means=False, mean_records=None, fused_reductions=False, compact_plan=False, resident_reductions=False, word_rounding=False):
     original, original_load = alignment.pd, alignment.nltk_load
     if fast_frames and original.__version__ != "3.0.6": raise ValueError("native_timestamp_fast_frames_runtime_not_supported")
     if word_means and (original.__version__ != "3.0.6" or np.__version__ != "2.2.6" or np.getbufsize() != 8192 or not isinstance(mean_records, list)): raise ValueError("native_word_means_runtime_or_records_not_supported")
     if fused_reductions and not word_means: raise ValueError("native_fused_reductions_require_word_means")
     if compact_plan and not fused_reductions: raise ValueError("native_compact_plan_requires_fused_reductions")
     if resident_reductions and not fused_reductions: raise ValueError("native_resident_reductions_require_fused")
+    if word_rounding and not resident_reductions: raise ValueError("native_word_rounding_requires_resident_reductions")
     sentence_spans = {}
 
     class TokenizerProxy:
@@ -157,7 +170,10 @@ def native_timestamp_bounds_batched(alignment, context, records, fast_frames=Fal
             indices, offsets = [], [0]
             for rows in query_modes: indices.extend(rows); offsets.append(len(indices))
             plan_ready = time.perf_counter_ns()
-            statistics, record = (context.alignment_stats_resident if resident_reductions else context.alignment_stats_batch)(values, np.asarray(indices, dtype=np.uint32), np.asarray(offsets, dtype=np.uint32), np.asarray(list(query_modes.values()), dtype=np.uint32))
+            if word_rounding:
+                statistics, rounded_means, record = context.alignment_stats_resident_rounded(values, np.asarray(indices, dtype=np.uint32), np.asarray(offsets, dtype=np.uint32), np.asarray(list(query_modes.values()), dtype=np.uint32))
+            else:
+                statistics, record = (context.alignment_stats_resident if resident_reductions else context.alignment_stats_batch)(values, np.asarray(indices, dtype=np.uint32), np.asarray(offsets, dtype=np.uint32), np.asarray(list(query_modes.values()), dtype=np.uint32))
             cache_started = time.perf_counter_ns()
             record.update(cpu_query_preparation_wall_ns=plan_ready - preparation_started, compact_plan=compact_plan, queries=len(queries), fused_subset_count=len(query_modes), queries_consumed=0, fast_frames=fast_frames, fused_reductions=True, completion_group=len(records), timing_scope="shared_timestamp_and_mean_group")
             records.append(record)
@@ -179,6 +195,8 @@ def native_timestamp_bounds_batched(alignment, context, records, fast_frames=Fal
                 mean_cache = {rows: (statistics[positions[rows], 2], values[list(rows), 2].tobytes()) for rows in mean_queries}
                 record.update(cpu_snapshot_subset_copies=len(queries) + len(mean_queries), cpu_snapshot_selected_values_bytes=8 * (sum(len(rows) for column, rows in queries) + sum(len(rows) for rows in mean_queries)))
                 record["cpu_snapshot_gathered_values_bytes"] = record["cpu_snapshot_selected_values_bytes"]
+            if word_rounding:
+                mean_cache = {rows: (NativeRoundedWordMean(mean, rounded_means[positions[rows]]), snapshot) for rows, (mean, snapshot) in mean_cache.items()}
             mean_record = {**record, "scope": "word_mean_component_of_fused_stats", "queries": len(mean_queries), "queries_consumed": 0, "command_buffers_per_run": 0, "separate_dispatch": False, "completion_and_bridge_wall_ns": 0, "computation_wall_ns": 0, "logical_cpu_to_native_bytes": 0, "logical_output_readback_bytes": 0}
             mean_records.append(mean_record)
             frame = BatchFrame(data)
