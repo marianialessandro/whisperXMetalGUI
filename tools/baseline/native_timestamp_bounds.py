@@ -48,12 +48,13 @@ def native_timestamp_bounds(alignment, context, records):
 
 
 @contextlib.contextmanager
-def native_timestamp_bounds_batched(alignment, context, records, fast_frames=False, word_means=False, mean_records=None, fused_reductions=False, compact_plan=False):
+def native_timestamp_bounds_batched(alignment, context, records, fast_frames=False, word_means=False, mean_records=None, fused_reductions=False, compact_plan=False, resident_reductions=False):
     original, original_load = alignment.pd, alignment.nltk_load
     if fast_frames and original.__version__ != "3.0.6": raise ValueError("native_timestamp_fast_frames_runtime_not_supported")
     if word_means and (original.__version__ != "3.0.6" or np.__version__ != "2.2.6" or np.getbufsize() != 8192 or not isinstance(mean_records, list)): raise ValueError("native_word_means_runtime_or_records_not_supported")
     if fused_reductions and not word_means: raise ValueError("native_fused_reductions_require_word_means")
     if compact_plan and not fused_reductions: raise ValueError("native_compact_plan_requires_fused_reductions")
+    if resident_reductions and not fused_reductions: raise ValueError("native_resident_reductions_require_fused")
     sentence_spans = {}
 
     class TokenizerProxy:
@@ -156,7 +157,7 @@ def native_timestamp_bounds_batched(alignment, context, records, fast_frames=Fal
             indices, offsets = [], [0]
             for rows in query_modes: indices.extend(rows); offsets.append(len(indices))
             plan_ready = time.perf_counter_ns()
-            statistics, record = context.alignment_stats_batch(values, np.asarray(indices, dtype=np.uint32), np.asarray(offsets, dtype=np.uint32), np.asarray(list(query_modes.values()), dtype=np.uint32))
+            statistics, record = (context.alignment_stats_resident if resident_reductions else context.alignment_stats_batch)(values, np.asarray(indices, dtype=np.uint32), np.asarray(offsets, dtype=np.uint32), np.asarray(list(query_modes.values()), dtype=np.uint32))
             cache_started = time.perf_counter_ns()
             record.update(cpu_query_preparation_wall_ns=plan_ready - preparation_started, compact_plan=compact_plan, queries=len(queries), fused_subset_count=len(query_modes), queries_consumed=0, fast_frames=fast_frames, fused_reductions=True, completion_group=len(records), timing_scope="shared_timestamp_and_mean_group")
             records.append(record)

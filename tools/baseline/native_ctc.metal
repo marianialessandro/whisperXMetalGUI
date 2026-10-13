@@ -476,6 +476,7 @@ ulong multiply_frame_double(ulong bits, uint frame) {
 
 kernel void ctc_scale_round_segments(device const int2* bounds [[buffer(0)]], constant Dimensions& dimensions [[buffer(1)]], device const ulong* means [[buffer(2)]], device const ulong* scale [[buffer(3)]], device ulong* output [[buffer(4)]], device atomic_uint* invalid [[buffer(5)]], uint token [[thread_position_in_grid]]) {
     if (token >= dimensions.count) return;
+    if (token == 0) for (uint field = 0; field < 3; ++field) output[dimensions.count * 3 + field] = 0x7ff8000000000000ul;
     int2 frames = bounds[token];
     ulong score = means[token];
     if (frames.x < 0 || frames.y <= frames.x || frames.y > int(dimensions.frames) || score > 0x3ff0000000000000ul) { atomic_fetch_or_explicit(invalid, 1u, memory_order_relaxed); return; }

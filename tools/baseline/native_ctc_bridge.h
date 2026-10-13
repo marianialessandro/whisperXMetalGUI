@@ -36,6 +36,8 @@ int wxctc_round3(wxctc_context* context, const uint64_t* values, uint64_t count,
 int wxctc_prepare_segments(wxctc_context* context, const float* emission, uint64_t emission_elements, const int32_t* tokens, uint64_t token_elements, uint32_t frames, uint32_t vocabulary, int32_t blank, uint32_t wildcard, uint64_t* generation, wxctc_result* result, char* error_code, uint32_t error_capacity);
 // Optional ABI v1 extension: scale retained frames by a positive normal binary64 ratio (exponents 1000..1033), add a nonnegative offset (zero or exponents 1000..1063), then round triples to three decimals; output_capacity covers count*3.
 int wxctc_scale_round_segments(wxctc_context* context, uint64_t generation, uint32_t count, uint64_t ratio_bits, uint64_t offset_bits, uint64_t* output, uint32_t output_capacity, wxctc_max_result* result, char* error_code, uint32_t error_capacity);
+// Optional ABI v1 extension: reduce retained rounded triples plus an all-NaN sentinel row at character_count; indices are already mapped to these rows; generation/scale must match the latest successful retained scaling.
+int wxctc_alignment_stats_resident(wxctc_context* context, uint64_t generation, uint32_t character_count, uint64_t ratio_bits, uint64_t offset_bits, const uint32_t* indices, uint64_t index_count, const uint32_t* offsets, uint64_t offset_count, const uint32_t* modes, uint64_t mode_count, uint64_t* output, uint32_t output_capacity, wxctc_max_result* result, char* error_code, uint32_t error_capacity);
 // Calls on one context are serialized; destroy only after all calls have returned, without racing a new call.
 void wxctc_destroy(wxctc_context* context);
 

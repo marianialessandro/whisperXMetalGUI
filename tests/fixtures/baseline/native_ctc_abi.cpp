@@ -91,6 +91,18 @@ int main(int argc, char** argv) {
     assert(wxctc_scale_round_segments(context, generation, 1, 0x3f847ae147ae147bull, 0, resident_output, 3, &maximum_result, error, sizeof(error)) == 0);
     assert(resident_output[0] == 0 && resident_output[1] == 0x3f847ae147ae147bull && maximum_result.computation_gpu_seconds > 0);
     assert(wxctc_prepare_segments(context, emission, 5, tokens, 1, 3, 2, 0, 0, &generation, &result, error, sizeof(error)) != 0 && generation == 0);
+    assert(wxctc_prepare_segments(context, emission, 6, tokens, 1, 3, 2, 0, 0, &generation, &result, error, sizeof(error)) == 0);
+    uint32_t resident_indices[]{0, 1}, resident_offsets[]{0, 2}, resident_modes[]{7};
+    resident_output[0] = 123;
+    assert(wxctc_alignment_stats_resident(context, generation, 1, 0x3f847ae147ae147bull, 0, resident_indices, 2, resident_offsets, 2, resident_modes, 1, resident_output, 3, &maximum_result, error, sizeof(error)) != 0 && resident_output[0] == 123);
+    assert(wxctc_scale_round_segments(context, generation, 1, 0x3f847ae147ae147bull, 0, resident_output, 3, &maximum_result, error, sizeof(error)) == 0);
+    resident_output[0] = 123;
+    assert(wxctc_alignment_stats_resident(context, generation, 1, 0x3f847ae147ae147bull, 0, resident_indices, 2, resident_offsets, 2, resident_modes, 1, resident_output, 2, &maximum_result, error, sizeof(error)) != 0 && resident_output[0] == 123);
+    resident_indices[1] = 2;
+    assert(wxctc_alignment_stats_resident(context, generation, 1, 0x3f847ae147ae147bull, 0, resident_indices, 2, resident_offsets, 2, resident_modes, 1, resident_output, 3, &maximum_result, error, sizeof(error)) != 0 && resident_output[0] == 123);
+    resident_indices[1] = 1;
+    assert(wxctc_alignment_stats_resident(context, generation, 1, 0x3f847ae147ae147bull, 0, resident_indices, 2, resident_offsets, 2, resident_modes, 1, resident_output, 3, &maximum_result, error, sizeof(error)) == 0);
+    assert(resident_output[0] == 0 && resident_output[1] == 0x3f847ae147ae147bull && maximum_result.computation_gpu_seconds > 0);
     uint64_t grown = 0;
     for (int iteration = 0; iteration < 8; ++iteration) {
         std::vector<float> large(256 * 4, -1);

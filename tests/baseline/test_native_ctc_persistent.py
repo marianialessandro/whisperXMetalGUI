@@ -493,6 +493,89 @@ class PersistentNativeCTCTests(unittest.TestCase):
                 with persistent_metal_ctc(alignment, [], context, True, True, [], True): raise RuntimeError("forced")
             self.assertEqual(originals, (alignment.get_trellis, alignment.backtrack, alignment.merge_repeats))
 
+    def test_resident_statistics_match_uploaded_values_with_nan_positions_and_buffer_reuse(self):
+        generator = np.random.default_rng(936)
+        emission = torch.log_softmax(torch.from_numpy(generator.normal(size=(257, 7)).astype(np.float32)), dim=-1).numpy()
+        tokens = generator.integers(1, 7, size=17, dtype=np.int32)
+        with NativeCTC(self.library, self.identity) as context:
+            handle, _ = context.prepare_segments(emission, tokens)
+            rounded, _ = context.scale_round_segments(handle, .0123456789, 10.0005)
+            values = np.full((8193, 3), np.nan)
+            positions = np.linspace(0, 8192, len(handle), dtype=np.int32)
+            values[positions] = rounded
+            groups = [[], [1, 3, 5], list(range(8193)), list(reversed(range(8193))), positions.tolist(), [int(positions[0]), int(positions[0]), 1, int(positions[-1])]]
+            offsets = np.asarray([0, *np.cumsum([len(group) for group in groups])], dtype=np.uint32)
+            indices = np.asarray([i for group in groups for i in group], dtype=np.uint32)
+            modes = np.asarray([7, 7, 7, 7, 7, 7], dtype=np.uint32)
+            expected, previous = context.alignment_stats_batch(values, indices, offsets, modes)
+            for iteration in range(3):
+                actual, record = context.alignment_stats_resident(values, indices, offsets, modes)
+                np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+                self.assertEqual(record["logical_cpu_to_native_bytes"], indices.nbytes + offsets.nbytes + modes.nbytes)
+                self.assertEqual(previous["logical_cpu_to_native_bytes"] - record["logical_cpu_to_native_bytes"], values.nbytes)
+                self.assertEqual(record["logical_character_values_upload_bytes"], 0)
+                self.assertEqual(record["cpu_resident_snapshot_bytes"], rounded.nbytes)
+                self.assertGreater(record["computation_gpu_seconds"], 0)
+                context.round3(np.array([.0005]))
+                context.row_max(emission[:3])
+            saved = actual.copy()
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                outputs = list(executor.map(lambda _: context.alignment_stats_resident(values, indices, offsets, modes)[0], range(12)))
+            for output in outputs: np.testing.assert_array_equal(output.view(np.uint64), saved.view(np.uint64))
+            outputs[0][0, 0] = 123.
+            np.testing.assert_array_equal(outputs[1].view(np.uint64), saved.view(np.uint64))
+            rounded[0, 0] += 1.
+            with self.assertRaisesRegex(ValueError, "snapshot_changed"): context.alignment_stats_resident(rounded, np.array([0], dtype=np.uint32), np.array([0, 1], dtype=np.uint32), np.array([7], dtype=np.uint32))
+
+    def test_resident_statistics_reject_changed_partial_nan_stale_scale_and_invalid_queries(self):
+        emission, tokens = np.array([[-3., -.1], [-.2, -2.], [-.1, -3.]], dtype=np.float32), np.array([1], dtype=np.int32)
+        indices, offsets, modes = np.array([0], dtype=np.uint32), np.array([0, 1], dtype=np.uint32), np.array([7], dtype=np.uint32)
+        with NativeCTC(self.library, self.identity) as context:
+            with self.assertRaisesRegex(ValueError, "snapshot_missing"): context.alignment_stats_resident(np.ones((1, 3)), indices, offsets, modes)
+            handle, _ = context.prepare_segments(emission, tokens)
+            values, _ = context.scale_round_segments(handle, .01, 0.)
+            snapshot = context._resident_rounded_snapshot
+            for field in range(3):
+                changed = values.copy(); changed[0, field] = np.nan
+                with self.assertRaisesRegex(ValueError, "snapshot_changed"): context.alignment_stats_resident(changed, indices, offsets, modes)
+            for invalid_indices, invalid_offsets, invalid_modes, code in [(np.array([1], dtype=np.uint32), offsets, modes, "indices_invalid"), (indices, np.array([1, 1], dtype=np.uint32), modes, "metadata_invalid"), (indices, offsets, np.array([8], dtype=np.uint32), "metadata_invalid")]:
+                with self.assertRaisesRegex(ValueError, code): context.alignment_stats_resident(values, invalid_indices, invalid_offsets, invalid_modes)
+            context.scale_round_segments(handle, .02, 0.)
+            context._resident_rounded_snapshot = snapshot
+            with self.assertRaisesRegex(ValueError, "generation_or_scale_invalid"): context.alignment_stats_resident(values, indices, offsets, modes)
+            context.prepare_segments(emission, tokens)
+            context._resident_rounded_snapshot = snapshot
+            with self.assertRaisesRegex(ValueError, "generation_or_scale_invalid"): context.alignment_stats_resident(values, indices, offsets, modes)
+        with self.assertRaisesRegex(ValueError, "native_context_closed"): context.alignment_stats_resident(values, indices, offsets, modes)
+
+    def test_resident_statistics_adapter_preserves_original_queries_and_snapshot_checks(self):
+        from unittest.mock import patch
+        import nltk.tokenize
+        emission = torch.log_softmax(torch.tensor([[0., 1., -1.], [1., 0., -1.], [0., -1., 1.], [1., -1., 0.], [0., 1., -1.]]), dim=-1).numpy()
+        tokens = np.array([1, 2, 1], dtype=np.int32)
+        with NativeCTC(self.library, self.identity) as context:
+            handle, _ = context.prepare_segments(emission, tokens)
+            values, _ = context.scale_round_segments(handle, .01, 0.)
+            data = [{"char": char, "start": None if i == 1 else float(values[i - (i > 1), 0]), "end": None if i == 1 else float(values[i - (i > 1), 1]), "score": None if i == 1 else float(values[i - (i > 1), 2]), "word-idx": 0 if i < 2 else 1} for i, char in enumerate("a β?")]
+            originals = alignment.pd, alignment.nltk_load
+            frames, reports = [], []
+            with patch.object(alignment, "nltk_load", return_value=nltk.tokenize.PunktSentenceTokenizer()):
+                for resident in (False, True):
+                    spans, means = [], []
+                    with native_timestamp_bounds_batched(alignment, context, spans, fast_frames=True, word_means=True, mean_records=means, fused_reductions=True, compact_plan=True, resident_reductions=resident):
+                        list(alignment.nltk_load().span_tokenize("a β?"))
+                        frame = alignment.pd.DataFrame(data)
+                        word = frame.iloc[[2, 3]]
+                        frames.append([frame.start.min(), frame[frame.char != " "].end.max(), word.start.min(), word.end.max(), word.score.mean()])
+                        changed = word.copy(); changed.loc[2, "score"] += .001
+                        with self.assertRaisesRegex(ValueError, "snapshot_changed"): changed.score.mean()
+                    reports.append(spans[0])
+            np.testing.assert_array_equal(np.array(frames[0]).view(np.uint64), np.array(frames[1]).view(np.uint64))
+            self.assertLess(reports[1]["logical_cpu_to_native_bytes"], reports[0]["logical_cpu_to_native_bytes"])
+            self.assertEqual(originals, (alignment.pd, alignment.nltk_load))
+            with self.assertRaisesRegex(ValueError, "require_fused"):
+                with native_timestamp_bounds_batched(alignment, context, [], resident_reductions=True): pass
+
     def test_buffer_growth_reuse_and_sentinel_paths_match_original(self):
         generator = np.random.default_rng(43)
         large = torch.log_softmax(torch.from_numpy(generator.normal(size=(341, 38)).astype(np.float32)), dim=-1)
