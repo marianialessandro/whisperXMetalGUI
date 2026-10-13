@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import whisperx.alignment as alignment
 from tools.baseline.native_ctc import NativeCTC
+from tools.baseline.native_character_rounding import rounded_character_segments
 from tools.baseline.native_timestamp_bounds import native_timestamp_bounds, native_timestamp_bounds_batched
 from tools.baseline.ctc_alignment_trial import persistent_metal_ctc, native_wildcard_max
 from tools.baseline.native_ctc_fused import DeferredWildcard, fused_wildcard_preparation
@@ -363,6 +364,52 @@ class PersistentNativeCTCTests(unittest.TestCase):
             self.assertGreater(reports[1]["cpu_cache_preparation_wall_ns"], 0)
             with self.assertRaisesRegex(ValueError, "requires_fused"):
                 with native_timestamp_bounds_batched(alignment, context, [], compact_plan=True): pass
+
+    def test_round3_matches_cpython_for_random_bits_ties_subnormals_and_payloads(self):
+        from unittest.mock import patch
+        generator = np.random.default_rng(1017)
+        random = generator.bit_generator.random_raw(65536).view(np.float64)
+        centers = [0., .0005, .0015, .0025, .0625, .1875, .1235, 1.0015, 9999999.9995, float(2 ** 42), float(2 ** 43), float(2 ** 52)]
+        boundary = np.array([value for center in centers for sign in (1., -1.) for value in (np.nextafter(sign * center, -np.inf), sign * center, np.nextafter(sign * center, np.inf))])
+        special = np.array([0, 0x8000000000000000, 1, 0x8000000000000001, 0x7ff0000000000000, 0xfff0000000000000, 0x7ff8000000001234, 0xfff0000000001234], dtype=np.uint64).view(np.float64)
+        with NativeCTC(self.library, self.identity) as context:
+            for values in (random, boundary, special, random[::2]):
+                actual, record = context.round3(values)
+                expected = np.asarray([round(float(value), 3) for value in values], dtype=np.float64)
+                np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+                self.assertGreater(record["computation_gpu_seconds"], 0)
+                self.assertEqual(record["command_buffers_per_run"], 1)
+            example = np.array([.0005, .0025, 56294995342131.5])
+            actual, _ = context.round3(example)
+            self.assertFalse(np.array_equal(actual.view(np.uint64), np.round(example, 3).view(np.uint64)))
+            for bad in (np.array([], dtype=np.float64), np.zeros(98305), np.zeros(1, dtype=np.float32)):
+                with self.assertRaisesRegex(ValueError, "format_invalid"): context.round3(bad)
+            with patch.object(sys, "version_info", (3, 12, 11)):
+                with self.assertRaisesRegex(ValueError, "runtime_not_supported"): context.round3(example)
+        with self.assertRaisesRegex(ValueError, "native_context_closed"): context.round3(example)
+
+    def test_deferred_character_rounding_batches_actual_values_and_rejects_changed_scale(self):
+        segments = [(0, 1, .0005), (1, 3, .0625), (3, 4, .1875)]
+        ratio, offset = .123456789, 10.0005
+        with NativeCTC(self.library, self.identity) as context:
+            spans = []
+            characters = rounded_character_segments(alignment, segments, "aβ?", context, spans)
+            with self.assertRaisesRegex(ValueError, "scale_not_ready"): round(characters[0].score, 3)
+            for i, character in enumerate(characters):
+                actual = round(character.start * ratio + offset, 3), round(character.end * ratio + offset, 3), round(character.score, 3)
+                expected = round(segments[i][0] * ratio + offset, 3), round(segments[i][1] * ratio + offset, 3), round(segments[i][2], 3)
+                self.assertEqual([struct.pack("d", value) for value in actual], [struct.pack("d", value) for value in expected])
+                self.assertTrue(all(type(value) is float for value in actual))
+            self.assertEqual(len(spans), 1)
+            self.assertEqual(spans[0]["elements"], 9)
+            with self.assertRaisesRegex(ValueError, "scale_changed"): round(characters[1].start * (ratio * 2) + offset, 3)
+            with self.assertRaisesRegex(ValueError, "digits_not_supported"): round(characters[0].score, 2)
+            with self.assertRaises(TypeError): float(characters[0].start)
+            self.assertEqual([character.label for character in characters], list("aβ?"))
+            originals = alignment.get_trellis, alignment.backtrack, alignment.merge_repeats
+            with self.assertRaisesRegex(ValueError, "requires_segments"):
+                with persistent_metal_ctc(alignment, [], context, character_rounding=True, rounding_records=[]): pass
+            self.assertEqual(originals, (alignment.get_trellis, alignment.backtrack, alignment.merge_repeats))
 
     def test_buffer_growth_reuse_and_sentinel_paths_match_original(self):
         generator = np.random.default_rng(43)

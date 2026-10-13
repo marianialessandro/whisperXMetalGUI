@@ -174,6 +174,23 @@ class NativeCTC:
             if result.abi_version != 1: raise ValueError("native_result_invalid")
             return output.view(np.float64), {"scope": "experimental_fused_alignment_stats", "native_host_result_staging_bytes": 0, "native_host_result_memcpy_calls": 1, "rows": values.shape[0], "queries": modes.size, "index_elements": indices.size, "kernel": "ctc_alignment_stats_batch", "dispatch_completed": True, "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "computation_wall_ns": result.computation_wall_ns, "computation_gpu_seconds": result.computation_gpu_seconds, "logical_cpu_to_native_bytes": values.nbytes + indices.nbytes + offsets.nbytes + modes.nbytes, "logical_output_readback_bytes": modes.size * 24 + 4, "physical_copy_bytes": None, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
 
+    def round3(self, values):
+        import numpy as np
+        if not isinstance(values, np.ndarray) or values.dtype != np.float64 or values.ndim != 1 or not 0 < values.size <= 98304: raise ValueError("native_round3_format_invalid")
+        if sys.version_info[:3] != (3, 12, 12): raise ValueError("native_round3_runtime_not_supported")
+        with self._lock:
+            if not self._context.value: raise ValueError("native_context_closed")
+            started = time.perf_counter_ns()
+            values = np.ascontiguousarray(values)
+            output, result, error = np.empty(values.size, dtype=np.uint64), MaxResult(), ct.create_string_buffer(128)
+            function = self._library.wxctc_round3
+            function.argtypes = [ct.c_void_p, ct.POINTER(ct.c_uint64), ct.c_uint64, ct.POINTER(ct.c_uint64), ct.c_uint32, ct.POINTER(MaxResult), ct.POINTER(ct.c_char), ct.c_uint32]
+            function.restype = ct.c_int
+            status = function(self._context, values.ctypes.data_as(ct.POINTER(ct.c_uint64)), values.size, output.ctypes.data_as(ct.POINTER(ct.c_uint64)), output.size, ct.byref(result), error, len(error))
+            if status: raise ValueError(error.value.decode("ascii"))
+            if result.abi_version != 1: raise ValueError("native_result_invalid")
+            return output.view(np.float64), {"scope": "experimental_cpython_round3", "elements": values.size, "kernel": "ctc_round3", "dispatch_completed": True, "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "computation_wall_ns": result.computation_wall_ns, "computation_gpu_seconds": result.computation_gpu_seconds, "logical_cpu_to_native_bytes": values.nbytes, "logical_output_readback_bytes": output.nbytes, "native_host_result_staging_bytes": 0, "physical_copy_bytes": None, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
+
     def timestamp_bounds(self, values):
         import numpy as np
         if not isinstance(values, np.ndarray) or values.dtype != np.float64 or values.ndim != 1 or values.size > 32768: raise ValueError("native_timestamp_format_invalid")

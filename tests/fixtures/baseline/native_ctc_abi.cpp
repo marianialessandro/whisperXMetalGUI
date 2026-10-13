@@ -68,6 +68,11 @@ int main(int argc, char** argv) {
     assert(statistics[0] == triples[0] && statistics[1] == triples[4] && statistics[2] == 0x3fc999999999999aull);
     row_modes[0] = 8; statistics[0] = 123;
     assert(wxctc_alignment_stats_batch(context, triples, 6, 2, row_indices, 2, row_offsets, 2, row_modes, 1, statistics, 3, &maximum_result, error, sizeof(error)) != 0 && statistics[0] == 123);
+    uint64_t round_input[]{0x3f40624dd2f1a9fcull, 0x8000000000000001ull, 0x7ff8000000001234ull}, round_output[]{123, 123, 123};
+    assert(wxctc_round3(context, round_input, 3, round_output, 2, &maximum_result, error, sizeof(error)) != 0 && round_output[0] == 123);
+    assert(wxctc_round3(context, round_input, 0, round_output, 3, &maximum_result, error, sizeof(error)) != 0 && round_output[0] == 123);
+    assert(wxctc_round3(context, round_input, 3, round_output, 3, &maximum_result, error, sizeof(error)) == 0);
+    assert(round_output[0] == 0x3f50624dd2f1a9fcull && round_output[1] == 0x8000000000000000ull && round_output[2] == round_input[2]);
     int32_t wildcard[]{2};
     assert(wxctc_compute_wildcard(context, emission, 6, wildcard, 1, 3, 2, 0, path, 3, &result, error, sizeof(error)) == 0);
     assert(result.path_length > 0 && path[0].frame == 0 && path[0].token == 0);

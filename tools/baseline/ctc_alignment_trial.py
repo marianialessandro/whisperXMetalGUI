@@ -90,9 +90,10 @@ def native_metal_ctc(alignment, spans, binary, binary_sha256):
 
 
 @contextlib.contextmanager
-def persistent_metal_ctc(alignment, spans, context, character_segments=False):
+def persistent_metal_ctc(alignment, spans, context, character_segments=False, character_rounding=False, rounding_records=None):
     import numpy as np
     from tools.baseline.native_ctc_fused import DeferredWildcard
+    if character_rounding and (not character_segments or not isinstance(rounding_records, list)): raise ValueError("native_character_rounding_requires_segments_and_records")
     original_trellis, original_backtrack, original_merge = alignment.get_trellis, alignment.backtrack, alignment.merge_repeats
     def trellis(emission, tokens, blank_id=0):
         if isinstance(emission, DeferredWildcard):
@@ -110,6 +111,9 @@ def persistent_metal_ctc(alignment, spans, context, character_segments=False):
         return None if trellis.result is None else [alignment.Point(token, frame, score) for token, frame, score in trellis.result]
     def merge(path, transcript):
         if not isinstance(path, NativeCharacterPath) or len(path.segments) != len(transcript): raise ValueError("native_character_segment_metadata_invalid")
+        if character_rounding:
+            from tools.baseline.native_character_rounding import rounded_character_segments
+            return rounded_character_segments(alignment, path.segments, transcript, context, rounding_records)
         return [alignment.Segment(transcript[i], start, end, score) for i, (start, end, score) in enumerate(path.segments)]
     alignment.get_trellis, alignment.backtrack = trellis, backtrack
     if character_segments: alignment.merge_repeats = merge
@@ -167,6 +171,7 @@ def main(argv=None):
     parser.add_argument("--native-word-means", action="store_true", help="Optional Metal binary64 word score means with pinned Pandas 3.0.6/NumPy 2.2.6 summation and buffer policy; requires --native-timestamp-bounds-batched. Adds one score batch per character frame; rounding remains original.")
     parser.add_argument("--native-fused-reductions", action="store_true", help="Optional shared row queries and one Metal kernel for timestamp minima/maxima and word means; requires --native-word-means. Previous separate-batch mode remains available.")
     parser.add_argument("--native-compact-reduction-plan", action="store_true", help="Optional clipped sentence ranges, shared word row tuples and one snapshot gather per fused subset; requires --native-fused-reductions. Preserves snapshot mutation validation.")
+    parser.add_argument("--native-character-rounding", action="store_true", help="Optional exact CPython 3.12.12 round(value,3) Metal batch for character timestamps and scores; requires --native-character-segments. Original CPU scaling is preserved; adds one round batch per segment.")
     args = parser.parse_args(argv)
     if not 1 <= args.replicas <= 10: parser.error("replicas must be between 1 and 10")
     if args.ctc_backend == "native" and (args.native_binary is None or args.native_binary_sha256 is None): parser.error("native backend requires binary and its expected SHA256")
@@ -176,6 +181,7 @@ def main(argv=None):
     if args.native_wildcard_max and args.ctc_backend != "native-persistent": parser.error("--native-wildcard-max requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.ctc_backend != "native-persistent": parser.error("--native-fused-wildcard requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.native_wildcard_max: parser.error("wildcard modes are mutually exclusive")
+    if args.native_character_rounding and not args.native_character_segments: parser.error("--native-character-rounding requires --native-character-segments")
     if args.native_compact_reduction_plan and not args.native_fused_reductions: parser.error("--native-compact-reduction-plan requires --native-fused-reductions")
     if args.native_fused_reductions and not args.native_word_means: parser.error("--native-fused-reductions requires --native-word-means")
     if args.native_word_means and not args.native_timestamp_bounds_batched: parser.error("--native-word-means requires --native-timestamp-bounds-batched")
@@ -199,13 +205,14 @@ def main(argv=None):
         wildcard_spans = []
         timestamp_spans = []
         mean_spans = []
+        rounding_spans = []
         native_identity = None
         if args.ctc_backend == "native":
             args.native_binary = args.native_binary.resolve(strict=True)
             if manifest.sha256(args.native_binary) != args.native_binary_sha256: raise ValueError("native_binary_hash_mismatch")
             native_identity = {"binary_sha256": args.native_binary_sha256, "shader_sha256": manifest.sha256(Path(__file__).with_name("native_ctc.metal"))}
         @contextlib.contextmanager
-        def candidate_context(records, maximum_records, bounds_records, word_records):
+        def candidate_context(records, maximum_records, bounds_records, word_records, round_records):
             with contextlib.ExitStack() as scopes:
                 if args.native_timestamp_bounds_batched:
                     from tools.baseline.native_timestamp_bounds import native_timestamp_bounds_batched
@@ -217,7 +224,7 @@ def main(argv=None):
                     from tools.baseline.native_ctc_fused import fused_wildcard_preparation
                     scopes.enter_context(fused_wildcard_preparation(max(metadata["dictionary"].values()) + 1))
                 if args.native_wildcard_max: scopes.enter_context(native_wildcard_max(persistent, maximum_records))
-                if args.ctc_backend == "native-persistent": scopes.enter_context(persistent_metal_ctc(alignment, records, persistent, args.native_character_segments))
+                if args.ctc_backend == "native-persistent": scopes.enter_context(persistent_metal_ctc(alignment, records, persistent, args.native_character_segments, args.native_character_rounding, round_records))
                 else: scopes.enter_context(native_metal_ctc(alignment, records, args.native_binary, args.native_binary_sha256) if args.ctc_backend == "native" else metal_ctc(alignment, records))
                 yield
         native_setup_ns = None
@@ -233,7 +240,7 @@ def main(argv=None):
             model, metadata = whisperx.load_align_model(args.language, "mps")
             if args.warmup:
                 alignment.align(original["segments"], model, metadata, audio, "mps", return_char_alignments=args.return_char_alignments)
-                with candidate_context([], [], [], []): alignment.align(original["segments"], model, metadata, audio, "mps", return_char_alignments=args.return_char_alignments)
+                with candidate_context([], [], [], [], []): alignment.align(original["segments"], model, metadata, audio, "mps", return_char_alignments=args.return_char_alignments)
                 torch.mps.synchronize()
             baseline_times, candidate_times, matches, orders = [], [], [], []
             for replica in range(args.replicas):
@@ -243,7 +250,7 @@ def main(argv=None):
                 for backend in order:
                     torch.mps.synchronize()
                     started = time.perf_counter_ns()
-                    with candidate_context(spans, wildcard_spans, timestamp_spans, mean_spans) if backend == "candidate" else contextlib.nullcontext(): results[backend] = alignment.align(original["segments"], model, metadata, audio, "mps", return_char_alignments=args.return_char_alignments)
+                    with candidate_context(spans, wildcard_spans, timestamp_spans, mean_spans, rounding_spans) if backend == "candidate" else contextlib.nullcontext(): results[backend] = alignment.align(original["segments"], model, metadata, audio, "mps", return_char_alignments=args.return_char_alignments)
                     torch.mps.synchronize()
                     elapsed = time.perf_counter_ns() - started
                     (baseline_times if backend == "original" else candidate_times).append(elapsed)
@@ -259,6 +266,8 @@ def main(argv=None):
         report["native_wildcard_max_dispatch_count"] = len(wildcard_spans)
         report["native_fused_wildcard_enabled"] = args.native_fused_wildcard
         report["native_fused_wildcard_dispatch_count"] = sum(record.get("wildcard_fused") is True for record in spans)
+        report["native_character_rounding_enabled"], report["character_rounding_spans"] = args.native_character_rounding, rounding_spans
+        report["native_character_rounding_dispatch_count"] = len(rounding_spans)
         report["native_character_segments_enabled"] = args.native_character_segments
         report["return_char_alignments"] = args.return_char_alignments
         report["native_character_segments_dispatch_count"] = sum(record.get("character_segments_gpu") is True for record in spans)
@@ -286,8 +295,11 @@ def main(argv=None):
         if args.native_character_segments: report["residuals"][2] = "cpu_word_reductions_and_character_timestamp_scaling"
         if args.native_timestamp_bounds or args.native_timestamp_bounds_batched: report["residuals"][2] = "cpu_word_means_character_timestamp_scaling_interpolation_dataframe_selection_and_snapshot_validation"
         if args.native_word_means: report["residuals"][2] = "cpu_character_timestamp_scaling_rounding_interpolation_dataframe_selection_and_snapshot_validation"
+        if args.native_character_rounding:
+            report["residuals"][2] = "cpu_character_scaling_word_mean_rounding_interpolation_selection_and_snapshot_validation" if args.native_word_means else "cpu_word_reductions_and_character_scaling"
+            report["residuals"].append("cpu_character_round_batch_upload_and_readback")
         with (args.output_dir / "comparison.json").open("x") as output: json.dump(report, output, indent=2)
-        print(json.dumps({key: value for key, value in report.items() if key not in ("ctc_spans", "wildcard_spans", "timestamp_bounds_spans", "word_mean_spans")}))
+        print(json.dumps({key: value for key, value in report.items() if key not in ("ctc_spans", "wildcard_spans", "timestamp_bounds_spans", "word_mean_spans", "character_rounding_spans")}))
         return 0 if all(matches) else 2
     except (OSError, ValueError, RuntimeError, KeyError, StopIteration, AttributeError, subprocess.TimeoutExpired):
         print(json.dumps({"status": "trial_failed", "code": "ctc_alignment_trial_failed", "full_baseline_gate_passed": False}))

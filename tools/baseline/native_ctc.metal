@@ -436,3 +436,24 @@ kernel void ctc_alignment_stats_batch(device const ulong* values [[buffer(0)]], 
         }
     }
 }
+
+// Fixed decimal round-to-three: scale the exact binary64 significand in integers before applying ties-to-even.
+ulong python_round3(ulong bits) {
+    ulong sign = bits & 0x8000000000000000ul, magnitude = bits & 0x7ffffffffffffffful;
+    uint exponent = uint(magnitude >> 52);
+    if (exponent >= 1066) return bits;
+    if (exponent == 0) return sign;
+    uint shift = 1075 - exponent;
+    if (shift >= 64) return sign;
+    ulong scaled = ((magnitude & 0xffffffffffffful) | (1ul << 52)) * 1000ul;
+    ulong rounded = scaled >> shift, remainder = scaled & ((1ul << shift) - 1), halfway = 1ul << (shift - 1);
+    if (remainder > halfway || (remainder == halfway && (rounded & 1))) ++rounded;
+    if (rounded == 0) return sign;
+    uint highest = 63 - uint(clz(rounded));
+    ulong integer_bits = (ulong(highest + 1023) << 52) | ((rounded << (52 - highest)) & 0xffffffffffffful);
+    return sign | divide_positive_double(integer_bits, 1000);
+}
+
+kernel void ctc_round3(device const ulong* values [[buffer(0)]], constant Dimensions& dimensions [[buffer(1)]], device ulong* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    if (index < dimensions.count) output[index] = python_round3(values[index]);
+}

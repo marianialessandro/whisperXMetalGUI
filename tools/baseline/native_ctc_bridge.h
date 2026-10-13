@@ -30,6 +30,8 @@ int wxctc_timestamp_bounds_batch(wxctc_context* context, const uint64_t* values,
 int wxctc_word_means_batch(wxctc_context* context, const uint64_t* values, uint64_t count, const uint32_t* indices, uint64_t index_count, const uint32_t* offsets, uint64_t offset_count, uint64_t* output, uint32_t output_capacity, wxctc_max_result* result, char* error_code, uint32_t error_capacity);
 // Optional ABI v1 extension: one CSR query set over row-major (start,end,score) binary64 triples; modes bits 1/2/4 select minimum start/maximum end/mean score; outputs are three uint64 elements per query with unrequested fields NaN.
 int wxctc_alignment_stats_batch(wxctc_context* context, const uint64_t* values, uint64_t elements, uint32_t rows, const uint32_t* indices, uint64_t index_count, const uint32_t* offsets, uint64_t offset_count, const uint32_t* modes, uint64_t mode_count, uint64_t* output, uint32_t output_capacity, wxctc_max_result* result, char* error_code, uint32_t error_capacity);
+// Optional ABI v1 extension: CPython fixed round(value, 3) semantics on binary64 bit patterns; preserves signed zero and nonfinite payloads; count is 1..98304.
+int wxctc_round3(wxctc_context* context, const uint64_t* values, uint64_t count, uint64_t* output, uint32_t output_capacity, wxctc_max_result* result, char* error_code, uint32_t error_capacity);
 // Calls on one context are serialized; destroy only after all calls have returned, without racing a new call.
 void wxctc_destroy(wxctc_context* context);
 

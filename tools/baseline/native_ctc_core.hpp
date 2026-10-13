@@ -54,7 +54,7 @@ class NativeCTCContext {
     id<MTLLibrary> library_;
     id<MTLComputePipelineState> max_pipeline_;
     id<MTLComputePipelineState> wildcard_validate_, wildcard_expand_;
-    id<MTLComputePipelineState> segment_pipeline_, bounds_pipeline_, batch_bounds_pipeline_, word_means_pipeline_, alignment_stats_pipeline_;
+    id<MTLComputePipelineState> segment_pipeline_, bounds_pipeline_, batch_bounds_pipeline_, word_means_pipeline_, alignment_stats_pipeline_, round3_pipeline_;
     NSMutableArray<id<MTLComputePipelineState>>* pipelines_;
     NSArray<NSString*>* names_;
     id<MTLBuffer> e_, t_, invalid_, prefix_, rows_, path_, decisions_, endpoint_;
@@ -217,6 +217,17 @@ public:
         require(!(invalid & 1), "alignment_stats_metadata_invalid"); require(!(invalid & 2), "timestamp_negative_zero_not_supported"); require(!(invalid & 4), "word_means_values_invalid");
         const uint64_t* output = static_cast<const uint64_t*>(bounds_output_.contents);
         std::memcpy(caller_output, output, uint64_t(queries) * 24);
+        return {timing, allocated_bytes()};
+    }
+
+    NativeDirectStatsResult round3(const uint64_t* values, uint64_t count, uint64_t* output, uint64_t capacity) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(values != nullptr && output != nullptr && count > 0 && count <= 98304 && capacity >= count, "round3_shape_or_output_invalid");
+        pipeline(round3_pipeline_, @"ctc_round3");
+        reserve(bounds_input_, count * 8); reserve(bounds_output_, count * 8);
+        std::memcpy(bounds_input_.contents, values, count * 8);
+        auto timing = execute(queue_, round3_pipeline_, @[bounds_input_, bounds_output_], {0, 0, static_cast<uint32_t>(count), 0}, 1, count, 256, @"ctc_round3");
+        std::memcpy(output, bounds_output_.contents, count * 8);
         return {timing, allocated_bytes()};
     }
 
