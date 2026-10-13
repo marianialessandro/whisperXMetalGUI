@@ -65,3 +65,28 @@ def native_nearest_interpolation(alignment, context, records, batched_frames=Fal
     finally:
         alignment.interpolate_nans = original
         if batched_frames: alignment.pd = original_pd
+
+
+@contextlib.contextmanager
+def synthetic_sentence_gaps(alignment):
+    """Diagnostic-only missing timestamp rows; the same altered sentence spans feed reference and candidate."""
+    original = alignment.nltk_load
+    class TokenizerProxy:
+        def __init__(self, tokenizer): self.tokenizer = tokenizer
+
+        def span_tokenize(self, text, *args, **kwargs):
+            spans = list(self.tokenizer.span_tokenize(text, *args, **kwargs))
+            if not spans: return iter(spans)
+            if len(spans) == 1 and spans[0][1] - spans[0][0] > 1:
+                start, end = spans[0]; middle = (start + end) // 2
+                spans = [(start, middle), (middle, end)]
+            gap = (len(text) + 10, len(text) + 10)
+            return iter([gap, spans[0], gap, *spans[1:], gap])
+
+        def __getattr__(self, name): return getattr(self.tokenizer, name)
+
+    alignment.nltk_load = lambda *args, **kwargs: TokenizerProxy(original(*args, **kwargs))
+    try:
+        yield
+    finally:
+        alignment.nltk_load = original

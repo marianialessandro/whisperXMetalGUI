@@ -179,6 +179,7 @@ def main(argv=None):
     parser.add_argument("--native-word-rounding", action="store_true", help="Optional pinned NumPy three-decimal word mean rounding on Metal in the resident fused-stat command group; preserves unrounded numerical means. Requires --native-resident-reductions.")
     parser.add_argument("--native-nearest-interpolation", action="store_true", help="Optional default nearest timestamp interpolation and end filling on Metal for pinned Pandas/SciPy and contiguous zero-based Series; requires native-persistent. Adds one command group per numerical Series.")
     parser.add_argument("--native-interpolation-batched", action="store_true", help="Optional paired start/end subsegment nearest interpolation in one Metal completion with snapshot validation; requires --native-nearest-interpolation. Word Series remain standalone.")
+    parser.add_argument("--interpolation-gap-control", action="store_true", help="Diagnostic synthetic sentence-span gaps applied identically to reference and candidate over the unchanged audio/CTC text; verifies real filling, never natural accuracy. Defaults off.")
     args = parser.parse_args(argv)
     if not 1 <= args.replicas <= 10: parser.error("replicas must be between 1 and 10")
     if args.ctc_backend == "native" and (args.native_binary is None or args.native_binary_sha256 is None): parser.error("native backend requires binary and its expected SHA256")
@@ -251,6 +252,9 @@ def main(argv=None):
             import whisperx.alignment as alignment
             import torch
             if not torch.backends.mps.is_available(): raise ValueError("mps_required")
+            if args.interpolation_gap_control:
+                from tools.baseline.native_interpolation import synthetic_sentence_gaps
+                resources.enter_context(synthetic_sentence_gaps(alignment))
             audio = whisperx.load_audio(str(args.audio))
             model, metadata = whisperx.load_align_model(args.language, "mps")
             if args.warmup:
@@ -283,6 +287,7 @@ def main(argv=None):
         report["native_fused_wildcard_dispatch_count"] = sum(record.get("wildcard_fused") is True for record in spans)
         report["native_character_rounding_enabled"], report["character_rounding_spans"] = args.native_character_rounding, rounding_spans
         report["native_character_rounding_dispatch_count"] = len(rounding_spans)
+        report["synthetic_sentence_gap_control"] = args.interpolation_gap_control
         report["native_interpolation_batched_enabled"] = args.native_interpolation_batched
         report["native_nearest_interpolation_enabled"], report["interpolation_spans"] = args.native_nearest_interpolation, interpolation_spans
         report["native_nearest_interpolation_dispatch_count"] = sum(record["dispatch_completed"] for record in interpolation_spans)

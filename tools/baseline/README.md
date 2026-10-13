@@ -135,6 +135,10 @@ The additive ABI v1 `wxctc_interpolate_nearest_batch` accepts one or two column-
 
 Each supported subsegment pair uses one completion instead of two. Word-level Series retain standalone interpolation; object/all-None subsegment columns keep the metadata-only path. The paired frame retains the original DataFrame dtype/metadata and caches `16*rows` input fingerprint bytes plus the completed output until its original calls consume them. Returning an independent Series adds a host copy of that column, and preparation packs the two columns on CPU. Records expose `columns_consumed`; duplicated consumers do not represent another GPU command. This is scoped feasibility work, not full-pipeline residency or a default production change.
 
+## Explicit synthetic interpolation gap control
+
+Add `--interpolation-gap-control` to insert empty out-of-range sentence spans before, between and after real spans, identically for the reference and candidate. A single nontrivial original span is split into two for the diagnostic. Audio, ASR text, neural emissions and CTC tokens remain unchanged; sentence metadata is deliberately altered to produce missing timestamp rows and exercise default nearest filling in the full alignment flow. The scoped tokenizer restores even on failure. Reports mark `synthetic_sentence_gap_control`; these outputs are diagnostic parity evidence, not natural segmentation, ground truth, quality calibration or production behavior. The option is off by default and works independently of Metal flags.
+
 ## Lifecycle and verification
 
 The development ABI in `native_ctc_bridge.h` returns zero on success and nonzero with a fixed error code on failure. Input pointers and declared lengths must remain valid until a synchronous call returns. Output capacity must cover `frames`. Calls on one context serialize; finish all calls before destroying it and never race destruction with a new call. The Python wrapper's context manager and lock enforce compute/close ordering. No CPU fallback is invoked when native validation fails.

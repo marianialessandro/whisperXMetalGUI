@@ -742,6 +742,21 @@ class PersistentNativeCTCTests(unittest.TestCase):
                         self.assertEqual(round(frame.score.mean(), 3), round(np.float64(values[0, 2]), 3))
                     self.assertIs(alignment.pd, previous)
 
+    def test_synthetic_sentence_gap_control_is_explicit_and_restores_tokenizer_hook(self):
+        from unittest.mock import patch
+        import nltk.tokenize
+        from tools.baseline.native_interpolation import synthetic_sentence_gaps
+        with patch.object(alignment, "nltk_load", return_value=nltk.tokenize.PunktSentenceTokenizer()):
+            original = alignment.nltk_load
+            with synthetic_sentence_gaps(alignment):
+                spans = list(alignment.nltk_load().span_tokenize("alpha beta"))
+                self.assertEqual(spans, [(20, 20), (0, 5), (20, 20), (5, 10), (20, 20)])
+                self.assertEqual(list(alignment.nltk_load().span_tokenize("")), [])
+            self.assertIs(alignment.nltk_load, original)
+            with self.assertRaisesRegex(RuntimeError, "forced"):
+                with synthetic_sentence_gaps(alignment): raise RuntimeError("forced")
+            self.assertIs(alignment.nltk_load, original)
+
     def test_buffer_growth_reuse_and_sentinel_paths_match_original(self):
         generator = np.random.default_rng(43)
         large = torch.log_softmax(torch.from_numpy(generator.normal(size=(341, 38)).astype(np.float32)), dim=-1)
