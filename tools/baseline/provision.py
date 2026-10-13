@@ -133,7 +133,39 @@ def inspect_spec(spec):
     identity["status"] = "files_verified"
     identity["loadability_verified"] = False
     identity["native_conversion_proven"] = False
+    if "components" in spec:
+        try:
+            identity.update(inspect_components(spec))
+        except (ProvisionError, BaselineError, OSError, ValueError, TypeError, KeyError):
+            return {**identity, "status": "prerequisite_missing", "code": "model_component_config_mismatch"}
+    elif isinstance(spec.get("role"), str): identity["roles"] = [spec["role"]]
     return identity
+
+
+def inspect_components(spec):
+    expected = {"speaker_segmentation": ("segmentation", ["segmentation/pytorch_model.bin"]), "speaker_embedding": ("embedding", ["embedding/pytorch_model.bin"]), "speaker_plda": ("plda", ["plda/plda.npz", "plda/xvec_transform.npz"])}
+    components = spec["components"]
+    if spec["repository"] != "pyannote/speaker-diarization-community-1" or not isinstance(components, dict) or not components or set(components) - set(expected) or "config.yaml" not in spec["files"]: raise ProvisionError("model_component_config_mismatch")
+    try:
+        import yaml
+    except ImportError:
+        raise ProvisionError("model_component_config_mismatch") from None
+    prefix = Path("models--" + spec["repository"].replace("/", "--")) / "snapshots" / spec["revision"]
+    config = contained(Path(spec["cache_root"]), prefix / "config.yaml")
+    if config.stat().st_size > 1024 * 1024: raise ProvisionError("model_component_config_mismatch")
+    try:
+        document = yaml.safe_load(config.read_text())
+    except yaml.YAMLError:
+        raise ProvisionError("model_component_config_mismatch") from None
+    if not isinstance(document, dict) or not isinstance(document.get("pipeline"), dict) or not isinstance(document["pipeline"].get("params"), dict): raise ProvisionError("model_component_config_mismatch")
+    pipeline = document["pipeline"]
+    if pipeline["name"] != "pyannote.audio.pipelines.SpeakerDiarization": raise ProvisionError("model_component_config_mismatch")
+    roles = {spec["role"]} if isinstance(spec.get("role"), str) else set()
+    for role, files in components.items():
+        name, required = expected[role]
+        if files != required or set(files) - set(spec["files"]) or pipeline["params"].get(name) != "$model/" + name: raise ProvisionError("model_component_config_mismatch")
+        roles.add(role)
+    return {"roles": sorted(roles), "component_config_sha256": sha256(config), "components_verified": True}
 
 
 def inspect_torch_spec(spec):
@@ -154,6 +186,7 @@ def inspect_torch_spec(spec):
         except (OSError, BaselineError):
             return {**result, "code": "model_file_missing"}
     result["status"] = "files_verified"
+    if isinstance(spec.get("role"), str): result["roles"] = [spec["role"]]
     return result
 
 

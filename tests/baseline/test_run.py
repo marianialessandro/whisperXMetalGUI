@@ -5,12 +5,85 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import os
+import signal
+import threading
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.baseline import run, corpus
 
 
 class RunnerTests(unittest.TestCase):
+    def group_lifecycle(self, interrupt):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = Path(__file__).resolve().parents[1] / "fixtures/baseline/sleeping_group.py"
+            children = []
+            original = run.subprocess.Popen
+            stop = threading.Event()
+            def launch(*args, **kwargs):
+                child = original(*args, **kwargs)
+                children.append(child)
+                return child
+            def cancellation():
+                deadline = time.monotonic() + 5
+                while not stop.is_set() and time.monotonic() < deadline:
+                    if (root / "parent-ready").exists():
+                        if not stop.is_set(): os.kill(os.getpid(), signal.SIGINT)
+                        return
+                    stop.wait(0.01)
+            thread = threading.Thread(target=cancellation, daemon=True) if interrupt else None
+            if thread is not None: thread.start()
+            try:
+                with patch.object(run.subprocess, "Popen", launch), self.assertRaisesRegex(run.RunError, "job_cancelled" if interrupt else "job_interrupted"):
+                    run.execute(Path(sys.executable), [fixture, "--markers", root], {"output": str(root / "output")}, 10 if interrupt else 1)
+            finally:
+                stop.set()
+                if thread is not None: thread.join(timeout=6)
+                for child in children:
+                    if child.poll() is None: run.stop_child(child)
+            self.assertTrue((root / "parent-stopped").exists())
+            self.assertTrue((root / "grandchild-stopped").exists())
+            self.assertTrue(all(child.poll() is not None for child in children))
+            self.assertTrue(all(child.stdin.closed and child.stdout.closed for child in children))
+
+    def test_timeout_terminates_the_real_process_group_and_closes_private_pipes(self):
+        self.group_lifecycle(False)
+
+    def test_interruption_terminates_the_real_process_group_and_closes_private_pipes(self):
+        self.group_lifecycle(True)
+
+    def test_timeout_cleans_descendants_even_after_the_group_leader_has_exited(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = Path(__file__).resolve().parents[1] / "fixtures/baseline/sleeping_group.py"
+            with self.assertRaisesRegex(run.RunError, "job_interrupted"):
+                run.execute(Path(sys.executable), [fixture, "--markers", root, "--exit-parent"], {"output": str(root / "output")}, 1)
+            descendant = int((root / "grandchild-ready").read_text())
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                status = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(descendant)], capture_output=True, text=True).stdout.strip()
+                if not status or status.startswith("Z"): break
+                time.sleep(0.01)
+            self.assertTrue(not status or status.startswith("Z"), "descendant remains alive after leader exit")
+
+    def test_component_roles_count_only_after_file_and_configuration_verification(self):
+        spec = {"repository": "pyannote/speaker-diarization-community-1", "role": "speaker_segmentation", "cache_root": "/private/cache", "revision": "a" * 40, "license_verified": True, "license_source": "https://example.org/license"}
+        checked = {"status": "files_verified", "roles": ["speaker_segmentation", "speaker_embedding", "speaker_plda"]}
+        with tempfile.TemporaryDirectory() as directory, patch.object(run.manifest, "contained", side_effect=OSError()):
+            arguments = ({"assets": [], "cases": []}, corpus.expected_coverage(Path(__file__).resolve().parents[2]), {"licenses": []}, Path(directory), [spec])
+            with patch.object(run.provision, "inspect_spec", return_value=checked):
+                report = run.preflight(*arguments)
+            missing_roles = {item.get("role") for item in report["missing"] if item["code"] == "required_model_role_undeclared"}
+            self.assertNotIn("speaker_embedding", missing_roles)
+            self.assertNotIn("speaker_plda", missing_roles)
+            self.assertIn("vad", missing_roles)
+            with patch.object(run.provision, "inspect_spec", return_value={**checked, "status": "prerequisite_missing", "code": "model_component_config_mismatch"}):
+                report = run.preflight(*arguments)
+            self.assertIn({"code": "required_model_role_undeclared", "role": "speaker_embedding"}, report["missing"])
+
     def test_cache_routes_are_transport_specific_and_inventory_order_independent(self):
         specs = [{"transport": "torch_hub", "cache_root": "/private/torch"}, {"cache_root": "/private/hf"}, {"cache_root": "/private/hf"}]
         expected = (Path("/private/hf").resolve(), Path("/private/torch").resolve())

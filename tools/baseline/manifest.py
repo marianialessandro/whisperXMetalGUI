@@ -13,6 +13,8 @@ import sys
 import tempfile
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 
 class BaselineError(ValueError):
     """Only fixed error codes cross the persistence boundary."""
@@ -24,6 +26,7 @@ SAFE_KEYS = frozenset("schema_version run_id status code source selection git_sh
 SAFE_KEYS |= frozenset("loadability_verified native_conversion_proven tensors harness".split())
 SAFE_KEYS |= frozenset("seed deterministic_algorithms_forced".split())
 SAFE_KEYS |= frozenset("default_reference_status".split())
+SAFE_KEYS |= frozenset("roles components_verified component_config_sha256".split())
 
 
 def failure(code, error=None):
@@ -191,10 +194,11 @@ def collect(selection, source_root, runtime, reference_root, model_specs=(), set
     versions = json.loads(installed) if installed else {name: None for name in PACKAGES}
     if not installed: prerequisites.append(failure("runtime_metadata_missing"))
     if not runtime_manifest.is_file(): prerequisites.append(failure("runtime_manifest_missing"))
-    models = [model_identity(spec["cache_root"], spec["repository"], spec["revision"], spec["files"]) for spec in model_specs]
+    from tools.baseline import provision
+    models = [provision.inspect_spec(spec) if spec.get("transport") == "torch_hub" or "components" in spec else model_identity(spec["cache_root"], spec["repository"], spec["revision"], spec["files"]) for spec in model_specs]
     if not models: prerequisites.append(failure("model_inventory_missing"))
     for model in models:
-        if model["status"] != "identified": prerequisites.append(failure(model["code"]))
+        if model["status"] not in ("identified", "files_verified"): prerequisites.append(failure(model["code"]))
     ram = command("/usr/sbin/sysctl", "-n", "hw.memsize")
     hardware = {"machine": platform.machine(), "chip": command("/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"), "ram_bytes": int(ram) if ram and ram.isdecimal() else None, "os": platform.mac_ver()[0], "sdk": command("/usr/bin/xcrun", "--show-sdk-version")}
     safe_settings = {}

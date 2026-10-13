@@ -31,6 +31,37 @@ class NativeNPZInventoryTests(unittest.TestCase):
         expected = digest or hashlib.sha256(path.read_bytes()).hexdigest()
         return subprocess.run([str(self.binary), "--model", str(path), "--sha256", expected, *extra], capture_output=True, text=True, timeout=30)
 
+    def test_streamed_payload_hashes_match_independent_numeric_bytes_and_leave_defaults_unchanged(self):
+        import numpy as np
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.npz"
+            arrays = {"large": np.arange(270000, dtype=np.float64), "fortran": np.asfortranarray(np.arange(12, dtype=np.float32).reshape(3, 4)), "big_endian": np.array([0.0, -0.0, float("inf")], dtype=">f8"), "nan_payloads": np.array([0x7ff8000000000001, 0x7ff0000000000001], dtype=np.uint64).view(np.float64), "empty": np.zeros((0, 3), dtype=np.float32), "scalar": np.array(7, dtype=np.int64)}
+            np.savez(path, **arrays)
+            legacy = json.loads(self.invoke(path).stdout)
+            self.assertTrue(all("payload_sha256" not in tensor for tensor in legacy["tensors"]))
+            result = self.invoke(path, extra=("--payload-hashes",))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            for tensor in report["tensors"]:
+                expected = hashlib.sha256(arrays[tensor["name"]].tobytes(order="F" if tensor["fortran_order"] else "C")).hexdigest()
+                self.assertEqual(tensor["payload_sha256"], expected)
+            self.assertFalse(report["tensor_loading_verified"])
+            self.assertFalse(report["native_conversion_proven"])
+            self.assertNotIn("AddressSanitizer", result.stderr)
+            self.assertNotIn("runtime error:", result.stderr)
+
+    def test_payload_hashes_require_original_file_identity_before_creating_output(self):
+        import numpy as np
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.npz"
+            np.savez(path, value=np.array([1, 2], dtype=np.float64))
+            original = hashlib.sha256(path.read_bytes()).hexdigest()
+            np.savez(path, value=np.array([2, 1], dtype=np.float64))
+            output = Path(directory) / "new.json"
+            result = self.invoke(path, original, ("--payload-hashes", "--output", str(output)))
+            self.assertEqual(json.loads(result.stdout)["code"], "model_hash_mismatch")
+            self.assertFalse(output.exists())
+
     def test_native_shapes_match_python_and_output_cannot_be_overwritten(self):
         import numpy as np
         with tempfile.TemporaryDirectory() as directory:

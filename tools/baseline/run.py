@@ -43,7 +43,11 @@ def preflight(catalog, coverage, licenses, evidence_root, model_specs, alignment
     for repository in sorted(required_repositories - declared_repositories):
         missing.append({"code": "required_model_undeclared", "repository": repository})
     required_roles = {"alignment_" + language for language in corpus.REPRESENTATIVES} | {"speaker_segmentation", "speaker_embedding", "speaker_plda", "vad"}
-    for role in sorted(required_roles - {spec.get("role") for spec in model_specs}):
+    verified_roles = set()
+    for spec, model in zip(model_specs, models):
+        if model["status"] == "files_verified":
+            verified_roles.update(model.get("roles", [spec["role"]] if isinstance(spec.get("role"), str) else []))
+    for role in sorted(required_roles - verified_roles):
         missing.append({"code": "required_model_role_undeclared", "role": role})
     for spec in model_specs:
         if spec.get("license_verified") is not True or not spec.get("license_source", "").startswith("https://"):
@@ -69,20 +73,29 @@ def preflight(catalog, coverage, licenses, evidence_root, model_specs, alignment
 
 
 def stop_child(child):
-    if child.poll() is not None:
-        return
     try:
-        os.killpg(child.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        child.terminate()
-    try:
-        child.wait(timeout=5)
-    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            if child.poll() is None: child.terminate()
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                child.kill()
+            child.wait()
         try:
             os.killpg(child.pid, signal.SIGKILL)
         except ProcessLookupError:
-            child.kill()
-        child.wait()
+            pass
+    finally:
+        for name in ("stdin", "stdout", "stderr"):
+            stream = getattr(child, name, None)
+            if stream is not None:
+                try: stream.close()
+                except OSError: pass
 
 
 def execute(runtime, arguments, request, timeout, cache_root=None, torch_home=None):
@@ -92,7 +105,7 @@ def execute(runtime, arguments, request, timeout, cache_root=None, torch_home=No
         environment["HF_HUB_CACHE"] = str(cache_root)
     if torch_home is not None:
         environment["TORCH_HOME"] = str(torch_home)
-    child = subprocess.Popen([str(runtime), "-I", "-B", "-u", *map(str, arguments)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment)
+    child = subprocess.Popen([str(runtime), "-I", "-B", "-u", *map(str, arguments)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment, process_group=0)
     try:
         output, _ = child.communicate(json.dumps(request).encode(), timeout=timeout)
     except subprocess.TimeoutExpired:

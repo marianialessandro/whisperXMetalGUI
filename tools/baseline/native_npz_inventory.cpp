@@ -19,7 +19,7 @@
 #include <vector>
 
 // This feasibility tool inventories the stored ZIP/NPY format observed in the real MLX checkpoints without Python, tensor loading or numerical conversion.
-struct Tensor { std::string name; std::string dtype; std::vector<uint64_t> shape; uint64_t payload; uint64_t offset; bool fortran; };
+struct Tensor { std::string name; std::string dtype; std::vector<uint64_t> shape; uint64_t payload; uint64_t offset; bool fortran; std::string payload_sha256; };
 static uint16_t u16(const std::vector<uint8_t>& data, size_t index) { require(index + 2 <= data.size(), "zip_truncated"); return uint16_t(data[index]) | uint16_t(data[index + 1]) << 8; }
 static uint32_t u32(const std::vector<uint8_t>& data, size_t index) { require(index + 4 <= data.size(), "zip_truncated"); return uint32_t(u16(data, index)) | uint32_t(u16(data, index + 2)) << 16; }
 static uint64_t u64(const std::vector<uint8_t>& data, size_t index) { require(index + 8 <= data.size(), "zip_truncated"); return uint64_t(u32(data, index)) | uint64_t(u32(data, index + 4)) << 32; }
@@ -39,6 +39,21 @@ static std::string digest(std::ifstream& source) {
     source.clear(); source.seekg(0);
     while (source) { source.read(block.data(), block.size()); if (source.gcount()) CC_SHA256_Update(&context, block.data(), static_cast<CC_LONG>(source.gcount())); }
     require(source.eof(), "model_read_failed");
+    std::array<unsigned char, CC_SHA256_DIGEST_LENGTH> value{}; CC_SHA256_Final(value.data(), &context);
+    std::ostringstream result; result << std::hex << std::setfill('0');
+    for (auto byte : value) result << std::setw(2) << unsigned(byte);
+    return result.str();
+}
+
+static std::string payload_digest(std::ifstream& source, const Tensor& tensor, uint64_t file_size) {
+    require(tensor.offset <= file_size && tensor.payload <= file_size - tensor.offset, "npy_payload_size_invalid");
+    CC_SHA256_CTX context; CC_SHA256_Init(&context);
+    uint64_t consumed = 0;
+    while (consumed < tensor.payload) {
+        auto block = read(source, tensor.offset + consumed, static_cast<size_t>(std::min<uint64_t>(1024 * 1024, tensor.payload - consumed)), file_size);
+        CC_SHA256_Update(&context, block.data(), static_cast<CC_LONG>(block.size()));
+        consumed += block.size();
+    }
     std::array<unsigned char, CC_SHA256_DIGEST_LENGTH> value{}; CC_SHA256_Final(value.data(), &context);
     std::ostringstream result; result << std::hex << std::setfill('0');
     for (auto byte : value) result << std::setw(2) << unsigned(byte);
@@ -75,7 +90,7 @@ static Tensor npy_header(std::ifstream& source, uint64_t offset, uint64_t bytes,
     }
     uint64_t item_size = std::stoull(dtype.substr(2));
     require(elements <= std::numeric_limits<uint64_t>::max() / item_size && elements * item_size == bytes - 8 - width - length, "npy_payload_size_invalid");
-    return {name, dtype, dimensions, elements * item_size, offset + 8 + width + length, fortran};
+    return {name, dtype, dimensions, elements * item_size, offset + 8 + width + length, fortran, {}};
 }
 
 static std::vector<Tensor> inventory(std::ifstream& source, uint64_t size) {
@@ -152,7 +167,9 @@ static std::string json(const std::vector<Tensor>& tensors, const std::string& h
         if (comma) output << ','; comma = true;
         output << "{\"name\":\"" << tensor.name << "\",\"dtype\":\"" << tensor.dtype << "\",\"shape\":[";
         for (size_t index = 0; index < tensor.shape.size(); ++index) { if (index) output << ','; output << tensor.shape[index]; }
-        output << "],\"fortran_order\":" << (tensor.fortran ? "true" : "false") << ",\"payload_bytes\":" << tensor.payload << ",\"file_offset\":" << tensor.offset << '}';
+        output << "],\"fortran_order\":" << (tensor.fortran ? "true" : "false") << ",\"payload_bytes\":" << tensor.payload << ",\"file_offset\":" << tensor.offset;
+        if (!tensor.payload_sha256.empty()) output << ",\"payload_sha256\":\"" << tensor.payload_sha256 << '\"';
+        output << '}';
     }
     output << "]}\n"; return output.str();
 }
@@ -161,11 +178,13 @@ static std::string json(const std::vector<Tensor>& tensors, const std::string& h
 int main(int argc, char** argv) {
     opterr = 0;
     std::string model, expected, output_path;
-    option options[]{{"model", required_argument, nullptr, 'm'}, {"sha256", required_argument, nullptr, 's'}, {"output", required_argument, nullptr, 'o'}, {"help", no_argument, nullptr, 'h'}, {nullptr, 0, nullptr, 0}};
+    bool payload_hashes = false;
+    option options[]{{"model", required_argument, nullptr, 'm'}, {"sha256", required_argument, nullptr, 's'}, {"output", required_argument, nullptr, 'o'}, {"payload-hashes", no_argument, nullptr, 'p'}, {"help", no_argument, nullptr, 'h'}, {nullptr, 0, nullptr, 0}};
     int flag;
     while ((flag = getopt_long(argc, argv, "", options, nullptr)) != -1) {
         if (flag == 'm') model = optarg; else if (flag == 's') expected = optarg; else if (flag == 'o') output_path = optarg;
-        else if (flag == 'h') { std::cout << "Usage: native_npz_inventory --model FILE --sha256 HASH [--output NEW_JSON]\nInspects bounded stored ZIP/NPY headers with system CommonCrypto; no Python, tensors loaded, conversion or GPU execution.\n"; return 0; }
+        else if (flag == 'p') payload_hashes = true;
+        else if (flag == 'h') { std::cout << "Usage: native_npz_inventory --model FILE --sha256 HASH [--output NEW_JSON] [--payload-hashes]\nInspects bounded stored ZIP/NPY headers with system CommonCrypto; no Python, tensors loaded, conversion or GPU execution.\nOptional --payload-hashes streams raw tensor payload bytes into per-tensor SHA256, without allocation of complete tensors or numeric decoding; default header-only behavior is unchanged.\n"; return 0; }
         else { std::cout << "{\"status\":\"unresolved\",\"code\":\"arguments_invalid\"}\n"; return 64; }
     }
     try {
@@ -175,6 +194,7 @@ int main(int argc, char** argv) {
         std::ifstream source(model, std::ios::binary); require(source.good(), "model_read_failed");
         auto hash = digest(source); require(hash == expected, "model_hash_mismatch");
         auto tensors = inventory(source, size);
+        if (payload_hashes) for (auto& tensor : tensors) tensor.payload_sha256 = payload_digest(source, tensor, size);
         auto document = json(tensors, hash);
         if (output_path.empty()) std::cout << document;
         else {

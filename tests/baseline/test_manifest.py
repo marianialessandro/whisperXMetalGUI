@@ -5,12 +5,32 @@ import subprocess
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
+import hashlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.baseline import manifest
 
 
 class ManifestTests(unittest.TestCase):
+    def test_collect_identifies_torch_transport_without_huggingface_snapshot_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "hub/checkpoints/weights.pth"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_bytes(b"weights")
+            spec = {"transport": "torch_hub", "repository": "torchaudio/BUNDLE", "revision": "a" * 40, "role": "alignment_it", "cache_root": str(root), "files": ["weights.pth"], "sha256": {"weights.pth": hashlib.sha256(b"weights").hexdigest()}}
+            with patch.object(manifest, "command", return_value=None):
+                report = manifest.collect("gui-checkout", root, Path(sys.executable), root, [spec])
+            self.assertEqual(report["models"][0]["status"], "files_verified")
+            self.assertEqual(report["models"][0]["roles"], ["alignment_it"])
+            self.assertFalse(report["models"][0]["loadability_verified"])
+            self.assertNotIn({"status": "prerequisite_missing", "code": "model_file_missing"}, report["prerequisites"])
+            checkpoint.write_bytes(b"modified")
+            with patch.object(manifest, "command", return_value=None):
+                report = manifest.collect("gui-checkout", root, Path(sys.executable), root, [spec])
+            self.assertIn({"status": "prerequisite_missing", "code": "model_hash_mismatch"}, report["prerequisites"])
+
     def test_environment_is_allowlisted_and_never_persisted(self):
         secret = "sentinel-private-credential"
         inherited = {"HF_TOKEN": secret, "HUGGING_FACE_HUB_TOKEN": secret, "AWS_SECRET_ACCESS_KEY": secret, "PYTHONPATH": secret, "DYLD_INSERT_LIBRARIES": secret, "HF_HOME": "/model cache", "HOME": "/Users/private", "PATH": secret}

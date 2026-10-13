@@ -17,6 +17,52 @@ from tools.baseline import provision
 
 
 class ProvisionTests(unittest.TestCase):
+    def community_spec(self, root):
+        revision = "a" * 40
+        prefix = root / "models--pyannote--speaker-diarization-community-1/snapshots" / revision
+        files = {"config.yaml": b"pipeline:\n  name: pyannote.audio.pipelines.SpeakerDiarization\n  params:\n    segmentation: $model/segmentation\n    embedding: $model/embedding\n    plda: $model/plda\n", "segmentation/pytorch_model.bin": b"segmentation", "embedding/pytorch_model.bin": b"embedding", "plda/plda.npz": b"plda", "plda/xvec_transform.npz": b"transform"}
+        for name, payload in files.items():
+            target = prefix / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payload)
+        return {"cache_root": str(root), "repository": "pyannote/speaker-diarization-community-1", "revision": revision, "role": "speaker_segmentation", "files": list(files), "sha256": {name: hashlib.sha256(payload).hexdigest() for name, payload in files.items()}, "components": {"speaker_segmentation": ["segmentation/pytorch_model.bin"], "speaker_embedding": ["embedding/pytorch_model.bin"], "speaker_plda": ["plda/plda.npz", "plda/xvec_transform.npz"]}}
+
+    def test_shared_pipeline_roles_require_verified_component_files_and_config_references(self):
+        with tempfile.TemporaryDirectory() as directory:
+            spec = self.community_spec(Path(directory))
+            report = provision.inspect_spec(spec)
+            self.assertEqual(report["status"], "files_verified")
+            self.assertEqual(report["roles"], ["speaker_embedding", "speaker_plda", "speaker_segmentation"])
+            self.assertTrue(report["components_verified"])
+            self.assertEqual(report["component_config_sha256"], spec["sha256"]["config.yaml"])
+            self.assertFalse(report["loadability_verified"])
+            legacy = dict(spec)
+            legacy.pop("components")
+            self.assertEqual(provision.inspect_spec(legacy)["roles"], ["speaker_segmentation"])
+            snapshot = Path(directory) / "models--pyannote--speaker-diarization-community-1/snapshots" / spec["revision"]
+            (snapshot / "embedding/pytorch_model.bin").write_bytes(b"changed")
+            self.assertEqual(provision.inspect_spec(spec)["code"], "model_hash_mismatch")
+
+    def test_component_roles_reject_missing_files_wrong_mapping_and_unknown_components(self):
+        with tempfile.TemporaryDirectory() as directory:
+            spec = self.community_spec(Path(directory))
+            variants = [{**spec, "files": [name for name in spec["files"] if name != "plda/xvec_transform.npz"]}, {**spec, "components": {"speaker_embedding": ["segmentation/pytorch_model.bin"]}}, {**spec, "components": {"vad": ["segmentation/pytorch_model.bin"]}}]
+            for variant in variants:
+                with self.subTest(variant=variant["components"]):
+                    self.assertEqual(provision.inspect_spec(variant)["code"], "model_component_config_mismatch")
+
+    def test_component_config_drift_and_unsafe_yaml_fail_without_loading_or_exposing_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            spec = self.community_spec(Path(directory))
+            config = Path(directory) / "models--pyannote--speaker-diarization-community-1/snapshots" / spec["revision"] / "config.yaml"
+            original = config.read_bytes()
+            for payload in (original.replace(b"$model/embedding", b"external/embedding"), b"!!python/object/apply:builtins.print [private-credential-sentinel]"):
+                config.write_bytes(payload)
+                spec["sha256"]["config.yaml"] = hashlib.sha256(payload).hexdigest()
+                report = provision.inspect_spec(spec)
+                self.assertEqual(report["code"], "model_component_config_mismatch")
+                self.assertNotIn("private-credential-sentinel", json.dumps(report))
+
     def test_bind_default_reference_requires_verified_snapshot_and_never_overwrites_conflict(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
