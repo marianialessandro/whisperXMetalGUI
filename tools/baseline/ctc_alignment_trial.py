@@ -178,6 +178,7 @@ def main(argv=None):
     parser.add_argument("--native-resident-reductions", action="store_true", help="Optional shared retained rounded character triples for fused statistics; verifies original row values and maps NaN positions without uploading character values. Requires --native-fused-reductions and --native-resident-character-rounding.")
     parser.add_argument("--native-word-rounding", action="store_true", help="Optional pinned NumPy three-decimal word mean rounding on Metal in the resident fused-stat command group; preserves unrounded numerical means. Requires --native-resident-reductions.")
     parser.add_argument("--native-nearest-interpolation", action="store_true", help="Optional default nearest timestamp interpolation and end filling on Metal for pinned Pandas/SciPy and contiguous zero-based Series; requires native-persistent. Adds one command group per numerical Series.")
+    parser.add_argument("--native-interpolation-batched", action="store_true", help="Optional paired start/end subsegment nearest interpolation in one Metal completion with snapshot validation; requires --native-nearest-interpolation. Word Series remain standalone.")
     args = parser.parse_args(argv)
     if not 1 <= args.replicas <= 10: parser.error("replicas must be between 1 and 10")
     if args.ctc_backend == "native" and (args.native_binary is None or args.native_binary_sha256 is None): parser.error("native backend requires binary and its expected SHA256")
@@ -187,6 +188,7 @@ def main(argv=None):
     if args.native_wildcard_max and args.ctc_backend != "native-persistent": parser.error("--native-wildcard-max requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.ctc_backend != "native-persistent": parser.error("--native-fused-wildcard requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.native_wildcard_max: parser.error("wildcard modes are mutually exclusive")
+    if args.native_interpolation_batched and not args.native_nearest_interpolation: parser.error("batched interpolation requires native nearest interpolation")
     if args.native_nearest_interpolation and args.ctc_backend != "native-persistent": parser.error("native nearest interpolation requires native-persistent")
     if args.native_word_rounding and not args.native_resident_reductions: parser.error("native word rounding requires resident reductions")
     if args.native_resident_reductions and (not args.native_fused_reductions or not args.native_resident_character_rounding): parser.error("native resident reductions require fused reductions and resident character rounding")
@@ -224,15 +226,15 @@ def main(argv=None):
         @contextlib.contextmanager
         def candidate_context(records, maximum_records, bounds_records, word_records, round_records, interpolate_records):
             with contextlib.ExitStack() as scopes:
-                if args.native_nearest_interpolation:
-                    from tools.baseline.native_interpolation import native_nearest_interpolation
-                    scopes.enter_context(native_nearest_interpolation(alignment, persistent, interpolate_records))
                 if args.native_timestamp_bounds_batched:
                     from tools.baseline.native_timestamp_bounds import native_timestamp_bounds_batched
                     scopes.enter_context(native_timestamp_bounds_batched(alignment, persistent, bounds_records, fast_frames=args.native_timestamp_fast_frames, word_means=args.native_word_means, mean_records=word_records, fused_reductions=args.native_fused_reductions, compact_plan=args.native_compact_reduction_plan, resident_reductions=args.native_resident_reductions, word_rounding=args.native_word_rounding))
                 if args.native_timestamp_bounds:
                     from tools.baseline.native_timestamp_bounds import native_timestamp_bounds
                     scopes.enter_context(native_timestamp_bounds(alignment, persistent, bounds_records))
+                if args.native_nearest_interpolation:
+                    from tools.baseline.native_interpolation import native_nearest_interpolation
+                    scopes.enter_context(native_nearest_interpolation(alignment, persistent, interpolate_records, batched_frames=args.native_interpolation_batched))
                 if args.native_fused_wildcard:
                     from tools.baseline.native_ctc_fused import fused_wildcard_preparation
                     scopes.enter_context(fused_wildcard_preparation(max(metadata["dictionary"].values()) + 1))
@@ -281,6 +283,7 @@ def main(argv=None):
         report["native_fused_wildcard_dispatch_count"] = sum(record.get("wildcard_fused") is True for record in spans)
         report["native_character_rounding_enabled"], report["character_rounding_spans"] = args.native_character_rounding, rounding_spans
         report["native_character_rounding_dispatch_count"] = len(rounding_spans)
+        report["native_interpolation_batched_enabled"] = args.native_interpolation_batched
         report["native_nearest_interpolation_enabled"], report["interpolation_spans"] = args.native_nearest_interpolation, interpolation_spans
         report["native_nearest_interpolation_dispatch_count"] = sum(record["dispatch_completed"] for record in interpolation_spans)
         report["native_word_rounding_enabled"] = args.native_word_rounding

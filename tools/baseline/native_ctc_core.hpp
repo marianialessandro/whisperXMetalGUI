@@ -16,6 +16,7 @@ struct Timing { uint64_t wall_ns; double gpu_seconds; };
 struct NativePoint { int32_t token; int32_t frame; float score; };
 struct NativeSegment { int32_t start; int32_t end; double score; };
 struct NativeResult { std::vector<NativePoint> path; bool found; std::vector<Timing> timings; uint64_t dp_bytes; uint64_t allocated_bytes; std::vector<NativeSegment> segments; int32_t path_length; uint64_t generation = 0; };
+struct NativeNearestResult { Timing timing; uint64_t allocated_bytes; uint32_t counts[4]; };
 struct NativeDirectStatsResult { Timing timing; uint64_t allocated_bytes; };
 struct NativeBatchBoundsResult { std::vector<uint64_t> bounds; Timing timing; uint64_t allocated_bytes; };
 struct NativeBoundsResult { uint64_t minimum, maximum; Timing timing; uint64_t allocated_bytes; };
@@ -60,7 +61,7 @@ class NativeCTCContext {
     id<MTLBuffer> e_, t_, invalid_, prefix_, rows_, path_, decisions_, endpoint_;
     id<MTLBuffer> max_values_, max_indices_;
     id<MTLBuffer> expanded_;
-    id<MTLBuffer> segment_bounds_, segment_means_, bounds_input_, bounds_output_, bounds_indices_, bounds_offsets_, stats_modes_, scale_parameters_, rounded_segments_, rounded_words_, nearest_neighbors_;
+    id<MTLBuffer> segment_bounds_, segment_means_, bounds_input_, bounds_output_, bounds_indices_, bounds_offsets_, stats_modes_, scale_parameters_, rounded_segments_, rounded_words_, nearest_neighbors_, nearest_counts_;
     uint64_t generation_counter_ = 0, resident_generation_ = 0, rounded_generation_ = 0, rounded_ratio_ = 0, rounded_offset_ = 0;
     uint32_t resident_count_ = 0, resident_frames_ = 0;
     bool compact_, batched_;
@@ -71,7 +72,7 @@ class NativeCTCContext {
         require(buffer != nil, "metal_allocation_failed");
     }
 
-    uint64_t allocated_bytes() const { return e_.length + t_.length + invalid_.length + prefix_.length + rows_.length + path_.length + decisions_.length + endpoint_.length + max_values_.length + max_indices_.length + expanded_.length + segment_bounds_.length + segment_means_.length + bounds_input_.length + bounds_output_.length + bounds_indices_.length + bounds_offsets_.length + stats_modes_.length + scale_parameters_.length + rounded_segments_.length + rounded_words_.length + nearest_neighbors_.length; }
+    uint64_t allocated_bytes() const { return e_.length + t_.length + invalid_.length + prefix_.length + rows_.length + path_.length + decisions_.length + endpoint_.length + max_values_.length + max_indices_.length + expanded_.length + segment_bounds_.length + segment_means_.length + bounds_input_.length + bounds_output_.length + bounds_indices_.length + bounds_offsets_.length + stats_modes_.length + scale_parameters_.length + rounded_segments_.length + rounded_words_.length + nearest_neighbors_.length + nearest_counts_.length; }
 
     void pipeline(id<MTLComputePipelineState> __strong& state, NSString* name) {
         if (state != nil) return;
@@ -261,21 +262,23 @@ public:
         return {timing, allocated_bytes()};
     }
 
-    NativeDirectStatsResult interpolate_nearest(const uint64_t* values, uint64_t count, uint64_t* output, uint64_t capacity) {
+    NativeNearestResult interpolate_nearest(const uint64_t* values, uint64_t count, uint64_t* output, uint64_t capacity, uint32_t columns = 1) {
         std::lock_guard<std::mutex> guard(mutex_);
-        require(values != nullptr && output != nullptr && count > 0 && count <= 32768 && capacity >= count, "nearest_shape_or_output_invalid");
+        require(values != nullptr && output != nullptr && columns >= 1 && columns <= 2 && count > 0 && count % columns == 0 && count / columns <= 32768 && capacity >= count, "nearest_shape_or_output_invalid");
         pipeline(nearest_neighbors_pipeline_, @"ctc_nearest_neighbors"); pipeline(nearest_fill_pipeline_, @"ctc_nearest_fill");
-        reserve(bounds_input_, count * 8); reserve(bounds_output_, count * 8); reserve(nearest_neighbors_, count * 8);
+        reserve(bounds_input_, count * 8); reserve(bounds_output_, count * 8); reserve(nearest_neighbors_, count * 8); reserve(nearest_counts_, columns * 8);
         std::memcpy(bounds_input_.contents, values, count * 8);
         auto started = std::chrono::steady_clock::now();
         id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "metal_command_creation_failed");
         command.label = @"ctc_nearest_interpolation";
-        Dimensions dimensions{0, 0, static_cast<uint32_t>(count), 0};
-        encode(command, nearest_neighbors_pipeline_, @[bounds_input_, nearest_neighbors_], dimensions, 1, 1, 1, @"ctc_nearest_neighbors");
+        Dimensions dimensions{static_cast<uint32_t>(count / columns), columns, static_cast<uint32_t>(count), 0};
+        encode(command, nearest_neighbors_pipeline_, @[bounds_input_, nearest_neighbors_, nearest_counts_], dimensions, 1, columns, 1, @"ctc_nearest_neighbors");
         encode(command, nearest_fill_pipeline_, @[bounds_input_, nearest_neighbors_, bounds_output_], dimensions, 1, count, 256, @"ctc_nearest_fill");
         auto timing = complete(command, started);
         std::memcpy(output, bounds_output_.contents, count * 8);
-        return {timing, allocated_bytes()};
+        NativeNearestResult result{timing, allocated_bytes(), {}};
+        std::memcpy(result.counts, nearest_counts_.contents, columns * 8);
+        return result;
     }
 
     NativeDirectStatsResult round3(const uint64_t* values, uint64_t count, uint64_t* output, uint64_t capacity) {

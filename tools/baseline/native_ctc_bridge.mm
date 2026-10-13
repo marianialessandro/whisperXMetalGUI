@@ -223,4 +223,19 @@ int wxctc_interpolate_nearest(wxctc_context* context, const uint64_t* values, ui
     }
 }
 
+int wxctc_interpolate_nearest_batch(wxctc_context* context, const uint64_t* values, uint64_t elements, uint32_t columns, uint64_t* output, uint32_t output_capacity, uint32_t* counts, uint32_t counts_capacity, wxctc_max_result* result, char* error_code, uint32_t error_capacity) {
+    @autoreleasepool {
+        set_error(error_code, error_capacity, "");
+        if (result != nullptr) { *result = {}; result->abi_version = 1; }
+        try {
+            require(context != nullptr && result != nullptr && counts != nullptr && columns >= 1 && columns <= 2 && counts_capacity >= columns * 2, "output_or_context_invalid");
+            auto completed = context->core.interpolate_nearest(values, elements, output, output_capacity, columns);
+            std::memcpy(counts, completed.counts, columns * 8);
+            *result = {1, 0, 0, completed.timing.wall_ns, 0, completed.timing.gpu_seconds, completed.allocated_bytes};
+            return 0;
+        } catch (const InventoryError& error) { set_error(error_code, error_capacity, error.what()); return 1; }
+        catch (...) { set_error(error_code, error_capacity, "native_nearest_interpolation_failed"); return 1; }
+    }
+}
+
 void wxctc_destroy(wxctc_context* context) { @autoreleasepool { delete context; } }

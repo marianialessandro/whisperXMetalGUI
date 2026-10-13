@@ -113,6 +113,13 @@ int main(int argc, char** argv) {
     assert(wxctc_interpolate_nearest(context, nearest_values, 0, nearest_output, 3, &maximum_result, error, sizeof(error)) != 0 && nearest_output[2] == 789);
     assert(wxctc_interpolate_nearest(context, nearest_values, 3, nearest_output, 3, &maximum_result, error, sizeof(error)) == 0);
     assert(nearest_output[0] == 0 && nearest_output[1] == 0 && nearest_output[2] == 0x3ff0000000000000ull && maximum_result.computation_gpu_seconds > 0);
+    uint64_t paired_values[]{0, 0x7ff8000000000000ull, 0x3ff0000000000000ull, 0x7ff8000000001234ull, 0xfff8000000005678ull, 0x7ff8000000007890ull};
+    uint64_t paired_output[]{123, 456, 789, 111, 222, 333}; uint32_t paired_counts[]{17, 18, 19, 20};
+    assert(wxctc_interpolate_nearest_batch(context, paired_values, 6, 2, paired_output, 6, paired_counts, 3, &maximum_result, error, sizeof(error)) != 0 && paired_output[0] == 123 && paired_counts[0] == 17);
+    assert(wxctc_interpolate_nearest_batch(context, paired_values, 5, 2, paired_output, 6, paired_counts, 4, &maximum_result, error, sizeof(error)) != 0 && paired_output[5] == 333 && paired_counts[3] == 20);
+    assert(wxctc_interpolate_nearest_batch(context, paired_values, 6, 2, paired_output, 6, paired_counts, 4, &maximum_result, error, sizeof(error)) == 0);
+    assert(paired_output[1] == 0 && paired_output[3] == paired_values[3] && paired_output[5] == paired_values[3]);
+    assert(paired_counts[0] == 1 && paired_counts[1] == 1 && paired_counts[2] == 3 && paired_counts[3] == 0);
     uint64_t grown = 0;
     for (int iteration = 0; iteration < 8; ++iteration) {
         std::vector<float> large(256 * 4, -1);

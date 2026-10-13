@@ -666,6 +666,82 @@ class PersistentNativeCTCTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "runtime_or_records_not_supported"):
                     with native_nearest_interpolation(alignment, context, []): pass
 
+    def test_nearest_pair_keeps_column_boundaries_and_reports_actual_gpu_gap_counts(self):
+        import pandas as pd
+        from whisperx.utils import interpolate_nans
+        generator = np.random.default_rng(922)
+        all_missing = np.array([0x7ff8000000001234, 0xfff8000000005678, 0x7ff0000000007890], dtype=np.uint64).view(np.float64)
+        cases = [np.column_stack([all_missing, [np.nan, -0., np.nan]]), np.array([[0., np.nan], [np.nan, np.nan], [2., 10.], [np.nan, np.nan], [np.nan, 14.]])]
+        for size in [1, 7, 257, 8193, 32768]:
+            values = generator.normal(size=(size, 2)); values[generator.random(size=(size, 2)) < .6] = np.nan
+            cases.extend([values, values[::2]])
+        with NativeCTC(self.library, self.identity) as context:
+            for values in cases:
+                actual, record = context.interpolate_nearest_pair(values)
+                expected = np.column_stack([interpolate_nans(pd.Series(values[:, i])).to_numpy() for i in range(2)])
+                np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+                missing = [int(np.isnan(values[:, i]).sum()) for i in range(2)]
+                self.assertEqual(record["input_missing_counts"], missing)
+                self.assertEqual(record["filled_missing_counts"], [count if count != len(values) else 0 for count in missing])
+                self.assertEqual(record["logical_control_readback_bytes"], 16)
+                self.assertEqual(record["command_buffers_per_run"], 1)
+            for invalid in [np.zeros((0, 2)), np.zeros((32769, 2)), np.zeros((2, 3)), np.zeros((2, 2), dtype=np.float32)]:
+                with self.assertRaisesRegex(ValueError, "format_invalid"): context.interpolate_nearest_pair(invalid)
+
+    def test_nearest_pair_frame_preserves_original_values_metadata_and_rejects_changed_snapshots(self):
+        import pandas as pd
+        from tools.baseline.native_interpolation import native_nearest_interpolation
+        from whisperx.utils import interpolate_nans
+        rows = [{"text": str(i), "words": [], "start": start, "end": end} for i, (start, end) in enumerate([(0., np.nan), (np.nan, 2.), (2., np.nan), (np.nan, 4.)])]
+        original_pd, original_function = alignment.pd, alignment.interpolate_nans
+        with NativeCTC(self.library, self.identity) as context:
+            records = []
+            with native_nearest_interpolation(alignment, context, records, batched_frames=True):
+                frame = alignment.pd.DataFrame(rows)
+                frame.attrs = {"origin": "test"}
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]["columns_consumed"], 0)
+                pd.testing.assert_frame_equal(pd.DataFrame(frame), pd.DataFrame(rows))
+                for column in ("start", "end"):
+                    source = frame[column]
+                    actual = alignment.interpolate_nans(source)
+                    expected = interpolate_nans(pd.Series(source, name=column))
+                    pd.testing.assert_series_equal(pd.Series(actual), expected)
+                    self.assertEqual(actual.attrs, frame.attrs)
+                    actual.iloc[0] = 999.
+                    np.testing.assert_array_equal(alignment.interpolate_nans(source).to_numpy().view(np.uint64), expected.to_numpy().view(np.uint64))
+                changed = frame["start"].copy(); changed.iloc[0] = 42.
+                with self.assertRaisesRegex(ValueError, "snapshot_changed"): alignment.interpolate_nans(changed)
+                frame["start"] = alignment.interpolate_nans(frame["start"])
+                frame["end"] = alignment.interpolate_nans(frame["end"])
+                self.assertEqual(len(records), 1)
+                all_none = alignment.pd.DataFrame([{"text": "?", "words": [], "start": None, "end": None}])
+                self.assertEqual(all_none.start.dtype, object)
+                self.assertIsNone(alignment.interpolate_nans(all_none.start).iloc[0])
+            self.assertIs(alignment.pd, original_pd)
+            self.assertIs(alignment.interpolate_nans, original_function)
+            with self.assertRaisesRegex(RuntimeError, "forced"):
+                with native_nearest_interpolation(alignment, context, [], batched_frames=True): raise RuntimeError("forced")
+            self.assertIs(alignment.pd, original_pd)
+
+    def test_nearest_pair_proxy_composes_with_resident_character_frame_proxy(self):
+        from unittest.mock import patch
+        import nltk.tokenize
+        from tools.baseline.native_interpolation import native_nearest_interpolation
+        emission, tokens = np.array([[-3., -.1], [-.2, -2.], [-.1, -3.]], dtype=np.float32), np.array([1], dtype=np.int32)
+        with NativeCTC(self.library, self.identity) as context:
+            handle, _ = context.prepare_segments(emission, tokens)
+            values, _ = context.scale_round_segments(handle, .01, 0.)
+            with patch.object(alignment, "nltk_load", return_value=nltk.tokenize.PunktSentenceTokenizer()):
+                with native_timestamp_bounds_batched(alignment, context, [], fast_frames=True, word_means=True, mean_records=[], fused_reductions=True, compact_plan=True, resident_reductions=True, word_rounding=True):
+                    previous = alignment.pd
+                    with native_nearest_interpolation(alignment, context, [], batched_frames=True):
+                        list(alignment.nltk_load().span_tokenize("a"))
+                        frame = alignment.pd.DataFrame([{"char": "a", "word-idx": 0, "start": float(values[0, 0]), "end": float(values[0, 1]), "score": float(values[0, 2])}])
+                        self.assertEqual(frame.start.min(), values[0, 0])
+                        self.assertEqual(round(frame.score.mean(), 3), round(np.float64(values[0, 2]), 3))
+                    self.assertIs(alignment.pd, previous)
+
     def test_buffer_growth_reuse_and_sentinel_paths_match_original(self):
         generator = np.random.default_rng(43)
         large = torch.log_softmax(torch.from_numpy(generator.normal(size=(341, 38)).astype(np.float32)), dim=-1)

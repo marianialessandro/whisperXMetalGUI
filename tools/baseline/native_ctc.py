@@ -250,20 +250,30 @@ class NativeCTC:
             return output.view(np.float64).reshape(-1, 3), {"scope": "experimental_resident_character_scale_round", "elements": output.size, "characters": segments.count, "kernel": "ctc_scale_round_segments", "dispatch_completed": True, "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "computation_wall_ns": result.computation_wall_ns, "computation_gpu_seconds": result.computation_gpu_seconds, "logical_cpu_to_native_bytes": 16, "logical_character_reupload_bytes": 0, "cpu_resident_snapshot_bytes": output.nbytes, "logical_output_readback_bytes": output.nbytes, "logical_invalid_control_readback_bytes": 4, "native_host_result_staging_bytes": 0, "physical_copy_bytes": None, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
 
     def interpolate_nearest(self, values):
+        return self._interpolate_nearest(values, 1)
+
+    def interpolate_nearest_pair(self, values):
         import numpy as np
-        if not isinstance(values, np.ndarray) or values.dtype != np.float64 or values.ndim != 1 or not 0 < values.size <= 32768: raise ValueError("native_nearest_format_invalid")
+        if not isinstance(values, np.ndarray) or values.dtype != np.float64 or values.ndim != 2 or values.shape[1] != 2 or not 0 < len(values) <= 32768: raise ValueError("native_nearest_pair_format_invalid")
+        output, record = self._interpolate_nearest(np.ascontiguousarray(values.T).reshape(-1), 2)
+        return output.reshape(2, -1).T, record
+
+    def _interpolate_nearest(self, values, columns):
+        import numpy as np
+        if not isinstance(values, np.ndarray) or values.dtype != np.float64 or values.ndim != 1 or not 0 < values.size <= 32768 * columns or values.size % columns: raise ValueError("native_nearest_format_invalid")
         with self._lock:
             if not self._context.value: raise ValueError("native_context_closed")
             started = time.perf_counter_ns()
-            function = self._library.wxctc_interpolate_nearest
-            function.argtypes = [ct.c_void_p, ct.POINTER(ct.c_uint64), ct.c_uint64, ct.POINTER(ct.c_uint64), ct.c_uint32, ct.POINTER(MaxResult), ct.POINTER(ct.c_char), ct.c_uint32]
+            function = self._library.wxctc_interpolate_nearest_batch
+            function.argtypes = [ct.c_void_p, ct.POINTER(ct.c_uint64), ct.c_uint64, ct.c_uint32, ct.POINTER(ct.c_uint64), ct.c_uint32, ct.POINTER(ct.c_uint32), ct.c_uint32, ct.POINTER(MaxResult), ct.POINTER(ct.c_char), ct.c_uint32]
             function.restype = ct.c_int
             values = np.ascontiguousarray(values)
             output, result, error = np.empty(values.size, dtype=np.uint64), MaxResult(), ct.create_string_buffer(128)
-            status = function(self._context, values.ctypes.data_as(ct.POINTER(ct.c_uint64)), values.size, output.ctypes.data_as(ct.POINTER(ct.c_uint64)), output.size, ct.byref(result), error, len(error))
+            counts = (ct.c_uint32 * (columns * 2))()
+            status = function(self._context, values.ctypes.data_as(ct.POINTER(ct.c_uint64)), values.size, columns, output.ctypes.data_as(ct.POINTER(ct.c_uint64)), output.size, counts, len(counts), ct.byref(result), error, len(error))
             if status: raise ValueError(error.value.decode("ascii"))
             if result.abi_version != 1: raise ValueError("native_result_invalid")
-            return output.view(np.float64), {"scope": "experimental_nearest_interpolation", "elements": values.size, "dispatch_completed": True, "command_buffers_per_run": 1, "gpu_kernels": ["ctc_nearest_neighbors", "ctc_nearest_fill"], "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "computation_wall_ns": result.computation_wall_ns, "computation_gpu_seconds": result.computation_gpu_seconds, "logical_cpu_to_native_bytes": values.nbytes, "logical_output_readback_bytes": output.nbytes, "native_host_result_staging_bytes": 0, "physical_copy_bytes": None, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
+            return output.view(np.float64), {"scope": "experimental_nearest_interpolation", "elements": values.size, "columns": columns, "input_missing_counts": [counts[i * 2] for i in range(columns)], "filled_missing_counts": [counts[i * 2 + 1] for i in range(columns)], "logical_control_readback_bytes": columns * 8, "dispatch_completed": True, "command_buffers_per_run": 1, "gpu_kernels": ["ctc_nearest_neighbors", "ctc_nearest_fill"], "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "computation_wall_ns": result.computation_wall_ns, "computation_gpu_seconds": result.computation_gpu_seconds, "logical_cpu_to_native_bytes": values.nbytes, "logical_output_readback_bytes": output.nbytes, "native_host_result_staging_bytes": 0, "physical_copy_bytes": None, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
 
     def round3(self, values):
         import numpy as np
