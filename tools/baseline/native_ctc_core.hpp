@@ -53,7 +53,7 @@ class NativeCTCContext {
     id<MTLLibrary> library_;
     id<MTLComputePipelineState> max_pipeline_;
     id<MTLComputePipelineState> wildcard_validate_, wildcard_expand_;
-    id<MTLComputePipelineState> segment_pipeline_, bounds_pipeline_, batch_bounds_pipeline_;
+    id<MTLComputePipelineState> segment_pipeline_, bounds_pipeline_, batch_bounds_pipeline_, word_means_pipeline_;
     NSMutableArray<id<MTLComputePipelineState>>* pipelines_;
     NSArray<NSString*>* names_;
     id<MTLBuffer> e_, t_, invalid_, prefix_, rows_, path_, decisions_, endpoint_;
@@ -179,6 +179,24 @@ public:
         require(!(invalid & 1), "timestamp_batch_indices_invalid"); require(!(invalid & 2), "timestamp_negative_zero_not_supported");
         const uint64_t* output = static_cast<const uint64_t*>(bounds_output_.contents);
         return {{output, output + uint64_t(queries) * 2}, timing, allocated_bytes()};
+    }
+
+    NativeBatchBoundsResult word_means_batch(const uint64_t* values, uint64_t count, const uint32_t* indices, uint64_t index_count, const uint32_t* offsets, uint64_t offset_count) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(values != nullptr && indices != nullptr && offsets != nullptr && count <= 32768 && index_count <= 4 * 1024 * 1024 && offset_count >= 2 && offset_count <= 32769, "word_means_shape_invalid");
+        uint32_t queries = static_cast<uint32_t>(offset_count - 1);
+        pipeline(word_means_pipeline_, @"ctc_word_means_batch");
+        reserve(bounds_input_, std::max(uint64_t(8), count * 8)); reserve(bounds_output_, uint64_t(queries) * 8);
+        reserve(bounds_indices_, std::max(uint64_t(4), index_count * 4)); reserve(bounds_offsets_, offset_count * 4); reserve(invalid_, 4);
+        if (count) std::memcpy(bounds_input_.contents, values, count * 8);
+        if (index_count) std::memcpy(bounds_indices_.contents, indices, index_count * 4);
+        std::memcpy(bounds_offsets_.contents, offsets, offset_count * 4);
+        *static_cast<uint32_t*>(invalid_.contents) = 0;
+        auto timing = execute(queue_, word_means_pipeline_, @[bounds_input_, bounds_indices_, bounds_offsets_, bounds_output_, invalid_], {queries, static_cast<uint32_t>(count), static_cast<uint32_t>(index_count), 0}, 1, queries, 256, @"ctc_word_means_batch");
+        uint32_t invalid = *static_cast<uint32_t*>(invalid_.contents);
+        require(!(invalid & 1), "word_means_indices_invalid"); require(!(invalid & 2), "word_means_values_invalid");
+        const uint64_t* output = static_cast<const uint64_t*>(bounds_output_.contents);
+        return {{output, output + queries}, timing, allocated_bytes()};
     }
 
     NativeBoundsResult timestamp_bounds(const uint64_t* values, uint64_t count) {

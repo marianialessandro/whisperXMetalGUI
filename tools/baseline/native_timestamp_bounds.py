@@ -1,4 +1,4 @@
-"""Scoped alignment-only Pandas adapter for native binary64 timestamp extrema; means/interpolation remain original."""
+"""Scoped alignment-only Pandas adapters for native timestamp extrema and optional binary64 word score means."""
 
 import contextlib
 import numpy as np
@@ -47,9 +47,10 @@ def native_timestamp_bounds(alignment, context, records):
 
 
 @contextlib.contextmanager
-def native_timestamp_bounds_batched(alignment, context, records, fast_frames=False):
+def native_timestamp_bounds_batched(alignment, context, records, fast_frames=False, word_means=False, mean_records=None):
     original, original_load = alignment.pd, alignment.nltk_load
     if fast_frames and original.__version__ != "3.0.6": raise ValueError("native_timestamp_fast_frames_runtime_not_supported")
+    if word_means and (original.__version__ != "3.0.6" or np.__version__ != "2.2.6" or np.getbufsize() != 8192 or not isinstance(mean_records, list)): raise ValueError("native_word_means_runtime_or_records_not_supported")
     sentence_spans = {}
 
     class TokenizerProxy:
@@ -65,7 +66,7 @@ def native_timestamp_bounds_batched(alignment, context, records, fast_frames=Fal
     def load_tokenizer(*args, **kwargs): return TokenizerProxy(original_load(*args, **kwargs))
 
     class BatchSeries(original.Series):
-        _metadata = [*original.Series._metadata, "_native_batch_cache"]
+        _metadata = [*original.Series._metadata, "_native_batch_cache", "_native_word_mean_cache"]
 
         @property
         def _constructor(self): return BatchSeries
@@ -88,12 +89,24 @@ def native_timestamp_bounds_batched(alignment, context, records, fast_frames=Fal
             cache[1]["queries_consumed"] += 1
             return bounds[0 if method == "min" else 1]
 
+        def mean(self, axis=None, skipna=True, numeric_only=False, **kwargs):
+            if self.name != "score" or not word_means: return super().mean(axis=axis, skipna=skipna, numeric_only=numeric_only, **kwargs)
+            if axis not in (None, 0, "index") or skipna is not True or numeric_only is not False or kwargs: raise ValueError("native_word_mean_options_not_supported")
+            if self.dtype != np.dtype("float64") and not (self.dtype == np.dtype("object") and all(value is None for value in self)): raise ValueError("native_word_mean_dtype_not_supported")
+            cache = getattr(self, "_native_word_mean_cache", None)
+            key = tuple(self.index)
+            if cache is None or key not in cache[0]: raise ValueError("native_word_mean_subset_not_registered")
+            mean, snapshot = cache[0][key]
+            if self.to_numpy(dtype=np.float64).tobytes() != snapshot: raise ValueError("native_word_mean_snapshot_changed")
+            cache[1]["queries_consumed"] += 1
+            return mean
+
         def min(self, axis=None, skipna=True, numeric_only=False, **kwargs): return self._bounds("min", axis, skipna, numeric_only, kwargs)
 
         def max(self, axis=None, skipna=True, numeric_only=False, **kwargs): return self._bounds("max", axis, skipna, numeric_only, kwargs)
 
     class BatchFrame(original.DataFrame):
-        _metadata = [*original.DataFrame._metadata, "_native_batch_cache"]
+        _metadata = [*original.DataFrame._metadata, "_native_batch_cache", "_native_word_mean_cache"]
 
         @property
         def _constructor(self): return BatchFrame
@@ -115,7 +128,7 @@ def native_timestamp_bounds_batched(alignment, context, records, fast_frames=Fal
         text = "".join(row["char"] for row in data)
         if text not in sentence_spans or len(data) > 32768: raise ValueError("native_timestamp_batch_sentence_metadata_missing")
         values = np.asarray([[row["start"], row["end"]] for row in data], dtype=np.float64).reshape(-1)
-        queries = {}
+        queries, mean_queries = {}, {}
         def register(column, rows): queries.setdefault((column, tuple(rows)), None)
         for start, end in sentence_spans[text]:
             rows = [i for i in range(len(data)) if start <= i <= end]
@@ -127,6 +140,7 @@ def native_timestamp_bounds_batched(alignment, context, records, fast_frames=Fal
                 if not "".join(data[i]["char"] for i in word_rows).strip(): continue
                 selected = [i for i in word_rows if data[i]["char"] != " "]
                 register("start", selected); register("end", selected)
+                if word_means: mean_queries.setdefault(tuple(selected), None)
         if not queries: raise ValueError("native_timestamp_batch_queries_missing")
         indices, offsets, snapshots = [], [0], []
         for column, rows in queries:
@@ -140,6 +154,16 @@ def native_timestamp_bounds_batched(alignment, context, records, fast_frames=Fal
         cache = {key: (bounds[i], snapshots[i]) for i, key in enumerate(queries)}
         frame = BatchFrame(data)
         frame._native_batch_cache = cache, record
+        if word_means and mean_queries:
+            scores = np.asarray([row["score"] for row in data], dtype=np.float64)
+            mean_indices, mean_offsets, mean_snapshots = [], [0], []
+            for rows in mean_queries:
+                mean_indices.extend(rows); mean_offsets.append(len(mean_indices))
+                mean_snapshots.append(scores[list(rows)].tobytes())
+            means, mean_record = context.word_means_batch(scores, np.asarray(mean_indices, dtype=np.uint32), np.asarray(mean_offsets, dtype=np.uint32))
+            mean_record["queries_consumed"] = 0
+            mean_records.append(mean_record)
+            frame._native_word_mean_cache = {key: (means[i], mean_snapshots[i]) for i, key in enumerate(mean_queries)}, mean_record
         return frame
 
     class PandasProxy:

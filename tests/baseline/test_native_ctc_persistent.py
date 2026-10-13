@@ -180,6 +180,71 @@ class PersistentNativeCTCTests(unittest.TestCase):
             self.assertIs(alignment.pd, original_pd)
             self.assertIs(alignment.nltk_load, loader)
 
+    def test_word_mean_batches_match_pandas_bitwise_across_pairwise_and_buffer_boundaries(self):
+        import pandas as pd
+        from unittest.mock import patch
+        generator = np.random.default_rng(974)
+        with NativeCTC(self.library, self.identity) as context:
+            for length in (0, 1, 7, 8, 9, 127, 128, 129, 255, 1025, 8191, 8192, 8193, 16383, 16384, 16385, 24577, 32767, 32768):
+                for replica in range(3):
+                    scores = generator.integers(0, 1001, length).astype(np.float64) / 1000
+                    scores[::19] = np.nan
+                    groups = [list(range(length)), [], list(range(min(length, 31))), list(range(length))[::-1]]
+                    indices = np.asarray([i for group in groups for i in group], dtype=np.uint32)
+                    offsets = np.asarray([0, *np.cumsum([len(group) for group in groups])], dtype=np.uint32)
+                    means, record = context.word_means_batch(scores, indices, offsets)
+                    for actual, group in zip(means, groups):
+                        expected = pd.Series(scores[group]).mean()
+                        if np.isnan(expected): self.assertTrue(np.isnan(actual))
+                        else:
+                            self.assertEqual(actual.tobytes(), np.float64(expected).tobytes(), (length, replica))
+                            self.assertEqual(round(actual, 3).tobytes(), round(np.float64(expected), 3).tobytes())
+                    self.assertGreater(record["computation_gpu_seconds"], 0)
+                    self.assertEqual(record["command_buffers_per_run"], 1)
+            indices, offsets = np.array([0], dtype=np.uint32), np.array([0, 1], dtype=np.uint32)
+            for value in (-0., -.1, .0001, 1.001, np.inf, -np.inf):
+                with self.assertRaisesRegex(ValueError, "values_invalid"): context.word_means_batch(np.array([value]), indices, offsets)
+            with self.assertRaisesRegex(ValueError, "indices_invalid"): context.word_means_batch(np.array([.1]), np.array([1], dtype=np.uint32), offsets)
+            with self.assertRaisesRegex(ValueError, "indices_invalid"): context.word_means_batch(np.array([.1]), indices, np.array([0, 2], dtype=np.uint32))
+            with self.assertRaisesRegex(ValueError, "indices_invalid"): context.word_means_batch(np.array([.1]), np.zeros(32769, dtype=np.uint32), np.array([0, 32769], dtype=np.uint32))
+            with patch.object(np, "__version__", "unsupported"):
+                with self.assertRaisesRegex(ValueError, "runtime_not_supported"): context.word_means_batch(np.array([.1]), indices, offsets)
+            previous = np.getbufsize()
+            try:
+                np.setbufsize(4096)
+                with self.assertRaisesRegex(ValueError, "runtime_not_supported"): context.word_means_batch(np.array([.1]), indices, offsets)
+            finally: np.setbufsize(previous)
+            means, _ = context.word_means_batch(np.array([.1]), indices, offsets)
+            self.assertEqual(means[0], np.float64(.1))
+
+    def test_word_mean_adapter_missing_scores_rounding_and_snapshot_validation(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        rows = [{"char": char, "start": float(i), "end": float(i + 1), "score": score, "word-idx": word} for i, (char, word, score) in enumerate(zip("a ? b", [0, 1, 1, 2, 2], [.101, .202, None, .303, .404]))]
+        tokenizer = SimpleNamespace(span_tokenize=lambda text: iter([(0, 3), (3, 5)]))
+        original_pd = alignment.pd
+        with NativeCTC(self.library, self.identity) as context, patch.object(alignment, "nltk_load", return_value=tokenizer) as loader:
+            for fast in (False, True):
+                means = []
+                with native_timestamp_bounds_batched(alignment, context, [], fast_frames=fast, word_means=True, mean_records=means):
+                    list(alignment.nltk_load("test").span_tokenize("a ? b"))
+                    frame = alignment.pd.DataFrame(rows)
+                    self.assertIsInstance(frame.loc[[0]]["score"].mean(), np.float64)
+                    self.assertEqual(round(frame.loc[[4]]["score"].mean(), 3), .404)
+                    self.assertTrue(np.isnan(frame.loc[[2]]["score"].mean()))
+                    self.assertEqual(len(means), 1)
+                    self.assertEqual(means[0]["queries_consumed"], 3)
+                    self.assertEqual(frame["word-idx"].mean(), 1.2)
+                    with self.assertRaisesRegex(ValueError, "subset_not_registered"): frame["score"].mean()
+                    with self.assertRaisesRegex(ValueError, "options_not_supported"): frame.loc[[0]]["score"].mean(skipna=False)
+                    with self.assertRaisesRegex(ValueError, "dtype_not_supported"): frame.loc[[0]]["score"].astype(np.float32).mean()
+                    derived = frame.loc[[0]]
+                    derived.loc[0, "score"] = .909
+                    self.assertEqual(frame.loc[[0]]["score"].mean(), .101)
+                    with self.assertRaisesRegex(ValueError, "snapshot_changed"): derived["score"].mean()
+                self.assertIs(alignment.pd, original_pd)
+                self.assertIs(alignment.nltk_load, loader)
+
     def test_buffer_growth_reuse_and_sentinel_paths_match_original(self):
         generator = np.random.default_rng(43)
         large = torch.log_softmax(torch.from_numpy(generator.normal(size=(341, 38)).astype(np.float32)), dim=-1)

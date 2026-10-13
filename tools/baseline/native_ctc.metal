@@ -310,3 +310,74 @@ kernel void ctc_timestamp_bounds_batch(device const ulong* values [[buffer(0)]],
         output[query * 2 + 1] = counts[0] == 0 ? 0x7ff8000000000000ul : ((high_key >> 63) ? high_key ^ 0x8000000000000000ul : ~high_key);
     }
 }
+
+ulong word_score(device const ulong* values, device const uint* indices, uint index) {
+    ulong bits = values[indices[index]];
+    return (bits & 0x7ffffffffffffffful) > 0x7ff0000000000000ul ? 0ul : bits;
+}
+
+// Reproduce the pinned NumPy pairwise leaf order, retaining NaN positions as positive zero.
+ulong word_sum_leaf(device const ulong* values, device const uint* indices, uint begin, uint count) {
+    ulong result = 0;
+    if (count < 8) {
+        for (uint i = 0; i < count; ++i) result = add_positive_double(result, word_score(values, indices, begin + i));
+        return result;
+    }
+    ulong sums[8];
+    for (uint lane = 0; lane < 8; ++lane) sums[lane] = word_score(values, indices, begin + lane);
+    uint i = 8;
+    for (; i < count - count % 8; i += 8) {
+        for (uint lane = 0; lane < 8; ++lane) sums[lane] = add_positive_double(sums[lane], word_score(values, indices, begin + i + lane));
+    }
+    result = add_positive_double(add_positive_double(add_positive_double(sums[0], sums[1]), add_positive_double(sums[2], sums[3])), add_positive_double(add_positive_double(sums[4], sums[5]), add_positive_double(sums[6], sums[7])));
+    for (; i < count; ++i) result = add_positive_double(result, word_score(values, indices, begin + i));
+    return result;
+}
+
+// Bounded explicit stack replaces recursion; splits preserve multiples of the eight-accumulator unroll factor.
+ulong word_pairwise_sum(device const ulong* values, device const uint* indices, uint begin, uint count) {
+    uint starts[16], lengths[16], states[16], depth = 0;
+    ulong left[16], result = 0;
+    starts[0] = begin; lengths[0] = count; states[0] = 0;
+    while (true) {
+        uint length = lengths[depth], start = starts[depth];
+        if (length <= 128) result = word_sum_leaf(values, indices, start, length);
+        else {
+            uint split = (length / 2) & ~7u;
+            if (states[depth] == 0) {
+                states[depth] = 1; ++depth;
+                starts[depth] = start; lengths[depth] = split; states[depth] = 0;
+                continue;
+            }
+            if (states[depth] == 1) {
+                left[depth] = result; states[depth] = 2; ++depth;
+                starts[depth] = start + split; lengths[depth] = length - split; states[depth] = 0;
+                continue;
+            }
+            result = add_positive_double(left[depth], result);
+        }
+        if (depth == 0) return result;
+        --depth;
+    }
+}
+
+kernel void ctc_word_means_batch(device const ulong* values [[buffer(0)]], constant Dimensions& dimensions [[buffer(1)]], device const uint* indices [[buffer(2)]], device const uint* offsets [[buffer(3)]], device ulong* output [[buffer(4)]], device atomic_uint* invalid [[buffer(5)]], uint query [[thread_position_in_grid]]) {
+    if (query >= dimensions.frames) return;
+    uint begin = offsets[query], end = offsets[query + 1], count = 0;
+    if (begin > end || end > dimensions.count || end - begin > 32768 || (query == 0 && begin != 0) || (query + 1 == dimensions.frames && end != dimensions.count)) {
+        atomic_fetch_or_explicit(invalid, 1u, memory_order_relaxed); output[query] = 0x7ff8000000000000ul; return;
+    }
+    uint bad = 0;
+    for (uint i = begin; i < end; ++i) {
+        uint index = indices[i];
+        if (index >= dimensions.vocabulary) { bad |= 1u; continue; }
+        ulong bits = values[index], magnitude = bits & 0x7ffffffffffffffful;
+        if (magnitude > 0x7ff0000000000000ul) continue;
+        if (bits != 0 && (bits < 0x3f50624dd2f1a9fcul || bits > 0x3ff0000000000000ul)) { bad |= 2u; continue; }
+        ++count;
+    }
+    if (bad) { atomic_fetch_or_explicit(invalid, bad, memory_order_relaxed); output[query] = 0x7ff8000000000000ul; return; }
+    ulong sum = 0;
+    for (uint start = begin; start < end; start += 8192) sum = add_positive_double(sum, word_pairwise_sum(values, indices, start, min(8192u, end - start)));
+    output[query] = count ? divide_positive_double(sum, count) : 0x7ff8000000000000ul;
+}

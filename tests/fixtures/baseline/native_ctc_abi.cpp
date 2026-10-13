@@ -52,6 +52,14 @@ int main(int argc, char** argv) {
     assert(wxctc_timestamp_bounds_batch(context, timestamps, 3, subset_indices, 3, subset_offsets, 3, batch_bounds, 4, &maximum_result, error, sizeof(error)) != 0 && batch_bounds[0] == 123);
     assert(wxctc_timestamp_bounds_batch(context, timestamps, 65537, subset_indices, 3, subset_offsets, 3, batch_bounds, 4, &maximum_result, error, sizeof(error)) != 0);
     assert(wxctc_timestamp_bounds_batch(context, timestamps, 3, nullptr, 3, subset_offsets, 3, batch_bounds, 4, &maximum_result, error, sizeof(error)) != 0);
+    uint64_t scores[]{0x3fb999999999999aull, 0x3fd3333333333333ull, 0x7ff8000000000000ull}, means[]{123, 123};
+    uint32_t score_indices[]{0, 1, 2};
+    assert(wxctc_word_means_batch(context, scores, 3, score_indices, 3, subset_offsets, 3, means, 1, &maximum_result, error, sizeof(error)) != 0 && means[0] == 123);
+    assert(wxctc_word_means_batch(context, scores, 3, score_indices, 3, subset_offsets, 3, means, 2, &maximum_result, error, sizeof(error)) == 0);
+    assert(means[0] == 0x3fc999999999999aull && means[1] == 0x7ff8000000000000ull);
+    scores[0] = 0x8000000000000000ull; means[0] = 123;
+    assert(wxctc_word_means_batch(context, scores, 3, score_indices, 3, subset_offsets, 3, means, 2, &maximum_result, error, sizeof(error)) != 0 && means[0] == 123);
+    assert(wxctc_word_means_batch(context, nullptr, 3, score_indices, 3, subset_offsets, 3, means, 2, &maximum_result, error, sizeof(error)) != 0);
     int32_t wildcard[]{2};
     assert(wxctc_compute_wildcard(context, emission, 6, wildcard, 1, 3, 2, 0, path, 3, &result, error, sizeof(error)) == 0);
     assert(result.path_length > 0 && path[0].frame == 0 && path[0].token == 0);

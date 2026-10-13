@@ -139,6 +139,24 @@ class NativeCTC:
             if result.abi_version != 1: raise ValueError("native_result_invalid")
             return output.view(np.float64), {"scope": "experimental_timestamp_bounds_batch", "elements": values.size, "queries": queries, "index_elements": indices.size, "kernel": "ctc_timestamp_bounds_batch", "dispatch_completed": True, "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "computation_wall_ns": result.computation_wall_ns, "computation_gpu_seconds": result.computation_gpu_seconds, "logical_cpu_to_native_bytes": values.nbytes + indices.nbytes + offsets.nbytes, "logical_output_readback_bytes": queries * 16 + 4, "physical_copy_bytes": None, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
 
+    def word_means_batch(self, values, indices, offsets):
+        import numpy as np
+        if not isinstance(values, np.ndarray) or values.dtype != np.float64 or values.ndim != 1 or values.size > 32768 or not isinstance(indices, np.ndarray) or indices.dtype != np.uint32 or indices.ndim != 1 or indices.size > 4 * 1024 * 1024 or not isinstance(offsets, np.ndarray) or offsets.dtype != np.uint32 or offsets.ndim != 1 or not 2 <= offsets.size <= 32769: raise ValueError("native_word_means_format_invalid")
+        if np.__version__ != "2.2.6" or np.getbufsize() != 8192: raise ValueError("native_word_means_runtime_not_supported")
+        with self._lock:
+            if not self._context.value: raise ValueError("native_context_closed")
+            started = time.perf_counter_ns()
+            values, indices, offsets = np.ascontiguousarray(values), np.ascontiguousarray(indices), np.ascontiguousarray(offsets)
+            queries = offsets.size - 1
+            output, result, error = np.empty(queries, dtype=np.uint64), MaxResult(), ct.create_string_buffer(128)
+            function = self._library.wxctc_word_means_batch
+            function.argtypes = [ct.c_void_p, ct.POINTER(ct.c_uint64), ct.c_uint64, ct.POINTER(ct.c_uint32), ct.c_uint64, ct.POINTER(ct.c_uint32), ct.c_uint64, ct.POINTER(ct.c_uint64), ct.c_uint32, ct.POINTER(MaxResult), ct.POINTER(ct.c_char), ct.c_uint32]
+            function.restype = ct.c_int
+            status = function(self._context, values.ctypes.data_as(ct.POINTER(ct.c_uint64)), values.size, indices.ctypes.data_as(ct.POINTER(ct.c_uint32)), indices.size, offsets.ctypes.data_as(ct.POINTER(ct.c_uint32)), offsets.size, output.ctypes.data_as(ct.POINTER(ct.c_uint64)), output.size, ct.byref(result), error, len(error))
+            if status: raise ValueError(error.value.decode("ascii"))
+            if result.abi_version != 1: raise ValueError("native_result_invalid")
+            return output.view(np.float64), {"scope": "experimental_word_means_batch", "elements": values.size, "queries": queries, "index_elements": indices.size, "kernel": "ctc_word_means_batch", "dispatch_completed": True, "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "computation_wall_ns": result.computation_wall_ns, "computation_gpu_seconds": result.computation_gpu_seconds, "logical_cpu_to_native_bytes": values.nbytes + indices.nbytes + offsets.nbytes, "logical_output_readback_bytes": queries * 8 + 4, "physical_copy_bytes": None, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
+
     def timestamp_bounds(self, values):
         import numpy as np
         if not isinstance(values, np.ndarray) or values.dtype != np.float64 or values.ndim != 1 or values.size > 32768: raise ValueError("native_timestamp_format_invalid")
