@@ -141,6 +141,25 @@ Add `--interpolation-gap-control` to insert empty out-of-range sentence spans be
 
 ## Lifecycle and verification
 
+### Direct MPS storage diagnostic
+
+`mps_storage_probe.py` provides separate `build`, `probe` and `live` CLI commands. It is a Torch 2.8.0 development extension, outside the production worker and CTC bridge. Build a new local dylib with:
+
+```sh
+macOS/output/installer/WhisperX.app/Contents/Runtime/bin/python3 -I -B tools/baseline/mps_storage_probe.py build --out macOS/output/baseline/tools/libmps_storage_probe.dylib
+macOS/output/installer/WhisperX.app/Contents/Runtime/bin/python3 -I -B tools/baseline/mps_storage_probe.py live --help
+```
+
+Use the SHA256 emitted by `build` as `--library-sha256`. Existing files are refused; compilation uses staging and exclusive publication, and the extension is ad-hoc signed. Linkage uses absolute paths to this local Torch runtime, so this diagnostic is not a redistributable native engine or installer component. The process accepts one library identity; restart Python to change it.
+
+`probe` takes a hash-verified bounded CTC NPZ fixture, uploads its saved emission to MPS and compares GPU row maxima and first indices against a separate CPU oracle. This checks captured neural values, not live inference. `live` takes `--audio`, `--audio-sha256`, `--torch-specs`, `--language it|en`, `--library`, `--library-sha256` and a new `--out` JSON file. Optional `--start`, `--duration` and `--replicas` default to 0 seconds, 6 seconds and six runs. Duration is bounded to .5..30 seconds. Checkpoint hash/license verification precedes model loading; the existing Python network guard and offline cache environment apply during decode/inference and restore on exit. This guard is not OS network isolation. Audio hash validation identifies the existing corpus asset; its license and corpus provenance remain the caller's corpus prerequisites.
+
+The live command produces torchaudio logits and log-softmax on MPS and passes the detached emission directly to the native operation before calling `.cpu()` for the separate reference. Native storage access follows the pinned [PyTorch MPS storage implementation](https://github.com/pytorch/pytorch/blob/v2.8.0/aten/src/ATen/native/mps/OperationUtils.h); it binds the original MTLBuffer with `storage_offset * element_size`. Only contiguous two-dimensional FP32 tensors without gradients or lazy negative/conjugate bits are supported, with 1..32768 rows, 1..4096 columns and at most 16777216 elements. NaN/positive log scores fail through a GPU validation flag; negative infinity is valid. Equal maxima keep the first index, including signed zero.
+
+An owning Tensor and a strong MTLBuffer reference retain the allocation until completion. Calls serialize. The extension commits and waits for the current MPS stream under its serial dispatch queue, then submits and waits for one command buffer on a private Metal queue using the same device. Callers must not mutate aliased input storage concurrently. There is no fence-only or asynchronous handoff, and producer wait time is included in reporting. The tracked kernel reads the original emission buffer, with no candidate emission host readback or reupload. It reads back only `8*rows+4` bytes of completed maxima, uint32 indices and validation; physical traffic is unmeasured. CPU tensor allocation and bit-copying of final output remain. Pipeline setup is reported on first use.
+
+This proves bounded buffer access and a real numerical dispatch, not a CTC integration, complete GPU placement, zero synchronization, end-to-end speedup or quality certification. Neural weights/loading, CTC and production defaults remain independent. Saved-fixture uploads and CPU reference readbacks are explicitly outside the candidate transport counters.
+
 The development ABI in `native_ctc_bridge.h` returns zero on success and nonzero with a fixed error code on failure. Input pointers and declared lengths must remain valid until a synchronous call returns. Output capacity must cover `frames`. Calls on one context serialize; finish all calls before destroying it and never race destruction with a new call. The Python wrapper's context manager and lock enforce compute/close ordering. No CPU fallback is invoked when native validation fails.
 
 ```sh
