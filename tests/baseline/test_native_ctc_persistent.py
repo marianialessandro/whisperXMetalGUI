@@ -411,6 +411,88 @@ class PersistentNativeCTCTests(unittest.TestCase):
                 with persistent_metal_ctc(alignment, [], context, character_rounding=True, rounding_records=[]): pass
             self.assertEqual(originals, (alignment.get_trellis, alignment.backtrack, alignment.merge_repeats))
 
+    def test_resident_scaling_and_rounding_match_separate_python_binary64_operations(self):
+        from unittest.mock import patch
+        generator = np.random.default_rng(2281)
+        emission = np.zeros((32768, 2), dtype=np.float32)
+        emission[:, 1] = -10.
+        anchors = np.linspace(0, 32767, 127, dtype=np.int32)
+        emission[anchors, 0], emission[anchors, 1] = -10., 0.
+        tokens = np.ones(127, dtype=np.int32)
+        ratios = [2. ** -23, .0005, .0015, .01, .0625, .123456789, 1., 1024., np.nextafter(2048., 0.), *[float(value) for value in np.exp2(generator.uniform(-23, 11, size=41))]]
+        offsets = [0., 2. ** -23, .0005, .1235, 10.0005, 1024., float(2 ** 40), np.nextafter(float(2 ** 41), 0.), *[float(value) for value in np.exp2(generator.uniform(-23, 41, size=42))]]
+        source = (self.root / "tools/baseline/native_ctc.metal").read_bytes()
+        start = source.index(b"kernel void ctc_scale_round_segments")
+        raw_source = source[:start] + source[start:].replace(b"python_round3(", b"(")
+        original_read = Path.read_bytes
+        for rounded in (False, True):
+            # The test-only shader variant exposes the scaling result before decimal rounding so quantization cannot hide arithmetic errors.
+            with patch.object(Path, "read_bytes", lambda path: (source if rounded else raw_source) if path.name == "native_ctc.metal" else original_read(path)), NativeCTC(self.library, self.identity) as context:
+                raw, _ = context.compute_segments(emission, tokens)
+                self.assertEqual(raw[-1][1], 32768)
+                handle, record = context.prepare_segments(emission, tokens)
+                self.assertEqual(len(handle), len(raw))
+                self.assertEqual(record["logical_character_segment_readback_bytes"], 0)
+                self.assertEqual(record["logical_resident_generation_metadata_bytes"], 8)
+                for ratio, offset in zip(ratios, offsets):
+                    actual, span = context.scale_round_segments(handle, float(ratio), float(offset))
+                    values = [(start * ratio + offset, end * ratio + offset, score) for start, end, score in raw]
+                    expected = np.asarray([[round(float(value), 3) if rounded else float(value) for value in row] for row in values])
+                    np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+                    self.assertGreater(span["computation_gpu_seconds"], 0)
+                    self.assertEqual(span["logical_cpu_to_native_bytes"], 16)
+                    self.assertEqual(span["logical_character_reupload_bytes"], 0)
+                saved = actual.copy()
+                context.round3(np.array([.0005]))
+                context.row_max(emission[:2])
+                context.scale_round_segments(handle, .01, 0)
+                np.testing.assert_array_equal(actual.view(np.uint64), saved.view(np.uint64))
+
+    def test_resident_handles_reject_stale_wrong_owner_domain_and_close(self):
+        from tools.baseline.native_ctc import ResidentCharacterSegments
+        from unittest.mock import patch
+        emission, tokens = np.array([[-3., -.1], [-.2, -2.], [-.1, -3.]], dtype=np.float32), np.array([1], dtype=np.int32)
+        with NativeCTC(self.library, self.identity) as context, NativeCTC(self.library, self.identity) as other:
+            handle, _ = context.prepare_segments(emission, tokens)
+            for ratio, offset in [(0., 0.), (-1., 0.), (2. ** -24, 0.), (2048., 0.), (.01, -0.), (.01, -1.), (.01, 2. ** -24), (.01, 2. ** 41), (float("nan"), 0.), (.01, float("inf"))]:
+                with self.assertRaisesRegex(ValueError, "scale_domain_invalid"): context.scale_round_segments(handle, ratio, offset)
+            with self.assertRaisesRegex(ValueError, "handle_invalid"): other.scale_round_segments(handle, .01, 0.)
+            with self.assertRaisesRegex(ValueError, "generation_invalid"): context.scale_round_segments(ResidentCharacterSegments(context, handle.generation, 2), .01, 0.)
+            with self.assertRaisesRegex(ValueError, "scale_type_invalid"): context.scale_round_segments(handle, .01, 2 ** 54)
+            with patch.object(sys, "version_info", (3, 12, 11)):
+                with self.assertRaisesRegex(ValueError, "runtime_not_supported"): context.scale_round_segments(handle, .01, 0.)
+            new, _ = context.prepare_segments(emission, tokens)
+            self.assertNotEqual(new.generation, handle.generation)
+            with self.assertRaisesRegex(ValueError, "generation_invalid"): context.scale_round_segments(handle, .01, 0.)
+            # A GPU validation failure still invalidates the retained buffer generation before another result can be consumed.
+            with self.assertRaises(ValueError): context.compute(np.ones((3, 2), dtype=np.float32), tokens)
+            with self.assertRaisesRegex(ValueError, "generation_invalid"): context.scale_round_segments(new, .01, 0.)
+            failed, record = context.prepare_segments(np.full((5, 3), -np.inf, dtype=np.float32), np.array([1, 2], dtype=np.int32))
+            self.assertIsNone(failed)
+            self.assertEqual(record["logical_character_segment_readback_bytes"], 0)
+            final, _ = context.prepare_segments(emission, tokens)
+        with self.assertRaisesRegex(ValueError, "native_context_closed"): context.scale_round_segments(final, .01, 0.)
+
+    def test_resident_deferred_adapter_materializes_once_and_restores_scoped_hooks(self):
+        emission, tokens = np.array([[-3., -.1], [-.2, -2.], [-.1, -3.]], dtype=np.float32), np.array([1], dtype=np.int32)
+        with NativeCTC(self.library, self.identity) as context:
+            raw, _ = context.compute_segments(emission, tokens)
+            handle, _ = context.prepare_segments(emission, tokens)
+            spans = []
+            characters = rounded_character_segments(alignment, handle, "β", context, spans)
+            with self.assertRaisesRegex(ValueError, "scale_type_invalid"): round(characters[0].start * .01 + 2 ** 10000, 3)
+            result = (round(characters[0].start * .01 + 10.0005, 3), round(characters[0].end * .01 + 10.0005, 3), round(characters[0].score, 3))
+            expected = (round(raw[0][0] * .01 + 10.0005, 3), round(raw[0][1] * .01 + 10.0005, 3), round(raw[0][2], 3))
+            self.assertEqual([struct.pack("d", value) for value in result], [struct.pack("d", value) for value in expected])
+            self.assertEqual(len(spans), 1)
+            self.assertEqual(spans[0]["scaling"], "metal_binary64_separate_multiply_add")
+            originals = alignment.get_trellis, alignment.backtrack, alignment.merge_repeats
+            with self.assertRaisesRegex(ValueError, "requires_character_rounding"):
+                with persistent_metal_ctc(alignment, [], context, True, resident_character_rounding=True): pass
+            with self.assertRaisesRegex(RuntimeError, "forced"):
+                with persistent_metal_ctc(alignment, [], context, True, True, [], True): raise RuntimeError("forced")
+            self.assertEqual(originals, (alignment.get_trellis, alignment.backtrack, alignment.merge_repeats))
+
     def test_buffer_growth_reuse_and_sentinel_paths_match_original(self):
         generator = np.random.default_rng(43)
         large = torch.log_softmax(torch.from_numpy(generator.normal(size=(341, 38)).astype(np.float32)), dim=-1)

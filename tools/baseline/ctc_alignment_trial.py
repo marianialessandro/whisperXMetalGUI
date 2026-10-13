@@ -90,20 +90,22 @@ def native_metal_ctc(alignment, spans, binary, binary_sha256):
 
 
 @contextlib.contextmanager
-def persistent_metal_ctc(alignment, spans, context, character_segments=False, character_rounding=False, rounding_records=None):
+def persistent_metal_ctc(alignment, spans, context, character_segments=False, character_rounding=False, rounding_records=None, resident_character_rounding=False):
     import numpy as np
     from tools.baseline.native_ctc_fused import DeferredWildcard
     if character_rounding and (not character_segments or not isinstance(rounding_records, list)): raise ValueError("native_character_rounding_requires_segments_and_records")
+    if resident_character_rounding and not character_rounding: raise ValueError("native_resident_rounding_requires_character_rounding")
+    segment_compute = context.prepare_segments if resident_character_rounding else context.compute_segments
     original_trellis, original_backtrack, original_merge = alignment.get_trellis, alignment.backtrack, alignment.merge_repeats
     def trellis(emission, tokens, blank_id=0):
         if isinstance(emission, DeferredWildcard):
             if emission.kind != "expanded" or blank_id != emission.blank: raise ValueError("fused_wildcard_metadata_invalid")
-            path, record = context.compute_segments(emission.base_emission.detach().numpy(), np.asarray(tokens, dtype=np.int32), blank_id, wildcard=True) if character_segments else context.compute_wildcard(emission.base_emission.detach().numpy(), np.asarray(tokens, dtype=np.int32), blank_id)
+            path, record = segment_compute(emission.base_emission.detach().numpy(), np.asarray(tokens, dtype=np.int32), blank_id, wildcard=True) if character_segments else context.compute_wildcard(emission.base_emission.detach().numpy(), np.asarray(tokens, dtype=np.int32), blank_id)
             spans.append(record)
             return MetalTrellis(path, emission.shape[0], len(tokens))
         if emission.device.type != "cpu" or str(emission.dtype) != "torch.float32":
             raise ValueError("trial_expected_original_cpu_float32_boundary")
-        path, record = context.compute_segments(emission.detach().numpy(), np.asarray(tokens, dtype=np.int32), blank_id) if character_segments else context.compute(emission.detach().numpy(), np.asarray(tokens, dtype=np.int32), blank_id)
+        path, record = segment_compute(emission.detach().numpy(), np.asarray(tokens, dtype=np.int32), blank_id) if character_segments else context.compute(emission.detach().numpy(), np.asarray(tokens, dtype=np.int32), blank_id)
         spans.append(record)
         return MetalTrellis(path, emission.shape[0], len(tokens))
     def backtrack(trellis, emission, tokens, blank_id=0):
@@ -172,6 +174,7 @@ def main(argv=None):
     parser.add_argument("--native-fused-reductions", action="store_true", help="Optional shared row queries and one Metal kernel for timestamp minima/maxima and word means; requires --native-word-means. Previous separate-batch mode remains available.")
     parser.add_argument("--native-compact-reduction-plan", action="store_true", help="Optional clipped sentence ranges, shared word row tuples and one snapshot gather per fused subset; requires --native-fused-reductions. Preserves snapshot mutation validation.")
     parser.add_argument("--native-character-rounding", action="store_true", help="Optional exact CPython 3.12.12 round(value,3) Metal batch for character timestamps and scores; requires --native-character-segments. Original CPU scaling is preserved; adds one round batch per segment.")
+    parser.add_argument("--native-resident-character-rounding", action="store_true", help="Optional retained Metal character bounds/means, exact bounded binary64 scaling and rounding without intermediate character readback/reupload; requires --native-character-rounding. Original ratio calculation remains CPU.")
     args = parser.parse_args(argv)
     if not 1 <= args.replicas <= 10: parser.error("replicas must be between 1 and 10")
     if args.ctc_backend == "native" and (args.native_binary is None or args.native_binary_sha256 is None): parser.error("native backend requires binary and its expected SHA256")
@@ -181,6 +184,7 @@ def main(argv=None):
     if args.native_wildcard_max and args.ctc_backend != "native-persistent": parser.error("--native-wildcard-max requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.ctc_backend != "native-persistent": parser.error("--native-fused-wildcard requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.native_wildcard_max: parser.error("wildcard modes are mutually exclusive")
+    if args.native_resident_character_rounding and not args.native_character_rounding: parser.error("native resident character rounding requires native character rounding")
     if args.native_character_rounding and not args.native_character_segments: parser.error("--native-character-rounding requires --native-character-segments")
     if args.native_compact_reduction_plan and not args.native_fused_reductions: parser.error("--native-compact-reduction-plan requires --native-fused-reductions")
     if args.native_fused_reductions and not args.native_word_means: parser.error("--native-fused-reductions requires --native-word-means")
@@ -224,7 +228,7 @@ def main(argv=None):
                     from tools.baseline.native_ctc_fused import fused_wildcard_preparation
                     scopes.enter_context(fused_wildcard_preparation(max(metadata["dictionary"].values()) + 1))
                 if args.native_wildcard_max: scopes.enter_context(native_wildcard_max(persistent, maximum_records))
-                if args.ctc_backend == "native-persistent": scopes.enter_context(persistent_metal_ctc(alignment, records, persistent, args.native_character_segments, args.native_character_rounding, round_records))
+                if args.ctc_backend == "native-persistent": scopes.enter_context(persistent_metal_ctc(alignment, records, persistent, args.native_character_segments, args.native_character_rounding, round_records, args.native_resident_character_rounding))
                 else: scopes.enter_context(native_metal_ctc(alignment, records, args.native_binary, args.native_binary_sha256) if args.ctc_backend == "native" else metal_ctc(alignment, records))
                 yield
         native_setup_ns = None
@@ -268,6 +272,7 @@ def main(argv=None):
         report["native_fused_wildcard_dispatch_count"] = sum(record.get("wildcard_fused") is True for record in spans)
         report["native_character_rounding_enabled"], report["character_rounding_spans"] = args.native_character_rounding, rounding_spans
         report["native_character_rounding_dispatch_count"] = len(rounding_spans)
+        report["native_resident_character_rounding_enabled"] = args.native_resident_character_rounding
         report["native_character_segments_enabled"] = args.native_character_segments
         report["return_char_alignments"] = args.return_char_alignments
         report["native_character_segments_dispatch_count"] = sum(record.get("character_segments_gpu") is True for record in spans)
@@ -298,6 +303,10 @@ def main(argv=None):
         if args.native_character_rounding:
             report["residuals"][2] = "cpu_character_scaling_word_mean_rounding_interpolation_selection_and_snapshot_validation" if args.native_word_means else "cpu_word_reductions_and_character_scaling"
             report["residuals"].append("cpu_character_round_batch_upload_and_readback")
+        if args.native_resident_character_rounding:
+            report["residuals"] = [item for item in report["residuals"] if item != "cpu_character_round_batch_upload_and_readback"]
+            report["residuals"][2] = "cpu_ratio_calculation_word_mean_rounding_interpolation_selection_and_snapshot_validation" if args.native_word_means else "cpu_word_reductions_and_ratio_calculation"
+            report["residuals"].append("cpu_final_rounded_character_readback_and_dataframe_upload")
         with (args.output_dir / "comparison.json").open("x") as output: json.dump(report, output, indent=2)
         print(json.dumps({key: value for key, value in report.items() if key not in ("ctc_spans", "wildcard_spans", "timestamp_bounds_spans", "word_mean_spans", "character_rounding_spans")}))
         return 0 if all(matches) else 2

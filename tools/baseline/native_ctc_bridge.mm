@@ -151,4 +151,34 @@ int wxctc_round3(wxctc_context* context, const uint64_t* values, uint64_t count,
     }
 }
 
+int wxctc_prepare_segments(wxctc_context* context, const float* emission, uint64_t emission_elements, const int32_t* tokens, uint64_t token_elements, uint32_t frames, uint32_t vocabulary, int32_t blank, uint32_t wildcard, uint64_t* generation, wxctc_result* result, char* error_code, uint32_t error_capacity) {
+    @autoreleasepool {
+        set_error(error_code, error_capacity, "");
+        if (generation != nullptr) *generation = 0;
+        if (result != nullptr) { *result = {}; result->path_length = -1; result->abi_version = 1; }
+        try {
+            require(context != nullptr && result != nullptr && generation != nullptr && token_elements <= UINT32_MAX && wildcard <= 1, "output_or_context_invalid");
+            auto completed = context->core.compute(emission, emission_elements, tokens, token_elements, {frames, vocabulary, static_cast<uint32_t>(token_elements), blank}, wildcard, true, true);
+            *generation = completed.generation;
+            *result = {completed.path_length, 1, completed.timings[0].wall_ns, completed.timings[1].wall_ns, completed.timings[0].gpu_seconds, completed.timings[1].gpu_seconds, completed.dp_bytes, completed.allocated_bytes};
+            return 0;
+        } catch (const InventoryError& error) { set_error(error_code, error_capacity, error.what()); return 1; }
+        catch (...) { set_error(error_code, error_capacity, "native_resident_segment_execution_failed"); return 1; }
+    }
+}
+
+int wxctc_scale_round_segments(wxctc_context* context, uint64_t generation, uint32_t count, uint64_t ratio_bits, uint64_t offset_bits, uint64_t* output, uint32_t output_capacity, wxctc_max_result* result, char* error_code, uint32_t error_capacity) {
+    @autoreleasepool {
+        set_error(error_code, error_capacity, "");
+        if (result != nullptr) { *result = {}; result->abi_version = 1; }
+        try {
+            require(context != nullptr && result != nullptr, "output_or_context_invalid");
+            auto completed = context->core.scale_round_segments(generation, count, ratio_bits, offset_bits, output, output_capacity);
+            *result = {1, 0, 0, completed.timing.wall_ns, 0, completed.timing.gpu_seconds, completed.allocated_bytes};
+            return 0;
+        } catch (const InventoryError& error) { set_error(error_code, error_capacity, error.what()); return 1; }
+        catch (...) { set_error(error_code, error_capacity, "native_resident_round_execution_failed"); return 1; }
+    }
+}
+
 void wxctc_destroy(wxctc_context* context) { @autoreleasepool { delete context; } }

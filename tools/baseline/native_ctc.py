@@ -26,6 +26,13 @@ class MaxResult(ct.Structure):
     _fields_ = [("abi_version", ct.c_uint32), ("reserved", ct.c_uint32), ("validation_wall_ns", ct.c_uint64), ("computation_wall_ns", ct.c_uint64), ("validation_gpu_seconds", ct.c_double), ("computation_gpu_seconds", ct.c_double), ("allocated_shared_buffer_bytes", ct.c_uint64)]
 
 
+class ResidentCharacterSegments:
+    """Metadata-only handle; raw numerical segments remain in its owning native context."""
+    def __init__(self, owner, generation, count): self.owner, self.generation, self.count = owner, generation, count
+
+    def __len__(self): return self.count
+
+
 class NativeCTC:
     def __init__(self, library, expected_sha256):
         started = time.perf_counter_ns()
@@ -63,7 +70,11 @@ class NativeCTC:
         if sys.version_info[:2] != (3, 12): raise ValueError("native_character_sum_runtime_not_supported")
         return self._compute(emission, tokens, blank, wildcard, True)
 
-    def _compute(self, emission, tokens, blank, wildcard, segments=False):
+    def prepare_segments(self, emission, tokens, blank=0, wildcard=False):
+        if sys.version_info[:3] != (3, 12, 12): raise ValueError("native_resident_round_runtime_not_supported")
+        return self._compute(emission, tokens, blank, wildcard, True, True)
+
+    def _compute(self, emission, tokens, blank, wildcard, segments=False, resident=False):
         import numpy as np
         if not isinstance(emission, np.ndarray) or emission.dtype != np.float32 or emission.ndim != 2 or not isinstance(tokens, np.ndarray) or tokens.dtype != np.int32 or tokens.ndim != 1:
             raise ValueError("native_input_format_invalid")
@@ -77,8 +88,14 @@ class NativeCTC:
                 raise ValueError("native_context_closed")
             started = time.perf_counter_ns()
             emission, tokens = np.ascontiguousarray(emission), np.ascontiguousarray(tokens)
-            path, result, error = (Segment * count)() if segments else (Point * frames)(), Result(), ct.create_string_buffer(128)
-            if segments:
+            path, result, error = None if resident else ((Segment * count)() if segments else (Point * frames)()), Result(), ct.create_string_buffer(128)
+            generation = ct.c_uint64()
+            if resident:
+                function = self._library.wxctc_prepare_segments
+                function.argtypes = [ct.c_void_p, ct.POINTER(ct.c_float), ct.c_uint64, ct.POINTER(ct.c_int32), ct.c_uint64, ct.c_uint32, ct.c_uint32, ct.c_int32, ct.c_uint32, ct.POINTER(ct.c_uint64), ct.POINTER(Result), ct.POINTER(ct.c_char), ct.c_uint32]
+                function.restype = ct.c_int
+                status = function(self._context, emission.ctypes.data_as(ct.POINTER(ct.c_float)), emission.size, tokens.ctypes.data_as(ct.POINTER(ct.c_int32)), tokens.size, frames, vocabulary, blank, int(wildcard), ct.byref(generation), ct.byref(result), error, len(error))
+            elif segments:
                 if ct.sizeof(Segment) != 16: raise ValueError("native_segment_abi_mismatch")
                 function = self._library.wxctc_compute_segments
                 function.argtypes = [ct.c_void_p, ct.POINTER(ct.c_float), ct.c_uint64, ct.POINTER(ct.c_int32), ct.c_uint64, ct.c_uint32, ct.c_uint32, ct.c_int32, ct.c_uint32, ct.POINTER(Segment), ct.c_uint32, ct.POINTER(Result), ct.POINTER(ct.c_char), ct.c_uint32]
@@ -94,10 +111,11 @@ class NativeCTC:
                 raise ValueError(error.value.decode("ascii"))
             if result.abi_version != 1 or not -1 <= result.path_length <= frames:
                 raise ValueError("native_result_invalid")
-            points = None if result.path_length < 0 else ([(path[i].start, path[i].end, path[i].score) for i in range(count)] if segments else [(path[i].token, path[i].frame, path[i].score) for i in range(result.path_length)])
+            if resident and ((result.path_length < 0) != (generation.value == 0)): raise ValueError("native_resident_result_invalid")
+            points = None if result.path_length < 0 else (ResidentCharacterSegments(self, generation.value, count) if resident else ([(path[i].start, path[i].end, path[i].score) for i in range(count)] if segments else [(path[i].token, path[i].frame, path[i].score) for i in range(result.path_length)]))
             kernels = ["ctc_validate_wildcard", "ctc_expand_wildcard", "ctc_prefix", "ctc_trellis_compact", "ctc_backtrack_compact"] if wildcard else ["ctc_validate", "ctc_prefix", "ctc_trellis_compact", "ctc_backtrack_compact"]
             if segments: kernels.append("ctc_merge_repeats")
-            return points, {"frames": frames, "tokens": count, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "logical_cpu_to_native_emission_bytes": emission.nbytes, "logical_final_path_readback_bytes": 0 if segments else 4 + (0 if points is None else 12 * len(points)), "logical_character_segment_readback_bytes": 0 if not segments or points is None else 16 * count, "logical_control_path_length_bytes": 4, "character_segments_gpu": segments, "logical_intermediate_wildcard_readback_bytes": 0, "wildcard_fused": wildcard, "gpu_kernels": kernels, "physical_copy_bytes": None, "transport": "synchronous_in_memory_c_abi", "command_buffers_per_run": 2, "validation_wall_ns": result.validation_wall_ns, "computation_wall_ns": result.computation_wall_ns, "validation_gpu_seconds": result.validation_gpu_seconds, "computation_gpu_seconds": result.computation_gpu_seconds, "dp_logical_storage_bytes": result.dp_logical_bytes, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
+            return points, {"frames": frames, "tokens": count, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "logical_cpu_to_native_emission_bytes": emission.nbytes, "logical_final_path_readback_bytes": 0 if segments else 4 + (0 if points is None else 12 * len(points)), "logical_character_segment_readback_bytes": 0 if resident or not segments or points is None else 16 * count, "character_segments_resident": resident, "logical_resident_generation_metadata_bytes": 8 if resident else 0, "logical_control_path_length_bytes": 4, "character_segments_gpu": segments, "logical_intermediate_wildcard_readback_bytes": 0, "wildcard_fused": wildcard, "gpu_kernels": kernels, "physical_copy_bytes": None, "transport": "synchronous_in_memory_c_abi", "command_buffers_per_run": 2, "validation_wall_ns": result.validation_wall_ns, "computation_wall_ns": result.computation_wall_ns, "validation_gpu_seconds": result.validation_gpu_seconds, "computation_gpu_seconds": result.computation_gpu_seconds, "dp_logical_storage_bytes": result.dp_logical_bytes, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
 
     def row_max(self, emission):
         import numpy as np
@@ -173,6 +191,25 @@ class NativeCTC:
             if status: raise ValueError(error.value.decode("ascii"))
             if result.abi_version != 1: raise ValueError("native_result_invalid")
             return output.view(np.float64), {"scope": "experimental_fused_alignment_stats", "native_host_result_staging_bytes": 0, "native_host_result_memcpy_calls": 1, "rows": values.shape[0], "queries": modes.size, "index_elements": indices.size, "kernel": "ctc_alignment_stats_batch", "dispatch_completed": True, "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "computation_wall_ns": result.computation_wall_ns, "computation_gpu_seconds": result.computation_gpu_seconds, "logical_cpu_to_native_bytes": values.nbytes + indices.nbytes + offsets.nbytes + modes.nbytes, "logical_output_readback_bytes": modes.size * 24 + 4, "physical_copy_bytes": None, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
+
+    def scale_round_segments(self, segments, ratio, offset):
+        import numpy as np
+        import struct
+        if not isinstance(segments, ResidentCharacterSegments) or segments.owner is not self or type(segments.generation) is not int or type(segments.count) is not int or not 0 < segments.generation < 1 << 64 or not 0 < segments.count <= 32768: raise ValueError("native_resident_handle_invalid")
+        if sys.version_info[:3] != (3, 12, 12): raise ValueError("native_resident_round_runtime_not_supported")
+        if type(ratio) is not float or type(offset) not in (int, float) or (type(offset) is int and abs(offset) > 1 << 53): raise ValueError("native_resident_scale_type_invalid")
+        ratio_bits, offset_bits = struct.unpack("QQ", struct.pack("dd", ratio, float(offset)))
+        with self._lock:
+            if not self._context.value: raise ValueError("native_context_closed")
+            started = time.perf_counter_ns()
+            function = self._library.wxctc_scale_round_segments
+            function.argtypes = [ct.c_void_p, ct.c_uint64, ct.c_uint32, ct.c_uint64, ct.c_uint64, ct.POINTER(ct.c_uint64), ct.c_uint32, ct.POINTER(MaxResult), ct.POINTER(ct.c_char), ct.c_uint32]
+            function.restype = ct.c_int
+            output, result, error = np.empty(segments.count * 3, dtype=np.uint64), MaxResult(), ct.create_string_buffer(128)
+            status = function(self._context, segments.generation, segments.count, ratio_bits, offset_bits, output.ctypes.data_as(ct.POINTER(ct.c_uint64)), output.size, ct.byref(result), error, len(error))
+            if status: raise ValueError(error.value.decode("ascii"))
+            if result.abi_version != 1: raise ValueError("native_resident_result_invalid")
+            return output.view(np.float64).reshape(-1, 3), {"scope": "experimental_resident_character_scale_round", "elements": output.size, "characters": segments.count, "kernel": "ctc_scale_round_segments", "dispatch_completed": True, "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "computation_wall_ns": result.computation_wall_ns, "computation_gpu_seconds": result.computation_gpu_seconds, "logical_cpu_to_native_bytes": 16, "logical_character_reupload_bytes": 0, "logical_output_readback_bytes": output.nbytes, "logical_invalid_control_readback_bytes": 4, "native_host_result_staging_bytes": 0, "physical_copy_bytes": None, "allocated_shared_buffer_bytes": result.allocated_shared_buffer_bytes}
 
     def round3(self, values):
         import numpy as np

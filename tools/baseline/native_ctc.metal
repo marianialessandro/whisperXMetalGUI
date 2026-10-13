@@ -457,3 +457,29 @@ ulong python_round3(ulong bits) {
 kernel void ctc_round3(device const ulong* values [[buffer(0)]], constant Dimensions& dimensions [[buffer(1)]], device ulong* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
     if (index < dimensions.count) output[index] = python_round3(values[index]);
 }
+
+// Multiplication of a normal positive binary64 value by a bounded frame integer, rounded before addition.
+ulong multiply_frame_double(ulong bits, uint frame) {
+    if (frame == 0) return 0;
+    ulong mask = (1ul << 52) - 1, significand = (bits & mask) | (1ul << 52);
+    ulong low = significand * ulong(frame), high = mulhi(significand, ulong(frame));
+    uint highest = high ? 127 - uint(clz(high)) : 63 - uint(clz(low)), shift = highest - 52;
+    ulong rounded = shift ? (low >> shift) | (high << (64 - shift)) : low;
+    if (shift) {
+        ulong remainder = low & ((1ul << shift) - 1), halfway = 1ul << (shift - 1);
+        if (remainder > halfway || (remainder == halfway && (rounded & 1))) ++rounded;
+    }
+    uint exponent = uint(bits >> 52) + highest - 52;
+    if (rounded == (1ul << 53)) { rounded >>= 1; ++exponent; }
+    return (ulong(exponent) << 52) | (rounded & mask);
+}
+
+kernel void ctc_scale_round_segments(device const int2* bounds [[buffer(0)]], constant Dimensions& dimensions [[buffer(1)]], device const ulong* means [[buffer(2)]], device const ulong* scale [[buffer(3)]], device ulong* output [[buffer(4)]], device atomic_uint* invalid [[buffer(5)]], uint token [[thread_position_in_grid]]) {
+    if (token >= dimensions.count) return;
+    int2 frames = bounds[token];
+    ulong score = means[token];
+    if (frames.x < 0 || frames.y <= frames.x || frames.y > int(dimensions.frames) || score > 0x3ff0000000000000ul) { atomic_fetch_or_explicit(invalid, 1u, memory_order_relaxed); return; }
+    output[token * 3] = python_round3(add_positive_double(multiply_frame_double(scale[0], uint(frames.x)), scale[1]));
+    output[token * 3 + 1] = python_round3(add_positive_double(multiply_frame_double(scale[0], uint(frames.y)), scale[1]));
+    output[token * 3 + 2] = python_round3(score);
+}

@@ -83,6 +83,14 @@ int main(int argc, char** argv) {
     assert(wxctc_compute_segments(context, emission, 6, tokens, 1, 3, 2, 0, 2, segments, 1, &result, error, sizeof(error)) != 0);
     assert(wxctc_compute_segments(context, emission, 6, tokens, 1, 3, 2, 0, 0, segments, 1, &result, error, sizeof(error)) == 0);
     assert(result.path_length == 1 && segments[0].start == 0 && segments[0].end == 1 && segments[0].score > 0);
+    uint64_t generation = 0, resident_output[]{123, 456, 789};
+    assert(wxctc_prepare_segments(context, emission, 6, tokens, 1, 3, 2, 0, 0, &generation, &result, error, sizeof(error)) == 0 && generation != 0);
+    assert(wxctc_scale_round_segments(context, generation, 1, 0x3f847ae147ae147bull, 0, resident_output, 2, &maximum_result, error, sizeof(error)) != 0 && resident_output[0] == 123);
+    assert(wxctc_scale_round_segments(context, generation, 1, 0, 0, resident_output, 3, &maximum_result, error, sizeof(error)) != 0 && resident_output[1] == 456);
+    assert(wxctc_scale_round_segments(context, generation + 1, 1, 0x3f847ae147ae147bull, 0, resident_output, 3, &maximum_result, error, sizeof(error)) != 0 && resident_output[2] == 789);
+    assert(wxctc_scale_round_segments(context, generation, 1, 0x3f847ae147ae147bull, 0, resident_output, 3, &maximum_result, error, sizeof(error)) == 0);
+    assert(resident_output[0] == 0 && resident_output[1] == 0x3f847ae147ae147bull && maximum_result.computation_gpu_seconds > 0);
+    assert(wxctc_prepare_segments(context, emission, 5, tokens, 1, 3, 2, 0, 0, &generation, &result, error, sizeof(error)) != 0 && generation == 0);
     uint64_t grown = 0;
     for (int iteration = 0; iteration < 8; ++iteration) {
         std::vector<float> large(256 * 4, -1);
