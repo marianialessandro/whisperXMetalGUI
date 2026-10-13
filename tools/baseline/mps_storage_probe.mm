@@ -206,6 +206,20 @@ public:
         }
     }
 
+    std::tuple<at::Tensor, at::Tensor, at::Tensor> nearest(const at::Tensor& values, int64_t columns) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        TORCH_CHECK(core_ != nullptr, "mps_ctc_context_closed");
+        TORCH_CHECK(values.device().type() == c10::DeviceType::CPU && values.scalar_type() == at::kDouble && values.dim() == 1 && values.is_contiguous() && !values.requires_grad() && !values.is_neg() && !values.is_conj(), "mps_ctc_nearest_tensor_invalid");
+        TORCH_CHECK(columns >= 1 && columns <= 2 && values.numel() > 0 && values.numel() % columns == 0 && values.numel() / columns <= 32768, "mps_ctc_nearest_shape_invalid");
+        @autoreleasepool {
+            auto output = at::empty({values.numel()}, at::TensorOptions().dtype(at::kDouble).device(at::kCPU));
+            auto completed = core_->interpolate_nearest(reinterpret_cast<const uint64_t*>(values.data_ptr<double>()), values.numel(), reinterpret_cast<uint64_t*>(output.data_ptr<double>()), output.numel(), columns);
+            auto counts = at::empty({columns, 2}, at::TensorOptions().dtype(at::kLong).device(at::kCPU));
+            for (int64_t index = 0; index < columns * 2; ++index) counts.data_ptr<int64_t>()[index] = completed.counts[index];
+            return {output, counts, observation({completed.timing, completed.allocated_bytes})};
+        }
+    }
+
     static at::Tensor observation(const NativeDirectStatsResult& result) {
         auto tensor = at::empty({3}, at::TensorOptions().dtype(at::kDouble).device(at::kCPU));
         double* data = tensor.data_ptr<double>();
@@ -213,5 +227,5 @@ public:
         return tensor;
     }
 };
-static auto mps_ctc_class = torch::class_<MPSCTC>("whisperx_mps_probe", "CTC").def(torch::init<std::string>()).def("compute", &MPSCTC::compute).def("prepare", &MPSCTC::prepare).def("scale", &MPSCTC::scale).def("stats", &MPSCTC::stats).def("close", &MPSCTC::close);
+static auto mps_ctc_class = torch::class_<MPSCTC>("whisperx_mps_probe", "CTC").def(torch::init<std::string>()).def("compute", &MPSCTC::compute).def("prepare", &MPSCTC::prepare).def("scale", &MPSCTC::scale).def("stats", &MPSCTC::stats).def("nearest", &MPSCTC::nearest).def("close", &MPSCTC::close);
 }

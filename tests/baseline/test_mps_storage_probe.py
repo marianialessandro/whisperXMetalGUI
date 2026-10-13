@@ -243,6 +243,62 @@ class MPSStorageProbeTests(unittest.TestCase):
             context.close()
             with self.assertRaisesRegex(ValueError, "context_closed"): context.scale_round_segments(resident, .02, 0.)
 
+    def test_mps_nearest_bits_counts_pairs_and_resident_state_survive(self):
+        import pandas as pd
+        from whisperx.utils import interpolate_nans
+        generator = np.random.default_rng(917)
+        with self.ctc_context() as context:
+            resident, _ = context.prepare_segments(torch.full((19, 6), -1., device="mps"), [1, 2])
+            scaled, _ = context.scale_round_segments(resident, .02, 0.)
+            for rows in (1, 7, 257, 8193, 32768):
+                values = generator.normal(size=(rows, 2))
+                values[generator.random(values.shape) < .4] = np.nan
+                if rows > 3: values[1:4] = [[-0., np.inf], [np.nan, -np.inf], [0., np.nan]]
+                output, record = context.interpolate_nearest_pair(values)
+                for column in range(2):
+                    expected = interpolate_nans(pd.Series(values[:, column]), "nearest").to_numpy(dtype=np.float64)
+                    self.assertEqual(output[:, column].tobytes(), expected.tobytes())
+                    missing = int(np.isnan(values[:, column]).sum())
+                    self.assertEqual(record["input_missing_counts"][column], missing)
+                    self.assertEqual(record["filled_missing_counts"][column], missing if missing < rows else 0)
+                self.assertGreater(record["computation_gpu_seconds"], 0)
+                self.assertEqual(record["command_buffers_per_run"], 1)
+            payloads = np.array([0x7ff8000000000051, 0x7ff8000000000062], dtype=np.uint64).view(np.float64)
+            all_missing = np.tile(payloads, (7, 1))
+            output, record = context.interpolate_nearest_pair(all_missing)
+            self.assertEqual(output.tobytes(), all_missing.tobytes())
+            self.assertEqual(record["filled_missing_counts"], [0, 0])
+            readonly = np.array([np.nan, 1., np.nan, -0.]); readonly.flags.writeable = False
+            result, record = context.interpolate_nearest(readonly)
+            self.assertEqual(result.tobytes(), interpolate_nans(pd.Series(readonly), "nearest").to_numpy().tobytes())
+            self.assertEqual(record["cpu_readonly_input_copy_bytes"], readonly.nbytes)
+            context.alignment_stats_resident(scaled, np.array([0, 1], dtype=np.uint32), np.array([0, 2], dtype=np.uint32), np.array([7], dtype=np.uint32))
+            for bad in (torch.zeros(2), torch.zeros(2, dtype=torch.float64, requires_grad=True), torch.zeros((2, 1), dtype=torch.float64), torch.zeros(0, dtype=torch.float64)):
+                with self.assertRaisesRegex(RuntimeError, "nearest_(tensor|shape)_invalid"): context.context.nearest(bad, 1)
+            with self.assertRaisesRegex(ValueError, "format_invalid"): context.interpolate_nearest(np.zeros(32769))
+        with self.assertRaisesRegex(ValueError, "context_closed"): context.interpolate_nearest(np.array([1.]))
+
+    def test_mps_paired_interpolation_scoped_restore_and_snapshot_mutation(self):
+        import whisperx.alignment as alignment
+        import pandas as pd
+        from tools.baseline.native_interpolation import native_nearest_interpolation
+        original_pd, original_interpolate = alignment.pd, alignment.interpolate_nans
+        rows = [{"text": "a", "words": [], "start": 1., "end": 2.}, {"text": "", "words": [], "start": None, "end": None}, {"text": "b", "words": [], "start": 3., "end": 4.}]
+        records = []
+        with self.ctc_context() as context:
+            with native_nearest_interpolation(alignment, context, records, batched_frames=True):
+                frame = alignment.pd.DataFrame(rows)
+                for column in ("start", "end"):
+                    result = alignment.interpolate_nans(frame[column])
+                    expected = original_interpolate(pd.DataFrame(rows)[column])
+                    self.assertEqual(result.to_numpy().tobytes(), expected.to_numpy().tobytes())
+                self.assertEqual(records[0]["columns_consumed"], 2)
+                self.assertEqual(records[0]["filled_missing_counts"], [1, 1])
+                frame.loc[1, "start"] = 8.
+                with self.assertRaisesRegex(ValueError, "snapshot_changed"): alignment.interpolate_nans(frame["start"])
+            self.assertIs(alignment.pd, original_pd)
+            self.assertIs(alignment.interpolate_nans, original_interpolate)
+
     def test_cli_help_and_captured_emissions_report(self):
         root = Path(__file__).resolve().parents[2]
         command = [sys.executable, "-I", "-B", str(root / "tools/baseline/mps_storage_probe.py")]

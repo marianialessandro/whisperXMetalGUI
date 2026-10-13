@@ -126,6 +126,30 @@ class MPSCTC:
             self._resident_rounded_snapshot = (segments.generation, segments.count, int(bits[0]), int(bits[1]), output.tobytes())
             return output, {"scope": "experimental_mps_resident_character_scale_round", "elements": output.size, "characters": segments.count, "dispatch_completed": True, "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "computation_wall_ns": int(wall), "computation_gpu_seconds": gpu, "logical_cpu_to_native_bytes": 16, "logical_character_reupload_bytes": 0, "cpu_resident_snapshot_bytes": output.nbytes, "logical_output_readback_bytes": output.nbytes, "logical_invalid_control_readback_bytes": 4, "physical_copy_bytes": None, "allocated_shared_buffer_bytes": int(allocated)}
 
+    def interpolate_nearest(self, values):
+        return self._interpolate_nearest(values, 1)
+
+    def interpolate_nearest_pair(self, values):
+        if not isinstance(values, np.ndarray) or values.dtype != np.float64 or values.ndim != 2 or values.shape[1] != 2 or not 0 < len(values) <= 32768: raise ValueError("native_nearest_pair_format_invalid")
+        output, record = self._interpolate_nearest(np.ascontiguousarray(values.T).reshape(-1), 2)
+        return output.reshape(2, -1).T, record
+
+    def _interpolate_nearest(self, values, columns):
+        if not isinstance(values, np.ndarray) or values.dtype != np.float64 or values.ndim != 1 or not 0 < values.size <= 32768 * columns or values.size % columns: raise ValueError("native_nearest_format_invalid")
+        with self.lock:
+            if self.context is None: raise ValueError("mps_ctc_context_closed")
+            started = time.perf_counter_ns()
+            packed = np.ascontiguousarray(values)
+            readonly_copy_bytes = 0
+            if not packed.flags.writeable:
+                packed = packed.copy()
+                readonly_copy_bytes = packed.nbytes
+            result, counts, metrics = self.context.nearest(torch.from_numpy(packed), columns)
+            output = result.numpy()
+            wall, gpu, allocated = metrics.tolist()
+            completed_counts = counts.tolist()
+            return output, {"scope": "experimental_mps_nearest_interpolation", "elements": values.size, "columns": columns, "input_missing_counts": [count[0] for count in completed_counts], "filled_missing_counts": [count[1] for count in completed_counts], "logical_control_readback_bytes": columns * 8, "dispatch_completed": True, "command_buffers_per_run": 1, "gpu_kernels": ["ctc_nearest_neighbors", "ctc_nearest_fill"], "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "computation_wall_ns": int(wall), "computation_gpu_seconds": gpu, "logical_cpu_to_native_bytes": packed.nbytes, "logical_output_readback_bytes": output.nbytes, "cpu_readonly_input_copy_bytes": readonly_copy_bytes, "native_host_result_staging_bytes": 0, "physical_copy_bytes": None, "allocated_shared_buffer_bytes": int(allocated)}
+
     def alignment_stats_resident(self, values, indices, offsets, modes):
         statistics, _, record = self._alignment_stats_resident(values, indices, offsets, modes, False)
         return statistics, record
