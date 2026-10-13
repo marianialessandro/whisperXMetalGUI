@@ -166,6 +166,7 @@ def main(argv=None):
     parser.add_argument("--native-library-sha256", help="Expected SHA256 of the native dylib, required with native-persistent backend.")
     parser.add_argument("--mps-library", type=Path, help="Optional pinned Torch interop dylib built by mps_storage_probe.py; required with native-mps backend.")
     parser.add_argument("--mps-library-sha256", help="Expected SHA256 of the Torch interop dylib, required with native-mps backend.")
+    parser.add_argument("--mps-resident-statistics", action="store_true", help="Optional native-mps-only character grouping, resident timestamp scaling/rounding and fused timestamp/word statistics with GPU word rounding; requires a rebuilt Torch extension.")
     parser.add_argument("--native-wildcard-max", action="store_true", help="Optional trial-only interception of CPU FP32 max(dim=1) using native Metal; requires native-persistent. Mask/gather/concatenation and max readback still use the original CPU boundary.")
     parser.add_argument("--native-fused-wildcard", action="store_true", help="Optional trial-only deferred wildcard preparation; native Metal expands the source emission and runs CTC without intermediate wildcard readback. Requires native-persistent; excludes --native-wildcard-max.")
     parser.add_argument("--native-character-segments", action="store_true", help="Optional GPU character bounds/means and segment-only readback; requires native-persistent and pinned CPython 3.12 sum semantics. Word reductions/timestamp scaling remain original.")
@@ -190,6 +191,7 @@ def main(argv=None):
     if args.ctc_backend != "native-persistent" and (args.native_library is not None or args.native_library_sha256 is not None): parser.error("native library options require --ctc-backend native-persistent")
     if args.ctc_backend == "native-mps" and (args.mps_library is None or args.mps_library_sha256 is None): parser.error("native-mps backend requires interop library and its expected SHA256")
     if args.ctc_backend != "native-mps" and (args.mps_library is not None or args.mps_library_sha256 is not None): parser.error("MPS library options require --ctc-backend native-mps")
+    if args.mps_resident_statistics and args.ctc_backend != "native-mps": parser.error("MPS resident statistics require --ctc-backend native-mps")
     if args.native_wildcard_max and args.ctc_backend != "native-persistent": parser.error("--native-wildcard-max requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.ctc_backend != "native-persistent": parser.error("--native-fused-wildcard requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.native_wildcard_max: parser.error("wildcard modes are mutually exclusive")
@@ -231,6 +233,9 @@ def main(argv=None):
         @contextlib.contextmanager
         def candidate_context(records, maximum_records, bounds_records, word_records, round_records, interpolate_records):
             with contextlib.ExitStack() as scopes:
+                if args.mps_resident_statistics:
+                    from tools.baseline.native_timestamp_bounds import native_timestamp_bounds_batched
+                    scopes.enter_context(native_timestamp_bounds_batched(alignment, mps_context, bounds_records, fast_frames=True, word_means=True, mean_records=word_records, fused_reductions=True, compact_plan=True, resident_reductions=True, word_rounding=True))
                 if args.native_timestamp_bounds_batched:
                     from tools.baseline.native_timestamp_bounds import native_timestamp_bounds_batched
                     scopes.enter_context(native_timestamp_bounds_batched(alignment, persistent, bounds_records, fast_frames=args.native_timestamp_fast_frames, word_means=args.native_word_means, mean_records=word_records, fused_reductions=args.native_fused_reductions, compact_plan=args.native_compact_reduction_plan, resident_reductions=args.native_resident_reductions, word_rounding=args.native_word_rounding))
@@ -246,7 +251,7 @@ def main(argv=None):
                 if args.native_wildcard_max: scopes.enter_context(native_wildcard_max(persistent, maximum_records))
                 if args.ctc_backend == "native-mps":
                     from tools.baseline.native_mps_ctc import native_mps_ctc
-                    scopes.enter_context(native_mps_ctc(alignment, mps_context, records))
+                    scopes.enter_context(native_mps_ctc(alignment, mps_context, records, resident_statistics=args.mps_resident_statistics, rounding_records=round_records))
                 elif args.ctc_backend == "native-persistent": scopes.enter_context(persistent_metal_ctc(alignment, records, persistent, args.native_character_segments, args.native_character_rounding, round_records, args.native_resident_character_rounding))
                 else: scopes.enter_context(native_metal_ctc(alignment, records, args.native_binary, args.native_binary_sha256) if args.ctc_backend == "native" else metal_ctc(alignment, records))
                 yield
@@ -295,7 +300,7 @@ def main(argv=None):
         report["native_context_initialization_wall_ns"] = native_setup_ns
         report["native_wildcard_max_enabled"], report["wildcard_spans"] = args.native_wildcard_max, wildcard_spans
         report["native_wildcard_max_dispatch_count"] = len(wildcard_spans)
-        report["native_fused_wildcard_enabled"] = args.native_fused_wildcard
+        report["native_fused_wildcard_enabled"] = args.native_fused_wildcard or args.ctc_backend == "native-mps"
         report["native_fused_wildcard_dispatch_count"] = sum(record.get("wildcard_fused") is True for record in spans)
         report["native_character_rounding_enabled"], report["character_rounding_spans"] = args.native_character_rounding, rounding_spans
         report["native_character_rounding_dispatch_count"] = len(rounding_spans)
@@ -323,13 +328,17 @@ def main(argv=None):
         report["native_timestamp_bounds_batched_enabled"] = args.native_timestamp_bounds_batched
         report["native_timestamp_bounds_query_count"] = sum(record.get("queries", 1) for record in timestamp_spans)
         report["native_timestamp_bounds_queries_consumed"] = sum(record.get("queries_consumed", 1) for record in timestamp_spans)
-        if args.native_timestamp_bounds or args.native_timestamp_bounds_batched:
+        if args.mps_resident_statistics:
+            for field in ("native_character_rounding_enabled", "native_word_rounding_enabled", "native_resident_reductions_enabled", "native_resident_character_rounding_enabled", "native_character_segments_enabled", "native_word_means_enabled", "native_compact_reduction_plan_enabled", "native_fused_reductions_enabled", "native_timestamp_fast_frames_enabled", "native_timestamp_bounds_batched_enabled"): report[field] = True
+        if args.native_timestamp_bounds or args.native_timestamp_bounds_batched or args.mps_resident_statistics:
             import numpy as np
             report["timestamp_bounds_reference_runtime"] = {"pandas": alignment.pd.__version__, "numpy": np.__version__, "policy": "binary64_min_max_skipna_negative_zero_rejected"}
         if args.ctc_backend == "native": report["residuals"][1] = "private_npz_and_native_process_startup_per_segment"
         if args.ctc_backend == "native-persistent": report["residuals"][1] = "cpu_to_native_shared_buffer_copy_per_segment"
         report["native_mps_emission_handoff_enabled"] = args.ctc_backend == "native-mps"
+        report["native_mps_resident_statistics_enabled"] = args.mps_resident_statistics
         if args.ctc_backend == "native-mps": report["residuals"] = ["mps_producer_wait_and_two_native_ctc_completions", "cpu_final_ctc_path_character_word_reductions_scaling_rounding_interpolation", "cpu_mask_and_token_metadata", "cpu_final_path_and_result_readback"]
+        if args.mps_resident_statistics: report["residuals"] = ["mps_producer_wait_and_native_completion_groups", "cpu_ratio_and_metadata_selection_provenance_snapshots_and_csr_mapping", "cpu_final_rounded_character_readback_and_dataframe_construction", "cpu_original_nearest_interpolation"]
         if args.native_wildcard_max: report["residuals"][-1] = "cpu_wildcard_mask_gather_concat_and_max_readback"
         if args.native_fused_wildcard: report["residuals"][-1] = "cpu_wildcard_mask_and_token_metadata"
         if args.native_character_segments: report["residuals"][2] = "cpu_word_reductions_and_character_timestamp_scaling"

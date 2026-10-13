@@ -188,6 +188,61 @@ class MPSStorageProbeTests(unittest.TestCase):
             self.assertIn("borrowed_storage_sanitizer_verified", result.stdout)
             self.assertNotIn("runtime error", result.stderr)
 
+    def test_resident_mps_characters_rounding_and_statistics_match_original_bits(self):
+        import pandas as pd
+        import whisperx.alignment as alignment
+        generator = torch.Generator().manual_seed(1277)
+        emission = torch.randn((127, 12), generator=generator).to("mps").log_softmax(dim=1)
+        tokens = [1, 2, 2, 4]
+        with self.ctc_context() as context:
+            path, _ = context.compute(emission, tokens)
+            segments = alignment.merge_repeats([alignment.Point(*point) for point in path], "abcd")
+            resident, record = context.prepare_segments(emission, tokens)
+            self.assertEqual(record["logical_final_path_and_control_readback_bytes"], 8)
+            self.assertTrue(record["character_segments_resident"])
+            for ratio, offset in ((0.02, 0.), (0.013123457, 19.123)):
+                rounded, scale_record = context.scale_round_segments(resident, ratio, offset)
+                expected = np.asarray([[round(segment.start * ratio + offset, 3), round(segment.end * ratio + offset, 3), round(segment.score, 3)] for segment in segments])
+                self.assertEqual(rounded.tobytes(), expected.tobytes())
+                self.assertEqual(scale_record["logical_character_reupload_bytes"], 0)
+                values = np.insert(rounded, 2, [np.nan] * 3, axis=0)
+                groups = [[], [2], [0, 1, 2, 3, 4], [1, 1, 4], [4, 0]]
+                indices = np.asarray([index for group in groups for index in group], dtype=np.uint32)
+                offsets = np.asarray([0, *np.cumsum([len(group) for group in groups])], dtype=np.uint32)
+                modes = np.full(len(groups), 7, dtype=np.uint32)
+                actual, means, stats_record = context.alignment_stats_resident_rounded(values, indices, offsets, modes)
+                for index, group in enumerate(groups):
+                    frame = pd.DataFrame(values[group])
+                    reference = np.array([frame[0].min(), frame[1].max(), frame[2].mean()])
+                    self.assertEqual(actual[index][~np.isnan(reference)].tobytes(), reference[~np.isnan(reference)].tobytes())
+                    self.assertTrue(np.isnan(actual[index][np.isnan(reference)]).all())
+                    if np.isnan(reference[2]): self.assertTrue(np.isnan(means[index]))
+                    else: self.assertEqual(means[index].tobytes(), round(np.float64(reference[2]), 3).tobytes())
+                self.assertEqual(stats_record["logical_character_values_upload_bytes"], 0)
+                empty, _, _ = context.alignment_stats_resident_rounded(values, np.array([], dtype=np.uint32), np.array([0, 0], dtype=np.uint32), np.array([7], dtype=np.uint32))
+                self.assertTrue(np.isnan(empty).all())
+
+    def test_resident_mps_stale_handles_mutation_failed_scale_and_close(self):
+        emission = torch.full((19, 6), -1., device="mps")
+        with self.ctc_context() as context:
+            resident, _ = context.prepare_segments(emission, [1, 2])
+            values, _ = context.scale_round_segments(resident, .02, 0.)
+            indices, offsets, modes = np.array([0, 1], dtype=np.uint32), np.array([0, 2], dtype=np.uint32), np.array([7], dtype=np.uint32)
+            changed = values.copy(); changed[0, 2] = .4
+            with self.assertRaisesRegex(ValueError, "snapshot_changed"): context.alignment_stats_resident(changed, indices, offsets, modes)
+            with self.assertRaisesRegex(RuntimeError, "indices_invalid|metadata_invalid"): context.alignment_stats_resident(values, indices, np.array([0, 3], dtype=np.uint32), modes)
+            context.alignment_stats_resident(values, indices, offsets, modes)
+            with self.assertRaisesRegex(RuntimeError, "segment_invalid|domain_invalid"): context.scale_round_segments(resident, -1., 0.)
+            with self.assertRaisesRegex(ValueError, "snapshot_missing"): context.alignment_stats_resident(values, indices, offsets, modes)
+            context.scale_round_segments(resident, .02, 0.)
+            with self.assertRaisesRegex(RuntimeError, "tensor_not_supported"): context.compute(emission.cpu(), [1, 2])
+            with self.assertRaisesRegex(RuntimeError, "generation_invalid"): context.scale_round_segments(resident, .02, 0.)
+            with self.ctc_context() as other:
+                with self.assertRaisesRegex(ValueError, "handle_invalid"): other.scale_round_segments(resident, .02, 0.)
+            resident, _ = context.prepare_segments(emission, [1, 2])
+            context.close()
+            with self.assertRaisesRegex(ValueError, "context_closed"): context.scale_round_segments(resident, .02, 0.)
+
     def test_cli_help_and_captured_emissions_report(self):
         root = Path(__file__).resolve().parents[2]
         command = [sys.executable, "-I", "-B", str(root / "tools/baseline/mps_storage_probe.py")]

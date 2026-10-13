@@ -83,6 +83,8 @@ class NativeCTCContext {
     }
 
 public:
+    void invalidate_resident() { std::lock_guard<std::mutex> guard(mutex_); resident_generation_ = 0; rounded_generation_ = 0; }
+
     NativeCTCContext(const char* shader, uint64_t shader_bytes, bool compact, bool batched) : compact_(compact), batched_(batched) {
         require(shader != nullptr && shader_bytes > 0 && shader_bytes <= 1024 * 1024, "shader_budget_invalid");
         device_ = MTLCreateSystemDefaultDevice(); require(device_ != nil && [device_ supportsFamily:MTLGPUFamilyApple7], "apple_metal_required");

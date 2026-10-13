@@ -10,6 +10,8 @@ import tempfile
 import os
 import threading
 import time
+import struct
+import numpy as np
 
 import torch
 
@@ -64,6 +66,7 @@ class MPSCTC:
         kernels = Path(kernels).resolve(strict=True)
         if kernels.stat().st_size > 1024 * 1024 or hashlib.sha256(kernels.read_bytes()).hexdigest() != kernels_sha256: raise ValueError("mps_ctc_shader_identity_invalid")
         self.lock = threading.RLock()
+        self._resident_rounded_snapshot = None
         started = time.perf_counter_ns()
         self.context = torch.classes.whisperx_mps_probe.CTC(kernels.read_text())
         self.initialization_wall_ns = time.perf_counter_ns() - started
@@ -78,19 +81,70 @@ class MPSCTC:
             if self.context is not None:
                 self.context.close()
                 self.context = None
+                self._resident_rounded_snapshot = None
 
     def compute(self, emission, tokens, blank=0, wildcard=False):
+        return self._compute(emission, tokens, blank, wildcard, False)
+
+    def prepare_segments(self, emission, tokens, blank=0, wildcard=False):
+        if sys.version_info[:3] != (3, 12, 12): raise ValueError("native_resident_round_runtime_not_supported")
+        return self._compute(emission, tokens, blank, wildcard, True)
+
+    def _compute(self, emission, tokens, blank, wildcard, resident):
         with self.lock:
             runtime_check()
             if self.context is None: raise ValueError("mps_ctc_context_closed")
             if not isinstance(tokens, (list, tuple)) or not 0 < len(tokens) <= 32768 or any(type(token) is not int or not -(2**31) <= token < 2**31 for token in tokens) or type(blank) is not int or not -(2**31) <= blank < 2**31 or type(wildcard) is not bool: raise ValueError("mps_ctc_token_metadata_invalid")
             started = time.perf_counter_ns()
+            self._resident_rounded_snapshot = None
             native_tokens = torch.tensor(tokens, dtype=torch.int32, device="cpu")
-            path, metrics = self.context.compute(emission, native_tokens, blank, wildcard)
+            path, metrics = (self.context.prepare if resident else self.context.compute)(emission, native_tokens, blank, wildcard)
             found, wait, wall, validation_gpu, compute_gpu, dp_bytes, allocated, offset, readback = metrics.tolist()
-            points = [(int(row[0]), int(row[1]), row[2]) for row in path.tolist()] if found else None
+            if resident:
+                from tools.baseline.native_ctc import ResidentCharacterSegments
+                generation, count = path.tolist()
+                if (generation == 0) == bool(found) or count != len(tokens): raise ValueError("mps_ctc_resident_result_invalid")
+                points = ResidentCharacterSegments(self, generation, count) if found else None
+            else: points = [(int(row[0]), int(row[1]), row[2]) for row in path.tolist()] if found else None
             record = {"scope": "experimental_native_mps_ctc", "frames": emission.shape[0], "vocabulary": emission.shape[1], "tokens": len(tokens), "wildcard_fused": wildcard, "producer_completion_wait_seconds": wait, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_completion_wall_ns": int(wall * 1e9), "validation_gpu_seconds": validation_gpu, "computation_gpu_seconds": compute_gpu, "command_buffers_per_run": 2, "dp_logical_storage_bytes": int(dp_bytes), "native_owned_buffer_bytes": int(allocated), "borrowed_source_storage_offset_bytes": int(offset), "logical_emission_host_readback_bytes": 0, "logical_cpu_to_native_emission_bytes": 0, "logical_token_upload_bytes": len(tokens) * 4, "logical_final_path_and_control_readback_bytes": int(readback), "physical_copy_bytes": None, "source_lifetime": "owning_tensor_and_strong_metal_reference_until_completion", "synchronization": "mps_producer_wait_then_two_native_ctc_completions", "quality_certified": False, "production_backend": False}
+            record.update(character_segments_gpu=resident, character_segments_resident=resident, logical_character_segment_readback_bytes=0, logical_resident_generation_metadata_bytes=16 if resident else 0)
             return points, record
+
+    def scale_round_segments(self, segments, ratio, offset):
+        from tools.baseline.native_ctc import ResidentCharacterSegments
+        if not isinstance(segments, ResidentCharacterSegments) or segments.owner is not self or type(segments.generation) is not int or type(segments.count) is not int or not 0 < segments.generation < 2**63 or not 0 < segments.count <= 32768: raise ValueError("native_resident_handle_invalid")
+        if sys.version_info[:3] != (3, 12, 12): raise ValueError("native_resident_round_runtime_not_supported")
+        if type(ratio) is not float or type(offset) not in (int, float) or (type(offset) is int and abs(offset) > 2**53): raise ValueError("native_resident_scale_type_invalid")
+        bits = np.frombuffer(struct.pack("dd", ratio, float(offset)), dtype=np.uint64).copy()
+        with self.lock:
+            if self.context is None: raise ValueError("mps_ctc_context_closed")
+            started = time.perf_counter_ns()
+            self._resident_rounded_snapshot = None
+            result, metrics = self.context.scale(segments.generation, segments.count, torch.from_numpy(bits))
+            output = result.numpy()
+            wall, gpu, allocated = metrics.tolist()
+            self._resident_rounded_snapshot = (segments.generation, segments.count, int(bits[0]), int(bits[1]), output.tobytes())
+            return output, {"scope": "experimental_mps_resident_character_scale_round", "elements": output.size, "characters": segments.count, "dispatch_completed": True, "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "computation_wall_ns": int(wall), "computation_gpu_seconds": gpu, "logical_cpu_to_native_bytes": 16, "logical_character_reupload_bytes": 0, "cpu_resident_snapshot_bytes": output.nbytes, "logical_output_readback_bytes": output.nbytes, "logical_invalid_control_readback_bytes": 4, "physical_copy_bytes": None, "allocated_shared_buffer_bytes": int(allocated)}
+
+    def alignment_stats_resident(self, values, indices, offsets, modes):
+        statistics, _, record = self._alignment_stats_resident(values, indices, offsets, modes, False)
+        return statistics, record
+
+    def alignment_stats_resident_rounded(self, values, indices, offsets, modes):
+        return self._alignment_stats_resident(values, indices, offsets, modes, True)
+
+    def _alignment_stats_resident(self, values, indices, offsets, modes, rounded):
+        from tools.baseline.resident_statistics import resident_statistics_plan
+        with self.lock:
+            if self.context is None: raise ValueError("mps_ctc_context_closed")
+            started = time.perf_counter_ns()
+            generation, count, ratio, offset, reference, selected, mapping, mapped, offsets, modes = resident_statistics_plan(values, indices, offsets, modes, self._resident_rounded_snapshot)
+            ready = time.perf_counter_ns()
+            output, metrics = self.context.stats(generation, count, torch.from_numpy(np.array([ratio, offset], dtype=np.uint64)), torch.from_numpy(mapped), torch.from_numpy(offsets), torch.from_numpy(modes), rounded)
+            result = output.numpy()
+            wall, gpu, allocated = metrics.tolist()
+            record = {"scope": "experimental_mps_resident_fused_stats", "rows": len(values), "resident_rows": count + 1, "queries": modes.size, "index_elements": mapped.size, "dispatch_completed": True, "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "computation_wall_ns": int(wall), "computation_gpu_seconds": gpu, "logical_cpu_to_native_bytes": mapped.nbytes + offsets.nbytes + modes.nbytes, "logical_character_values_upload_bytes": 0, "logical_output_readback_bytes": result.nbytes + 4, "word_rounding_gpu": rounded, "cpu_resident_snapshot_bytes": len(reference), "cpu_resident_snapshot_gather_bytes": selected.nbytes, "cpu_resident_mapping_bytes": mapping.nbytes, "cpu_resident_mapping_wall_ns": ready - started, "physical_copy_bytes": None, "allocated_shared_buffer_bytes": int(allocated)}
+            return result[:modes.size * 3].reshape(-1, 3), result[modes.size * 3:] if rounded else None, record
 
 
 def probe_npz(args):

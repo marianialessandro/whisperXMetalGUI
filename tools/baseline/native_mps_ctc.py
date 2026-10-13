@@ -8,9 +8,10 @@ from tools.baseline.native_ctc_fused import DeferredWildcard
 
 
 @contextlib.contextmanager
-def native_mps_ctc(alignment, context, records):
+def native_mps_ctc(alignment, context, records, resident_statistics=False, rounding_records=None):
     if torch.__version__ != "2.8.0" or not isinstance(records, list): raise ValueError("native_mps_scope_runtime_or_records_invalid")
-    original_trellis, original_backtrack = alignment.get_trellis, alignment.backtrack
+    if resident_statistics and not isinstance(rounding_records, list): raise ValueError("native_mps_rounding_records_required")
+    original_trellis, original_backtrack, original_merge = alignment.get_trellis, alignment.backtrack, alignment.merge_repeats
     class EmissionHandoff(TorchDispatchMode):
         def __init__(self):
             super().__init__()
@@ -41,16 +42,27 @@ def native_mps_ctc(alignment, context, records):
     def trellis(emission, tokens, blank_id=0):
         if not isinstance(emission, DeferredWildcard) or emission.kind not in ("base", "expanded") or emission.base_emission.device.type != "mps": raise ValueError("native_mps_emission_handoff_missing")
         if emission.kind == "expanded" and emission.blank != blank_id: raise ValueError("native_mps_blank_metadata_changed")
-        path, record = context.compute(emission.base_emission, tokens, blank_id, wildcard=emission.kind == "expanded")
+        path, record = (context.prepare_segments if resident_statistics else context.compute)(emission.base_emission, tokens, blank_id, wildcard=emission.kind == "expanded")
         records.append(record)
         return Trellis(path, emission.shape[0], len(tokens))
 
     def backtrack(trellis, emission, tokens, blank_id=0):
         if not isinstance(trellis, Trellis): raise ValueError("native_mps_trellis_not_supported")
+        if resident_statistics: return None if trellis.path is None else CharacterPath(trellis.path)
         return None if trellis.path is None else [alignment.Point(token, frame, score) for token, frame, score in trellis.path]
 
+    class CharacterPath:
+        def __init__(self, segments): self.segments = segments
+
+    def merge(path, transcript):
+        from tools.baseline.native_character_rounding import rounded_character_segments
+        if not isinstance(path, CharacterPath) or len(path.segments) != len(transcript): raise ValueError("native_mps_character_metadata_invalid")
+        return rounded_character_segments(alignment, path.segments, transcript, context, rounding_records)
+
     alignment.get_trellis, alignment.backtrack = trellis, backtrack
+    if resident_statistics: alignment.merge_repeats = merge
     try:
         with EmissionHandoff(): yield
     finally:
         alignment.get_trellis, alignment.backtrack = original_trellis, original_backtrack
+        if resident_statistics: alignment.merge_repeats = original_merge

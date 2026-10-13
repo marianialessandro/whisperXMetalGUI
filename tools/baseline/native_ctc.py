@@ -208,16 +208,8 @@ class NativeCTC:
         with self._lock:
             if not self._context.value: raise ValueError("native_context_closed")
             started = time.perf_counter_ns()
-            snapshot = self._resident_rounded_snapshot
-            if snapshot is None: raise ValueError("native_resident_statistics_snapshot_missing")
-            generation, count, ratio, offset, reference = snapshot
-            missing = np.isnan(values).all(axis=1)
-            selected = np.ascontiguousarray(values[~missing])
-            if selected.shape[0] != count or selected.tobytes() != reference: raise ValueError("native_resident_statistics_snapshot_changed")
-            if indices.size and int(indices.max()) >= len(values): raise ValueError("native_resident_statistics_indices_invalid")
-            mapping = np.full(len(values), count, dtype=np.uint32)
-            mapping[~missing] = np.arange(count, dtype=np.uint32)
-            mapped, offsets, modes = np.ascontiguousarray(mapping[indices]), np.ascontiguousarray(offsets), np.ascontiguousarray(modes)
+            from tools.baseline.resident_statistics import resident_statistics_plan
+            generation, count, ratio, offset, reference, selected, mapping, mapped, offsets, modes = resident_statistics_plan(values, indices, offsets, modes, self._resident_rounded_snapshot)
             mapping_ready = time.perf_counter_ns()
             output, result, error = np.empty(modes.size * (4 if word_rounding else 3), dtype=np.uint64), MaxResult(), ct.create_string_buffer(128)
             function = self._library.wxctc_alignment_stats_resident_rounded if word_rounding else self._library.wxctc_alignment_stats_resident

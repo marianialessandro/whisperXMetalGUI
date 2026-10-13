@@ -39,7 +39,7 @@ class ScopedAlignmentTrialTests(unittest.TestCase):
 
     def test_additive_mps_backend_flags_reject_missing_or_cross_backend_inputs(self):
         required = ["--audio", "missing", "--audio-sha256", "0" * 64, "--segments", "missing", "--segments-sha256", "0" * 64, "--language", "it", "--torch-specs", "missing", "--output-dir", "missing"]
-        invalid = [["--ctc-backend", "native-mps"], ["--mps-library", "missing", "--mps-library-sha256", "0" * 64], ["--ctc-backend", "native-persistent"], ["--ctc-backend", "native-mps", "--mps-library", "missing", "--mps-library-sha256", "0" * 64, "--native-character-segments"]]
+        invalid = [["--ctc-backend", "native-mps"], ["--mps-library", "missing", "--mps-library-sha256", "0" * 64], ["--ctc-backend", "native-persistent"], ["--mps-resident-statistics"], ["--ctc-backend", "native-mps", "--mps-library", "missing", "--mps-library-sha256", "0" * 64, "--native-character-segments"]]
         for arguments in invalid:
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error: main([*required, *arguments])
             self.assertEqual(error.exception.code, 2)

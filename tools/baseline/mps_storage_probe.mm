@@ -116,8 +116,17 @@ public:
     void close() { std::lock_guard<std::mutex> guard(mutex_); core_.reset(); }
 
     std::tuple<at::Tensor, at::Tensor> compute(const at::Tensor& input, const at::Tensor& tokens, int64_t blank, bool wildcard) {
+        return run(input, tokens, blank, wildcard, false);
+    }
+
+    std::tuple<at::Tensor, at::Tensor> prepare(const at::Tensor& input, const at::Tensor& tokens, int64_t blank, bool wildcard) {
+        return run(input, tokens, blank, wildcard, true);
+    }
+
+    std::tuple<at::Tensor, at::Tensor> run(const at::Tensor& input, const at::Tensor& tokens, int64_t blank, bool wildcard, bool resident) {
         std::lock_guard<std::mutex> guard(mutex_);
         TORCH_CHECK(core_ != nullptr, "mps_ctc_context_closed");
+        core_->invalidate_resident();
         TORCH_CHECK(input.device().type() == c10::DeviceType::MPS && input.scalar_type() == at::kFloat && input.dim() == 2 && input.is_contiguous() && !input.requires_grad() && !input.is_neg() && !input.is_conj(), "mps_ctc_tensor_not_supported");
         TORCH_CHECK(input.size(0) > 0 && input.size(0) <= 32768 && input.size(1) > 0 && input.size(1) <= 4096 && input.numel() <= 16777216 && blank >= 0 && blank < input.size(1), "mps_ctc_shape_or_blank_invalid");
         TORCH_CHECK(tokens.device().type() == c10::DeviceType::CPU && tokens.scalar_type() == at::kInt && tokens.dim() == 1 && tokens.is_contiguous() && !tokens.is_neg() && tokens.numel() > 0 && tokens.numel() <= input.size(0), "mps_ctc_tokens_not_supported");
@@ -136,13 +145,21 @@ public:
             if (sync_error) std::rethrow_exception(sync_error);
             const double producer_wait = seconds(sync_started);
             Dimensions dimensions{static_cast<uint32_t>(owner.size(0)), static_cast<uint32_t>(owner.size(1)), static_cast<uint32_t>(tokens.numel()), static_cast<int32_t>(blank)};
-            auto completed = core_->compute(nullptr, owner.numel(), token_owner.data_ptr<int32_t>(), token_owner.numel(), dimensions, wildcard, false, false, source, offset);
-            auto path = at::empty({static_cast<int64_t>(completed.path.size()), 3}, at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
-            float* packed = path.data_ptr<float>();
-            for (size_t index = 0; index < completed.path.size(); ++index) {
-                packed[index * 3] = completed.path[index].token;
-                packed[index * 3 + 1] = completed.path[index].frame;
-                packed[index * 3 + 2] = completed.path[index].score;
+            auto completed = core_->compute(nullptr, owner.numel(), token_owner.data_ptr<int32_t>(), token_owner.numel(), dimensions, wildcard, resident, resident, source, offset);
+            at::Tensor path;
+            if (resident) {
+                TORCH_CHECK(completed.generation <= INT64_MAX, "mps_ctc_generation_overflow");
+                path = at::empty({2}, at::TensorOptions().dtype(at::kLong).device(at::kCPU));
+                path.data_ptr<int64_t>()[0] = completed.generation;
+                path.data_ptr<int64_t>()[1] = tokens.numel();
+            } else {
+                path = at::empty({static_cast<int64_t>(completed.path.size()), 3}, at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+                float* packed = path.data_ptr<float>();
+                for (size_t index = 0; index < completed.path.size(); ++index) {
+                    packed[index * 3] = completed.path[index].token;
+                    packed[index * 3 + 1] = completed.path[index].frame;
+                    packed[index * 3 + 2] = completed.path[index].score;
+                }
             }
             auto metrics = at::empty({9}, at::TensorOptions().dtype(at::kDouble).device(at::kCPU));
             double* values = metrics.data_ptr<double>();
@@ -158,6 +175,43 @@ public:
             return {path, metrics};
         }
     }
+
+    std::tuple<at::Tensor, at::Tensor> scale(int64_t generation, int64_t count, const at::Tensor& parameters) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        TORCH_CHECK(core_ != nullptr, "mps_ctc_context_closed");
+        TORCH_CHECK(generation > 0 && count > 0 && count <= 32768, "mps_ctc_resident_handle_invalid");
+        TORCH_CHECK(parameters.device().type() == c10::DeviceType::CPU && parameters.scalar_type() == at::kUInt64 && parameters.dim() == 1 && parameters.numel() == 2 && parameters.is_contiguous(), "mps_ctc_scale_parameters_invalid");
+        @autoreleasepool {
+            auto output = at::empty({count, 3}, at::TensorOptions().dtype(at::kDouble).device(at::kCPU));
+            const uint64_t* bits = parameters.data_ptr<uint64_t>();
+            auto completed = core_->scale_round_segments(generation, count, bits[0], bits[1], reinterpret_cast<uint64_t*>(output.data_ptr<double>()), count * 3);
+            return {output, observation(completed)};
+        }
+    }
+
+    std::tuple<at::Tensor, at::Tensor> stats(int64_t generation, int64_t count, const at::Tensor& parameters, const at::Tensor& indices, const at::Tensor& offsets, const at::Tensor& modes, bool rounded) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        TORCH_CHECK(core_ != nullptr, "mps_ctc_context_closed");
+        TORCH_CHECK(generation > 0 && count > 0 && count <= 32768, "mps_ctc_resident_handle_invalid");
+        TORCH_CHECK(parameters.device().type() == c10::DeviceType::CPU && parameters.scalar_type() == at::kUInt64 && parameters.dim() == 1 && parameters.numel() == 2 && parameters.is_contiguous(), "mps_ctc_scale_parameters_invalid");
+        for (const auto& tensor : {indices, offsets, modes}) TORCH_CHECK(tensor.device().type() == c10::DeviceType::CPU && tensor.scalar_type() == at::kUInt32 && tensor.dim() == 1 && tensor.is_contiguous(), "mps_ctc_statistics_metadata_invalid");
+        TORCH_CHECK(indices.numel() <= 4194304 && offsets.numel() >= 2 && offsets.numel() <= 32769 && modes.numel() == offsets.numel() - 1, "mps_ctc_statistics_shape_invalid");
+        @autoreleasepool {
+            const uint64_t* bits = parameters.data_ptr<uint64_t>();
+            auto output = at::empty({modes.numel() * (rounded ? 4 : 3)}, at::TensorOptions().dtype(at::kDouble).device(at::kCPU));
+            const uint32_t empty_index = 0;
+            const uint32_t* index_data = indices.numel() ? indices.data_ptr<uint32_t>() : &empty_index;
+            auto completed = core_->alignment_stats_batch(nullptr, (count + 1) * 3, count + 1, index_data, indices.numel(), offsets.data_ptr<uint32_t>(), offsets.numel(), modes.data_ptr<uint32_t>(), modes.numel(), reinterpret_cast<uint64_t*>(output.data_ptr<double>()), output.numel(), generation, bits[0], bits[1], rounded);
+            return {output, observation(completed)};
+        }
+    }
+
+    static at::Tensor observation(const NativeDirectStatsResult& result) {
+        auto tensor = at::empty({3}, at::TensorOptions().dtype(at::kDouble).device(at::kCPU));
+        double* data = tensor.data_ptr<double>();
+        data[0] = result.timing.wall_ns; data[1] = result.timing.gpu_seconds; data[2] = result.allocated_bytes;
+        return tensor;
+    }
 };
-static auto mps_ctc_class = torch::class_<MPSCTC>("whisperx_mps_probe", "CTC").def(torch::init<std::string>()).def("compute", &MPSCTC::compute).def("close", &MPSCTC::close);
+static auto mps_ctc_class = torch::class_<MPSCTC>("whisperx_mps_probe", "CTC").def(torch::init<std::string>()).def("compute", &MPSCTC::compute).def("prepare", &MPSCTC::prepare).def("scale", &MPSCTC::scale).def("stats", &MPSCTC::stats).def("close", &MPSCTC::close);
 }
