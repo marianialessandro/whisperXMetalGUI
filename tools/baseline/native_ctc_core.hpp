@@ -16,6 +16,7 @@ struct Timing { uint64_t wall_ns; double gpu_seconds; };
 struct NativePoint { int32_t token; int32_t frame; float score; };
 struct NativeSegment { int32_t start; int32_t end; double score; };
 struct NativeResult { std::vector<NativePoint> path; bool found; std::vector<Timing> timings; uint64_t dp_bytes; uint64_t allocated_bytes; std::vector<NativeSegment> segments; int32_t path_length; };
+struct NativeDirectStatsResult { Timing timing; uint64_t allocated_bytes; };
 struct NativeBatchBoundsResult { std::vector<uint64_t> bounds; Timing timing; uint64_t allocated_bytes; };
 struct NativeBoundsResult { uint64_t minimum, maximum; Timing timing; uint64_t allocated_bytes; };
 struct NativeMaxResult { std::vector<float> values; std::vector<uint32_t> indices; std::vector<Timing> timings; uint64_t allocated_bytes; };
@@ -53,13 +54,13 @@ class NativeCTCContext {
     id<MTLLibrary> library_;
     id<MTLComputePipelineState> max_pipeline_;
     id<MTLComputePipelineState> wildcard_validate_, wildcard_expand_;
-    id<MTLComputePipelineState> segment_pipeline_, bounds_pipeline_, batch_bounds_pipeline_, word_means_pipeline_;
+    id<MTLComputePipelineState> segment_pipeline_, bounds_pipeline_, batch_bounds_pipeline_, word_means_pipeline_, alignment_stats_pipeline_;
     NSMutableArray<id<MTLComputePipelineState>>* pipelines_;
     NSArray<NSString*>* names_;
     id<MTLBuffer> e_, t_, invalid_, prefix_, rows_, path_, decisions_, endpoint_;
     id<MTLBuffer> max_values_, max_indices_;
     id<MTLBuffer> expanded_;
-    id<MTLBuffer> segment_bounds_, segment_means_, bounds_input_, bounds_output_, bounds_indices_, bounds_offsets_;
+    id<MTLBuffer> segment_bounds_, segment_means_, bounds_input_, bounds_output_, bounds_indices_, bounds_offsets_, stats_modes_;
     bool compact_, batched_;
     std::mutex mutex_;
 
@@ -68,7 +69,7 @@ class NativeCTCContext {
         require(buffer != nil, "metal_allocation_failed");
     }
 
-    uint64_t allocated_bytes() const { return e_.length + t_.length + invalid_.length + prefix_.length + rows_.length + path_.length + decisions_.length + endpoint_.length + max_values_.length + max_indices_.length + expanded_.length + segment_bounds_.length + segment_means_.length + bounds_input_.length + bounds_output_.length + bounds_indices_.length + bounds_offsets_.length; }
+    uint64_t allocated_bytes() const { return e_.length + t_.length + invalid_.length + prefix_.length + rows_.length + path_.length + decisions_.length + endpoint_.length + max_values_.length + max_indices_.length + expanded_.length + segment_bounds_.length + segment_means_.length + bounds_input_.length + bounds_output_.length + bounds_indices_.length + bounds_offsets_.length + stats_modes_.length; }
 
     void pipeline(id<MTLComputePipelineState> __strong& state, NSString* name) {
         if (state != nil) return;
@@ -197,6 +198,26 @@ public:
         require(!(invalid & 1), "word_means_indices_invalid"); require(!(invalid & 2), "word_means_values_invalid");
         const uint64_t* output = static_cast<const uint64_t*>(bounds_output_.contents);
         return {{output, output + queries}, timing, allocated_bytes()};
+    }
+
+    NativeDirectStatsResult alignment_stats_batch(const uint64_t* values, uint64_t elements, uint32_t rows, const uint32_t* indices, uint64_t index_count, const uint32_t* offsets, uint64_t offset_count, const uint32_t* modes, uint64_t mode_count, uint64_t* caller_output, uint64_t output_capacity) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(values != nullptr && indices != nullptr && offsets != nullptr && modes != nullptr && rows <= 32768 && elements == uint64_t(rows) * 3 && index_count <= 4 * 1024 * 1024 && offset_count >= 2 && offset_count <= 32769 && mode_count == offset_count - 1, "alignment_stats_shape_invalid");
+        uint32_t queries = static_cast<uint32_t>(mode_count);
+        require(caller_output != nullptr && output_capacity >= uint64_t(queries) * 3, "alignment_stats_output_invalid");
+        pipeline(alignment_stats_pipeline_, @"ctc_alignment_stats_batch");
+        reserve(bounds_input_, std::max(uint64_t(8), elements * 8)); reserve(bounds_output_, uint64_t(queries) * 24);
+        reserve(bounds_indices_, std::max(uint64_t(4), index_count * 4)); reserve(bounds_offsets_, offset_count * 4); reserve(stats_modes_, mode_count * 4); reserve(invalid_, 4);
+        if (elements) std::memcpy(bounds_input_.contents, values, elements * 8);
+        if (index_count) std::memcpy(bounds_indices_.contents, indices, index_count * 4);
+        std::memcpy(bounds_offsets_.contents, offsets, offset_count * 4); std::memcpy(stats_modes_.contents, modes, mode_count * 4);
+        *static_cast<uint32_t*>(invalid_.contents) = 0;
+        auto timing = execute(queue_, alignment_stats_pipeline_, @[bounds_input_, bounds_indices_, bounds_offsets_, stats_modes_, bounds_output_, invalid_], {queries, rows, static_cast<uint32_t>(index_count), 0}, 1, uint64_t(queries) * 256, 256, @"ctc_alignment_stats_batch");
+        uint32_t invalid = *static_cast<uint32_t*>(invalid_.contents);
+        require(!(invalid & 1), "alignment_stats_metadata_invalid"); require(!(invalid & 2), "timestamp_negative_zero_not_supported"); require(!(invalid & 4), "word_means_values_invalid");
+        const uint64_t* output = static_cast<const uint64_t*>(bounds_output_.contents);
+        std::memcpy(caller_output, output, uint64_t(queries) * 24);
+        return {timing, allocated_bytes()};
     }
 
     NativeBoundsResult timestamp_bounds(const uint64_t* values, uint64_t count) {

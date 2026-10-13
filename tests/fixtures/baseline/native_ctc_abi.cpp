@@ -60,6 +60,14 @@ int main(int argc, char** argv) {
     scores[0] = 0x8000000000000000ull; means[0] = 123;
     assert(wxctc_word_means_batch(context, scores, 3, score_indices, 3, subset_offsets, 3, means, 2, &maximum_result, error, sizeof(error)) != 0 && means[0] == 123);
     assert(wxctc_word_means_batch(context, nullptr, 3, score_indices, 3, subset_offsets, 3, means, 2, &maximum_result, error, sizeof(error)) != 0);
+    uint64_t triples[]{0x3ff0000000000000ull, 0x4000000000000000ull, 0x3fb999999999999aull, 0x4008000000000000ull, 0x4010000000000000ull, 0x3fd3333333333333ull}, statistics[]{123, 123, 123};
+    uint32_t row_indices[]{0, 1}, row_offsets[]{0, 2}, row_modes[]{7};
+    assert(wxctc_alignment_stats_batch(context, triples, 6, 2, row_indices, 2, row_offsets, 2, row_modes, 1, statistics, 2, &maximum_result, error, sizeof(error)) != 0 && statistics[0] == 123);
+    assert(wxctc_alignment_stats_batch(context, triples, 5, 2, row_indices, 2, row_offsets, 2, row_modes, 1, statistics, 3, &maximum_result, error, sizeof(error)) != 0 && statistics[0] == 123);
+    assert(wxctc_alignment_stats_batch(context, triples, 6, 2, row_indices, 2, row_offsets, 2, row_modes, 1, statistics, 3, &maximum_result, error, sizeof(error)) == 0);
+    assert(statistics[0] == triples[0] && statistics[1] == triples[4] && statistics[2] == 0x3fc999999999999aull);
+    row_modes[0] = 8; statistics[0] = 123;
+    assert(wxctc_alignment_stats_batch(context, triples, 6, 2, row_indices, 2, row_offsets, 2, row_modes, 1, statistics, 3, &maximum_result, error, sizeof(error)) != 0 && statistics[0] == 123);
     int32_t wildcard[]{2};
     assert(wxctc_compute_wildcard(context, emission, 6, wildcard, 1, 3, 2, 0, path, 3, &result, error, sizeof(error)) == 0);
     assert(result.path_length > 0 && path[0].frame == 0 && path[0].token == 0);

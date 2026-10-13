@@ -75,6 +75,20 @@ Supported score values are positive zero, finite values in 0.001..1 and NaN, mat
 
 Reports separate `word_mean_spans`, real mean dispatch count and consumed word requests from timestamp counts. Per mean batch, logical readback is eight bytes per unique word plus four validation bytes; input includes scores and CSR metadata. CPU character scaling/rounding, final mean rounding, labels, selection, snapshots, interpolation, character readback and uploads remain. This is another numerical GPU feasibility step, not production promotion, a zero-copy claim or independent quality certification.
 
+## Fused timestamp and word reductions
+
+Add `--native-fused-reductions` with `--native-word-means` to use one interleaved binary64 `(start, end, score)` input, one shared CSR row query set and one Metal kernel per character frame. Modes bits 1/2/4 request minimum start, maximum end and mean score. A word's row indices serve all three operations; sentence selections still follow the original inclusive spans and literal-space exclusion. Previous separate-batch modes and defaults remain available.
+
+The additive `wxctc_alignment_stats_batch` ABI v1 export validates row counts, lengths, capacities, mode bits, CSR metadata and selected numerical domains. Unrequested output fields are NaN and the scoped adapter rejects requests for operations it did not register. The binary64 extrema and NumPy score-sum policies are unchanged; the score helper reads interleaved data at stride three without altering its order. Limits: 32768 rows/queries/elements per subset and 4194304 CSR indices. Outputs are caller-owned triples, copied only after successful GPU completion/validation.
+
+The fused core writes directly from its Metal shared output buffer into the caller's output memory while holding the context lock. It creates no intermediate C++ result vector for this export. The record exposes zero native host result staging bytes and one native result memcpy; this does not mean zero physical copies, zero Python snapshot allocations or zero-copy GPU transport. Previously exported functions preserve their behavior.
+
+`timestamp_bounds_spans` carries the fused group's actual input/readback bytes, completion time and one command buffer. `word_mean_spans` is an explicitly marked component of that same completion group: `separate_dispatch=false`, zero additional command buffers and zero additional transfer bytes. Its GPU interval is shared, not a second independently measured kernel interval; do not sum duplicated component times. `native_word_means_dispatch_count` excludes these components; completed mean group/consumed request counts remain available. The report separately counts fused groups and unique row subsets.
+
+Add `--native-compact-reduction-plan` to optionally use clipped integer sentence ranges, shared word row tuples and one row gather per fused subset for snapshot construction. Original snapshot bytes and mutation checks are preserved. A whole row gather can copy unused columns on CPU; the report distinguishes requested snapshot bytes from temporary gathered bytes and counts gather calls. This changes host preparation only, not numerical GPU placement or GPU transfer sizes. Plan/cache wall times are partial local intervals, not a partition of complete alignment time. Compare complete alignment timing before drawing performance conclusions.
+
+All extensions remain standalone CLI feasibility work. Character readback, CPU timestamp scaling/rounding, final score rounding, interpolation, metadata, snapshots and uploads remain. The production backend and full quality gate are separate pending work.
+
 ## Lifecycle and verification
 
 The development ABI in `native_ctc_bridge.h` returns zero on success and nonzero with a fixed error code on failure. Input pointers and declared lengths must remain valid until a synchronous call returns. Output capacity must cover `frames`. Calls on one context serialize; finish all calls before destroying it and never race destruction with a new call. The Python wrapper's context manager and lock enforce compute/close ordering. No CPU fallback is invoked when native validation fails.

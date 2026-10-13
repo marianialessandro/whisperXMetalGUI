@@ -123,4 +123,18 @@ int wxctc_word_means_batch(wxctc_context* context, const uint64_t* values, uint6
     }
 }
 
+int wxctc_alignment_stats_batch(wxctc_context* context, const uint64_t* values, uint64_t elements, uint32_t rows, const uint32_t* indices, uint64_t index_count, const uint32_t* offsets, uint64_t offset_count, const uint32_t* modes, uint64_t mode_count, uint64_t* output, uint32_t output_capacity, wxctc_max_result* result, char* error_code, uint32_t error_capacity) {
+    @autoreleasepool {
+        set_error(error_code, error_capacity, "");
+        if (result != nullptr) { *result = {}; result->abi_version = 1; }
+        try {
+            require(context != nullptr && output != nullptr && result != nullptr && mode_count > 0 && mode_count <= 32768 && output_capacity >= mode_count * 3, "output_or_context_invalid");
+            auto completed = context->core.alignment_stats_batch(values, elements, rows, indices, index_count, offsets, offset_count, modes, mode_count, output, output_capacity);
+            *result = {1, 0, 0, completed.timing.wall_ns, 0, completed.timing.gpu_seconds, completed.allocated_bytes};
+            return 0;
+        } catch (const InventoryError& error) { set_error(error_code, error_capacity, error.what()); return 1; }
+        catch (...) { set_error(error_code, error_capacity, "native_alignment_stats_execution_failed"); return 1; }
+    }
+}
+
 void wxctc_destroy(wxctc_context* context) { @autoreleasepool { delete context; } }

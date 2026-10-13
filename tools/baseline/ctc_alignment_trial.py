@@ -165,6 +165,8 @@ def main(argv=None):
     parser.add_argument("--native-timestamp-bounds-batched", action="store_true", help="Optional shared-input Metal timestamp min/max batch per character frame; requires native-persistent and excludes --native-timestamp-bounds. Uses original tokenizer spans and word metadata; means/interpolation remain original.")
     parser.add_argument("--native-timestamp-fast-frames", action="store_true", help="Optional Pandas 3.0.6 manager constructors avoiding subclass reconstruction in batched timestamp mode; requires --native-timestamp-bounds-batched. Preserves snapshot checks and copy-on-write semantics.")
     parser.add_argument("--native-word-means", action="store_true", help="Optional Metal binary64 word score means with pinned Pandas 3.0.6/NumPy 2.2.6 summation and buffer policy; requires --native-timestamp-bounds-batched. Adds one score batch per character frame; rounding remains original.")
+    parser.add_argument("--native-fused-reductions", action="store_true", help="Optional shared row queries and one Metal kernel for timestamp minima/maxima and word means; requires --native-word-means. Previous separate-batch mode remains available.")
+    parser.add_argument("--native-compact-reduction-plan", action="store_true", help="Optional clipped sentence ranges, shared word row tuples and one snapshot gather per fused subset; requires --native-fused-reductions. Preserves snapshot mutation validation.")
     args = parser.parse_args(argv)
     if not 1 <= args.replicas <= 10: parser.error("replicas must be between 1 and 10")
     if args.ctc_backend == "native" and (args.native_binary is None or args.native_binary_sha256 is None): parser.error("native backend requires binary and its expected SHA256")
@@ -174,6 +176,8 @@ def main(argv=None):
     if args.native_wildcard_max and args.ctc_backend != "native-persistent": parser.error("--native-wildcard-max requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.ctc_backend != "native-persistent": parser.error("--native-fused-wildcard requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.native_wildcard_max: parser.error("wildcard modes are mutually exclusive")
+    if args.native_compact_reduction_plan and not args.native_fused_reductions: parser.error("--native-compact-reduction-plan requires --native-fused-reductions")
+    if args.native_fused_reductions and not args.native_word_means: parser.error("--native-fused-reductions requires --native-word-means")
     if args.native_word_means and not args.native_timestamp_bounds_batched: parser.error("--native-word-means requires --native-timestamp-bounds-batched")
     if args.native_timestamp_fast_frames and not args.native_timestamp_bounds_batched: parser.error("--native-timestamp-fast-frames requires --native-timestamp-bounds-batched")
     if args.native_timestamp_bounds_batched and args.ctc_backend != "native-persistent": parser.error("--native-timestamp-bounds-batched requires --ctc-backend native-persistent")
@@ -205,7 +209,7 @@ def main(argv=None):
             with contextlib.ExitStack() as scopes:
                 if args.native_timestamp_bounds_batched:
                     from tools.baseline.native_timestamp_bounds import native_timestamp_bounds_batched
-                    scopes.enter_context(native_timestamp_bounds_batched(alignment, persistent, bounds_records, fast_frames=args.native_timestamp_fast_frames, word_means=args.native_word_means, mean_records=word_records))
+                    scopes.enter_context(native_timestamp_bounds_batched(alignment, persistent, bounds_records, fast_frames=args.native_timestamp_fast_frames, word_means=args.native_word_means, mean_records=word_records, fused_reductions=args.native_fused_reductions, compact_plan=args.native_compact_reduction_plan))
                 if args.native_timestamp_bounds:
                     from tools.baseline.native_timestamp_bounds import native_timestamp_bounds
                     scopes.enter_context(native_timestamp_bounds(alignment, persistent, bounds_records))
@@ -261,7 +265,12 @@ def main(argv=None):
         report["native_timestamp_bounds_enabled"], report["timestamp_bounds_spans"] = args.native_timestamp_bounds, timestamp_spans
         report["native_timestamp_bounds_dispatch_count"] = len(timestamp_spans)
         report["native_word_means_enabled"], report["word_mean_spans"] = args.native_word_means, mean_spans
-        report["native_word_means_dispatch_count"] = len(mean_spans)
+        report["native_word_means_dispatch_count"] = sum(record.get("separate_dispatch", True) for record in mean_spans)
+        report["native_word_means_completed_group_count"] = len(mean_spans)
+        report["native_compact_reduction_plan_enabled"] = args.native_compact_reduction_plan
+        report["native_fused_reductions_enabled"] = args.native_fused_reductions
+        report["native_fused_reductions_command_groups"] = sum(record.get("fused_reductions", False) for record in timestamp_spans)
+        report["native_fused_reductions_subset_count"] = sum(record.get("fused_subset_count", 0) for record in timestamp_spans)
         report["native_word_means_queries_consumed"] = sum(record["queries_consumed"] for record in mean_spans)
         report["native_timestamp_fast_frames_enabled"] = args.native_timestamp_fast_frames
         report["native_timestamp_bounds_batched_enabled"] = args.native_timestamp_bounds_batched

@@ -311,37 +311,37 @@ kernel void ctc_timestamp_bounds_batch(device const ulong* values [[buffer(0)]],
     }
 }
 
-ulong word_score(device const ulong* values, device const uint* indices, uint index) {
-    ulong bits = values[indices[index]];
+ulong word_score(device const ulong* values, device const uint* indices, uint index, uint stride) {
+    ulong bits = values[indices[index] * stride];
     return (bits & 0x7ffffffffffffffful) > 0x7ff0000000000000ul ? 0ul : bits;
 }
 
 // Reproduce the pinned NumPy pairwise leaf order, retaining NaN positions as positive zero.
-ulong word_sum_leaf(device const ulong* values, device const uint* indices, uint begin, uint count) {
+ulong word_sum_leaf(device const ulong* values, device const uint* indices, uint begin, uint count, uint stride) {
     ulong result = 0;
     if (count < 8) {
-        for (uint i = 0; i < count; ++i) result = add_positive_double(result, word_score(values, indices, begin + i));
+        for (uint i = 0; i < count; ++i) result = add_positive_double(result, word_score(values, indices, begin + i, stride));
         return result;
     }
     ulong sums[8];
-    for (uint lane = 0; lane < 8; ++lane) sums[lane] = word_score(values, indices, begin + lane);
+    for (uint lane = 0; lane < 8; ++lane) sums[lane] = word_score(values, indices, begin + lane, stride);
     uint i = 8;
     for (; i < count - count % 8; i += 8) {
-        for (uint lane = 0; lane < 8; ++lane) sums[lane] = add_positive_double(sums[lane], word_score(values, indices, begin + i + lane));
+        for (uint lane = 0; lane < 8; ++lane) sums[lane] = add_positive_double(sums[lane], word_score(values, indices, begin + i + lane, stride));
     }
     result = add_positive_double(add_positive_double(add_positive_double(sums[0], sums[1]), add_positive_double(sums[2], sums[3])), add_positive_double(add_positive_double(sums[4], sums[5]), add_positive_double(sums[6], sums[7])));
-    for (; i < count; ++i) result = add_positive_double(result, word_score(values, indices, begin + i));
+    for (; i < count; ++i) result = add_positive_double(result, word_score(values, indices, begin + i, stride));
     return result;
 }
 
 // Bounded explicit stack replaces recursion; splits preserve multiples of the eight-accumulator unroll factor.
-ulong word_pairwise_sum(device const ulong* values, device const uint* indices, uint begin, uint count) {
+ulong word_pairwise_sum(device const ulong* values, device const uint* indices, uint begin, uint count, uint stride) {
     uint starts[16], lengths[16], states[16], depth = 0;
     ulong left[16], result = 0;
     starts[0] = begin; lengths[0] = count; states[0] = 0;
     while (true) {
         uint length = lengths[depth], start = starts[depth];
-        if (length <= 128) result = word_sum_leaf(values, indices, start, length);
+        if (length <= 128) result = word_sum_leaf(values, indices, start, length, stride);
         else {
             uint split = (length / 2) & ~7u;
             if (states[depth] == 0) {
@@ -378,6 +378,61 @@ kernel void ctc_word_means_batch(device const ulong* values [[buffer(0)]], const
     }
     if (bad) { atomic_fetch_or_explicit(invalid, bad, memory_order_relaxed); output[query] = 0x7ff8000000000000ul; return; }
     ulong sum = 0;
-    for (uint start = begin; start < end; start += 8192) sum = add_positive_double(sum, word_pairwise_sum(values, indices, start, min(8192u, end - start)));
+    for (uint start = begin; start < end; start += 8192) sum = add_positive_double(sum, word_pairwise_sum(values, indices, start, min(8192u, end - start), 1));
     output[query] = count ? divide_positive_double(sum, count) : 0x7ff8000000000000ul;
+}
+
+// Shared row queries select start minimum, end maximum and/or word mean from interleaved character triples.
+kernel void ctc_alignment_stats_batch(device const ulong* values [[buffer(0)]], constant Dimensions& dimensions [[buffer(1)]], device const uint* indices [[buffer(2)]], device const uint* offsets [[buffer(3)]], device const uint* modes [[buffer(4)]], device ulong* output [[buffer(5)]], device atomic_uint* invalid [[buffer(6)]], uint lane [[thread_position_in_threadgroup]], uint query [[threadgroup_position_in_grid]]) {
+    threadgroup ulong minima[256], maxima[256];
+    threadgroup uint counts[256], errors[256];
+    uint begin = offsets[query], end = offsets[query + 1], mode = modes[query];
+    if (mode == 0 || mode > 7 || begin > end || end > dimensions.count || end - begin > 32768 || (query == 0 && begin != 0) || (query + 1 == dimensions.frames && end != dimensions.count)) {
+        if (lane == 0) { atomic_fetch_or_explicit(invalid, 1u, memory_order_relaxed); for (uint j = 0; j < 3; ++j) output[query * 3 + j] = 0x7ff8000000000000ul; }
+        return;
+    }
+    ulong low = ~0ul, high = 0ul;
+    uint count = 0, bad = 0;
+    for (uint i = begin + lane; i < end; i += 256) {
+        uint row = indices[i];
+        if (row >= dimensions.vocabulary) { bad |= 1u; continue; }
+        if (mode & 1) {
+            ulong bits = values[row * 3], magnitude = bits & 0x7ffffffffffffffful;
+            if (magnitude <= 0x7ff0000000000000ul) {
+                if (bits == 0x8000000000000000ul) bad |= 2u;
+                else low = min(low, (bits >> 63) ? ~bits : bits ^ 0x8000000000000000ul);
+            }
+        }
+        if (mode & 2) {
+            ulong bits = values[row * 3 + 1], magnitude = bits & 0x7ffffffffffffffful;
+            if (magnitude <= 0x7ff0000000000000ul) {
+                if (bits == 0x8000000000000000ul) bad |= 2u;
+                else high = max(high, (bits >> 63) ? ~bits : bits ^ 0x8000000000000000ul);
+            }
+        }
+        if (mode & 4) {
+            ulong bits = values[row * 3 + 2], magnitude = bits & 0x7ffffffffffffffful;
+            if (magnitude > 0x7ff0000000000000ul) continue;
+            if (bits != 0 && (bits < 0x3f50624dd2f1a9fcul || bits > 0x3ff0000000000000ul)) bad |= 4u;
+            else ++count;
+        }
+    }
+    minima[lane] = low; maxima[lane] = high; counts[lane] = count; errors[lane] = bad;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride /= 2) {
+        if (lane < stride) { minima[lane] = min(minima[lane], minima[lane + stride]); maxima[lane] = max(maxima[lane], maxima[lane + stride]); counts[lane] += counts[lane + stride]; errors[lane] |= errors[lane + stride]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        for (uint j = 0; j < 3; ++j) output[query * 3 + j] = 0x7ff8000000000000ul;
+        if (errors[0]) { atomic_fetch_or_explicit(invalid, errors[0], memory_order_relaxed); return; }
+        ulong low_key = minima[0], high_key = maxima[0];
+        if ((mode & 1) && low_key != ~0ul) output[query * 3] = (low_key >> 63) ? low_key ^ 0x8000000000000000ul : ~low_key;
+        if ((mode & 2) && high_key != 0ul) output[query * 3 + 1] = (high_key >> 63) ? high_key ^ 0x8000000000000000ul : ~high_key;
+        if ((mode & 4) && counts[0]) {
+            ulong sum = 0;
+            for (uint start = begin; start < end; start += 8192) sum = add_positive_double(sum, word_pairwise_sum(values + 2, indices, start, min(8192u, end - start), 3));
+            output[query * 3 + 2] = divide_positive_double(sum, counts[0]);
+        }
+    }
 }

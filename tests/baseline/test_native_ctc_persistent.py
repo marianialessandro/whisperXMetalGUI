@@ -245,6 +245,125 @@ class PersistentNativeCTCTests(unittest.TestCase):
                 self.assertIs(alignment.pd, original_pd)
                 self.assertIs(alignment.nltk_load, loader)
 
+    def test_fused_alignment_stats_masks_csr_and_bitwise_long_word_means(self):
+        import pandas as pd
+        generator = np.random.default_rng(995)
+        with NativeCTC(self.library, self.identity) as context:
+            for length in (0, 1, 9, 129, 8193, 32768):
+                values = np.column_stack((generator.normal(size=length), generator.normal(size=length), generator.integers(0, 1001, length).astype(np.float64) / 1000))
+                values[::17, 0] = np.nan; values[::19, 1] = np.nan; values[::23, 2] = np.nan
+                groups = [list(range(length)), list(range(length))[::-1], [], list(range(min(length, 27))), [], [], []]
+                modes = np.arange(1, 8, dtype=np.uint32)
+                indices = np.asarray([i for group in groups for i in group], dtype=np.uint32)
+                offsets = np.asarray([0, *np.cumsum([len(group) for group in groups])], dtype=np.uint32)
+                actual, record = context.alignment_stats_batch(values, indices, offsets, modes)
+                for i, (group, mode) in enumerate(zip(groups, modes)):
+                    expected = [pd.Series(values[group, 0]).min() if mode & 1 else np.nan, pd.Series(values[group, 1]).max() if mode & 2 else np.nan, pd.Series(values[group, 2]).mean() if mode & 4 else np.nan]
+                    for result, reference in zip(actual[i], expected):
+                        if np.isnan(reference): self.assertTrue(np.isnan(result))
+                        else: self.assertEqual(result.tobytes(), np.float64(reference).tobytes())
+                self.assertEqual(record["command_buffers_per_run"], 1)
+                self.assertGreater(record["computation_gpu_seconds"], 0)
+                if length:
+                    full, _ = context.alignment_stats_batch(values, np.arange(length, dtype=np.uint32), np.array([0, length], dtype=np.uint32), np.array([7], dtype=np.uint32))
+                    self.assertEqual(full[0, 2].tobytes(), np.float64(pd.Series(values[:, 2]).mean()).tobytes())
+            values = np.array([[1., 2., .1], [3., 4., .3]])
+            indices, offsets = np.array([0, 1], dtype=np.uint32), np.array([0, 2], dtype=np.uint32)
+            for mode in (0, 8):
+                with self.assertRaisesRegex(ValueError, "metadata_invalid"): context.alignment_stats_batch(values, indices, offsets, np.array([mode], dtype=np.uint32))
+            with self.assertRaisesRegex(ValueError, "metadata_invalid"): context.alignment_stats_batch(values, np.array([0, 2], dtype=np.uint32), offsets, np.array([7], dtype=np.uint32))
+            with self.assertRaisesRegex(ValueError, "metadata_invalid"): context.alignment_stats_batch(values, indices, np.array([0, 0xffffffff], dtype=np.uint32), np.array([7], dtype=np.uint32))
+            values[0, 0] = -0.; values[0, 2] = -1.
+            ignored, _ = context.alignment_stats_batch(values, indices, offsets, np.array([2], dtype=np.uint32))
+            self.assertEqual(ignored[0, 1], 4.)
+            with self.assertRaisesRegex(ValueError, "negative_zero"): context.alignment_stats_batch(values, indices, offsets, np.array([1], dtype=np.uint32))
+            with self.assertRaisesRegex(ValueError, "values_invalid"): context.alignment_stats_batch(values, indices, offsets, np.array([4], dtype=np.uint32))
+
+    def test_fused_adapter_uses_shared_rows_and_reports_one_completion(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        rows = [{"char": char, "start": float(i), "end": float(i + 1), "score": None if i == 2 else .3, "word-idx": word} for i, (char, word) in enumerate(zip("a ? b", [0, 1, 1, 2, 2]))]
+        tokenizer = SimpleNamespace(span_tokenize=lambda text: iter([(0, 3), (3, 5)]))
+        original_pd = alignment.pd
+        with NativeCTC(self.library, self.identity) as context, patch.object(alignment, "nltk_load", return_value=tokenizer) as loader:
+            bounds, means = [], []
+            with native_timestamp_bounds_batched(alignment, context, bounds, fast_frames=True, word_means=True, mean_records=means, fused_reductions=True):
+                list(alignment.nltk_load("test").span_tokenize("a ? b"))
+                frame = alignment.pd.DataFrame(rows)
+                self.assertEqual(frame.loc[[0]]["start"].min(), 0.)
+                self.assertEqual(frame.loc[[0]]["end"].max(), 1.)
+                self.assertEqual(frame.loc[[0]]["score"].mean(), .3)
+                self.assertTrue(np.isnan(frame.loc[[2]]["score"].mean()))
+                self.assertEqual(frame.loc[[0, 1, 2, 3]]["start"].min(), 0.)
+                self.assertEqual(frame.loc[[0, 2]]["end"].max(), 3.)
+                with self.assertRaisesRegex(ValueError, "operation_not_requested"): frame.loc[[0]]["start"].max()
+                with self.assertRaisesRegex(ValueError, "subset_not_registered"): frame["score"].mean()
+                derived = frame.loc[[0]]
+                derived.loc[0, "score"] = .9
+                with self.assertRaisesRegex(ValueError, "snapshot_changed"): derived["score"].mean()
+            self.assertEqual(len(bounds), 1); self.assertEqual(len(means), 1)
+            self.assertEqual(bounds[0]["command_buffers_per_run"] + means[0]["command_buffers_per_run"], 1)
+            self.assertFalse(means[0]["separate_dispatch"])
+            self.assertEqual(means[0]["logical_cpu_to_native_bytes"], 0)
+            self.assertLess(bounds[0]["fused_subset_count"], bounds[0]["queries"] + means[0]["queries"])
+            self.assertEqual(bounds[0]["completion_group"], means[0]["completion_group"])
+            self.assertIs(alignment.pd, original_pd); self.assertIs(alignment.nltk_load, loader)
+
+    def test_fused_readback_stays_owned_across_reuse_and_concurrent_requests(self):
+        values = np.array([[1., 2., .1], [3., 4., .3]])
+        indices, offsets, modes = np.array([0, 1], dtype=np.uint32), np.array([0, 2], dtype=np.uint32), np.array([7], dtype=np.uint32)
+        with NativeCTC(self.library, self.identity) as context:
+            first, record = context.alignment_stats_batch(values, indices, offsets, modes)
+            saved = first.copy()
+            changed = np.array([[10., 20., .2], [30., 40., .4]])
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = [executor.submit(context.alignment_stats_batch, changed if i % 2 else values, indices, offsets, modes) for i in range(12)]
+                for i, future in enumerate(futures):
+                    actual, _ = future.result()
+                    expected = np.array([[10., 40., (.2 + .4) / 2]]) if i % 2 else saved
+                    np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+            np.testing.assert_array_equal(first.view(np.uint64), saved.view(np.uint64))
+            self.assertEqual(record["native_host_result_staging_bytes"], 0)
+            self.assertEqual(record["native_host_result_memcpy_calls"], 1)
+        with self.assertRaisesRegex(ValueError, "native_context_closed"): context.alignment_stats_batch(values, indices, offsets, modes)
+
+    def test_compact_plan_matches_fused_metadata_and_snapshot_bytes_on_boundary_spans(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        text = " α ? b \t."
+        rows, word = [], 0
+        for i, char in enumerate(text):
+            rows.append({"char": char, "start": None if i % 4 == 0 else i + .1, "end": None if i % 4 == 0 else i + .5, "score": None if i % 4 == 0 else .3, "word-idx": word})
+            if i == len(text) - 1 or text[i + 1] == " ": word += 1
+        tokenizer = SimpleNamespace(span_tokenize=lambda source: iter([(0, 3), (3, 99), (-2, 0), (8, 7)]))
+        captured, reference_bounds, reference_means, reports = [], None, None, []
+        with NativeCTC(self.library, self.identity) as context, patch.object(alignment, "nltk_load", return_value=tokenizer):
+            function = context.alignment_stats_batch
+            def capture(*arrays):
+                captured.append(tuple(array.copy() for array in arrays))
+                return function(*arrays)
+            with patch.object(context, "alignment_stats_batch", side_effect=capture):
+                for compact in (False, True):
+                    bounds, means = [], []
+                    with native_timestamp_bounds_batched(alignment, context, bounds, fast_frames=True, word_means=True, mean_records=means, fused_reductions=True, compact_plan=compact):
+                        list(alignment.nltk_load("test").span_tokenize(text))
+                        frame = alignment.pd.DataFrame(rows)
+                        actual_bounds = {key: (value[0].view(np.uint64).tobytes(), value[1]) for key, value in frame._native_batch_cache[0].items()}
+                        actual_means = {key: (value[0].tobytes(), value[1]) for key, value in frame._native_word_mean_cache[0].items()}
+                        if reference_bounds is None: reference_bounds, reference_means = actual_bounds, actual_means
+                        else:
+                            self.assertEqual(actual_bounds, reference_bounds)
+                            self.assertEqual(actual_means, reference_means)
+                        self.assertTrue(np.isnan(frame.loc[[]]["start"].min()))
+                    reports.append(bounds[0])
+            for original, compact in zip(captured[0], captured[1]): np.testing.assert_array_equal(original.view(np.uint64) if original.dtype == np.float64 else original, compact.view(np.uint64) if compact.dtype == np.float64 else compact)
+            self.assertLess(reports[1]["cpu_snapshot_subset_copies"], reports[0]["cpu_snapshot_subset_copies"])
+            self.assertEqual(reports[1]["cpu_snapshot_selected_values_bytes"], reports[0]["cpu_snapshot_selected_values_bytes"])
+            self.assertGreaterEqual(reports[1]["cpu_snapshot_gathered_values_bytes"], reports[1]["cpu_snapshot_selected_values_bytes"])
+            self.assertGreater(reports[1]["cpu_cache_preparation_wall_ns"], 0)
+            with self.assertRaisesRegex(ValueError, "requires_fused"):
+                with native_timestamp_bounds_batched(alignment, context, [], compact_plan=True): pass
+
     def test_buffer_growth_reuse_and_sentinel_paths_match_original(self):
         generator = np.random.default_rng(43)
         large = torch.log_softmax(torch.from_numpy(generator.normal(size=(341, 38)).astype(np.float32)), dim=-1)
