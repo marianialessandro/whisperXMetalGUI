@@ -40,6 +40,8 @@ int wxctc_scale_round_segments(wxctc_context* context, uint64_t generation, uint
 int wxctc_alignment_stats_resident(wxctc_context* context, uint64_t generation, uint32_t character_count, uint64_t ratio_bits, uint64_t offset_bits, const uint32_t* indices, uint64_t index_count, const uint32_t* offsets, uint64_t offset_count, const uint32_t* modes, uint64_t mode_count, uint64_t* output, uint32_t output_capacity, wxctc_max_result* result, char* error_code, uint32_t error_capacity);
 // Optional ABI v1 extension: the first mode_count*3 uint64 outputs are the original statistics, followed by mode_count NumPy-rounded mean scores; capacity must cover mode_count*4.
 int wxctc_alignment_stats_resident_rounded(wxctc_context* context, uint64_t generation, uint32_t character_count, uint64_t ratio_bits, uint64_t offset_bits, const uint32_t* indices, uint64_t index_count, const uint32_t* offsets, uint64_t offset_count, const uint32_t* modes, uint64_t mode_count, uint64_t* output, uint32_t output_capacity, wxctc_max_result* result, char* error_code, uint32_t error_capacity);
+// Optional ABI v1 extension: default nearest interpolation plus end filling for a zero-based contiguous index; NaN is missing, ties choose the preceding value, all-missing copies the first NaN payload; count is 1..32768.
+int wxctc_interpolate_nearest(wxctc_context* context, const uint64_t* values, uint64_t count, uint64_t* output, uint32_t output_capacity, wxctc_max_result* result, char* error_code, uint32_t error_capacity);
 // Calls on one context are serialized; destroy only after all calls have returned, without racing a new call.
 void wxctc_destroy(wxctc_context* context);
 

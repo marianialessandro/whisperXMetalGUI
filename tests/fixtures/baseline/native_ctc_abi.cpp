@@ -108,6 +108,11 @@ int main(int argc, char** argv) {
     assert(wxctc_alignment_stats_resident_rounded(context, generation, 1, 0x3f847ae147ae147bull, 0, resident_indices, 2, resident_offsets, 2, resident_modes, 1, rounded_statistics, 4, &maximum_result, error, sizeof(error)) == 0);
     assert(rounded_statistics[0] == resident_output[0] && rounded_statistics[1] == resident_output[1] && rounded_statistics[2] == resident_output[2]);
     assert(maximum_result.computation_gpu_seconds > 0);
+    uint64_t nearest_values[]{0, 0x7ff8000000000000ull, 0x3ff0000000000000ull}, nearest_output[]{123, 456, 789};
+    assert(wxctc_interpolate_nearest(context, nearest_values, 3, nearest_output, 2, &maximum_result, error, sizeof(error)) != 0 && nearest_output[0] == 123);
+    assert(wxctc_interpolate_nearest(context, nearest_values, 0, nearest_output, 3, &maximum_result, error, sizeof(error)) != 0 && nearest_output[2] == 789);
+    assert(wxctc_interpolate_nearest(context, nearest_values, 3, nearest_output, 3, &maximum_result, error, sizeof(error)) == 0);
+    assert(nearest_output[0] == 0 && nearest_output[1] == 0 && nearest_output[2] == 0x3ff0000000000000ull && maximum_result.computation_gpu_seconds > 0);
     uint64_t grown = 0;
     for (int iteration = 0; iteration < 8; ++iteration) {
         std::vector<float> large(256 * 4, -1);

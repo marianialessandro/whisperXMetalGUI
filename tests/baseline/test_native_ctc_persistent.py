@@ -619,6 +619,53 @@ class PersistentNativeCTCTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "requires_resident_reductions"):
                 with native_timestamp_bounds_batched(alignment, context, [], word_rounding=True): pass
 
+    def test_nearest_gpu_matches_original_pandas_scipy_random_missing_and_nan_payloads(self):
+        import pandas as pd
+        from whisperx.utils import interpolate_nans
+        generator = np.random.default_rng(301)
+        cases = [np.array([np.nan]), np.array([np.nan, 1., np.nan]), np.array([np.nan, 0., np.nan, np.nan, 4., np.nan]), np.array([0., np.nan, 2.]), np.array([-0., np.nan, 0.]), np.array([np.nan, np.inf, np.nan, -np.inf, np.nan]), np.array([0x7ff8000000001234, 0xfff8000000005678, 0x7ff0000000007890], dtype=np.uint64).view(np.float64)]
+        for size in [2, 7, 129, 1025, 8193, 32768]:
+            values = generator.normal(size=size); values[generator.random(size) < .73] = np.nan
+            cases.extend([values, values[::-2]])
+        with NativeCTC(self.library, self.identity) as context:
+            for values in cases:
+                expected = interpolate_nans(pd.Series(values)).to_numpy()
+                actual, record = context.interpolate_nearest(values)
+                np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+                self.assertEqual(record["command_buffers_per_run"], 1)
+                self.assertGreater(record["computation_gpu_seconds"], 0)
+            for invalid in [np.array([], dtype=np.float64), np.zeros(32769), np.zeros(1, dtype=np.float32)]:
+                with self.assertRaisesRegex(ValueError, "format_invalid"): context.interpolate_nearest(invalid)
+        with self.assertRaisesRegex(ValueError, "native_context_closed"): context.interpolate_nearest(np.array([1.]))
+
+    def test_nearest_adapter_preserves_series_metadata_and_rejects_unsupported_policy(self):
+        from unittest.mock import patch
+        import pandas as pd
+        from whisperx.utils import interpolate_nans
+        from tools.baseline.native_interpolation import native_nearest_interpolation
+        with NativeCTC(self.library, self.identity) as context:
+            records = []; original = alignment.interpolate_nans
+            with native_nearest_interpolation(alignment, context, records):
+                for series in [pd.Series([np.nan, 1., np.nan, np.nan, 4., np.nan], name="start"), pd.Series([None, None], dtype=object, name="end"), pd.Series([], dtype=np.float64, name="start")]:
+                    series.attrs = {"origin": "test"}
+                    expected = interpolate_nans(series)
+                    actual = alignment.interpolate_nans(series)
+                    pd.testing.assert_series_equal(actual, expected)
+                    self.assertEqual(actual.attrs, series.attrs)
+                    self.assertIsNot(actual, series)
+                    self.assertIs(alignment.interpolate_nans(series, method="ignore"), series)
+                for series in [pd.Series([1., np.nan], index=[1, 2]), pd.Series([1, 2], dtype="int64"), pd.Series([pd.NA], dtype="Float64")]:
+                    with self.assertRaises(ValueError): alignment.interpolate_nans(series)
+                with self.assertRaisesRegex(ValueError, "method_not_supported"): alignment.interpolate_nans(pd.Series([0., np.nan, 1.]), method="linear")
+            self.assertIs(alignment.interpolate_nans, original)
+            self.assertEqual([record["command_buffers_per_run"] for record in records], [1, 0, 0])
+            with self.assertRaisesRegex(RuntimeError, "forced"):
+                with native_nearest_interpolation(alignment, context, []): raise RuntimeError("forced")
+            self.assertIs(alignment.interpolate_nans, original)
+            with patch("tools.baseline.native_interpolation.scipy.__version__", "1.16.0"):
+                with self.assertRaisesRegex(ValueError, "runtime_or_records_not_supported"):
+                    with native_nearest_interpolation(alignment, context, []): pass
+
     def test_buffer_growth_reuse_and_sentinel_paths_match_original(self):
         generator = np.random.default_rng(43)
         large = torch.log_softmax(torch.from_numpy(generator.normal(size=(341, 38)).astype(np.float32)), dim=-1)

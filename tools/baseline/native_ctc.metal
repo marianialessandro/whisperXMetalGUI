@@ -503,3 +503,25 @@ ulong numpy_round3_score(ulong bits) {
 kernel void ctc_round_word_means(device const ulong* statistics [[buffer(0)]], constant Dimensions& dimensions [[buffer(1)]], device ulong* rounded [[buffer(2)]], uint query [[thread_position_in_grid]]) {
     if (query < dimensions.count) rounded[query] = numpy_round3_score(statistics[query * 3 + 2]);
 }
+
+// Linear GPU scans find valid neighbors without CPU interpolation or floating-point narrowing.
+kernel void ctc_nearest_neighbors(device const ulong* values [[buffer(0)]], constant Dimensions& dimensions [[buffer(1)]], device uint2* neighbors [[buffer(2)]]) {
+    uint previous = UINT_MAX;
+    for (uint i = 0; i < dimensions.count; ++i) {
+        if ((values[i] & 0x7ffffffffffffffful) <= 0x7ff0000000000000ul) previous = i;
+        neighbors[i].x = previous;
+    }
+    uint next = UINT_MAX;
+    for (uint i = dimensions.count; i > 0; --i) {
+        uint index = i - 1;
+        if ((values[index] & 0x7ffffffffffffffful) <= 0x7ff0000000000000ul) next = index;
+        neighbors[index].y = next;
+    }
+}
+
+kernel void ctc_nearest_fill(device const ulong* values [[buffer(0)]], constant Dimensions& dimensions [[buffer(1)]], device const uint2* neighbors [[buffer(2)]], device ulong* output [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index >= dimensions.count) return;
+    uint2 pair = neighbors[index];
+    uint selected = pair.x == UINT_MAX ? (pair.y == UINT_MAX ? 0 : pair.y) : pair.y == UINT_MAX ? pair.x : (index - pair.x <= pair.y - index ? pair.x : pair.y);
+    output[index] = values[selected];
+}

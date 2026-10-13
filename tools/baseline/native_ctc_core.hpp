@@ -54,13 +54,13 @@ class NativeCTCContext {
     id<MTLLibrary> library_;
     id<MTLComputePipelineState> max_pipeline_;
     id<MTLComputePipelineState> wildcard_validate_, wildcard_expand_;
-    id<MTLComputePipelineState> segment_pipeline_, bounds_pipeline_, batch_bounds_pipeline_, word_means_pipeline_, alignment_stats_pipeline_, round3_pipeline_, scale_round_pipeline_, word_round_pipeline_;
+    id<MTLComputePipelineState> segment_pipeline_, bounds_pipeline_, batch_bounds_pipeline_, word_means_pipeline_, alignment_stats_pipeline_, round3_pipeline_, scale_round_pipeline_, word_round_pipeline_, nearest_neighbors_pipeline_, nearest_fill_pipeline_;
     NSMutableArray<id<MTLComputePipelineState>>* pipelines_;
     NSArray<NSString*>* names_;
     id<MTLBuffer> e_, t_, invalid_, prefix_, rows_, path_, decisions_, endpoint_;
     id<MTLBuffer> max_values_, max_indices_;
     id<MTLBuffer> expanded_;
-    id<MTLBuffer> segment_bounds_, segment_means_, bounds_input_, bounds_output_, bounds_indices_, bounds_offsets_, stats_modes_, scale_parameters_, rounded_segments_, rounded_words_;
+    id<MTLBuffer> segment_bounds_, segment_means_, bounds_input_, bounds_output_, bounds_indices_, bounds_offsets_, stats_modes_, scale_parameters_, rounded_segments_, rounded_words_, nearest_neighbors_;
     uint64_t generation_counter_ = 0, resident_generation_ = 0, rounded_generation_ = 0, rounded_ratio_ = 0, rounded_offset_ = 0;
     uint32_t resident_count_ = 0, resident_frames_ = 0;
     bool compact_, batched_;
@@ -71,7 +71,7 @@ class NativeCTCContext {
         require(buffer != nil, "metal_allocation_failed");
     }
 
-    uint64_t allocated_bytes() const { return e_.length + t_.length + invalid_.length + prefix_.length + rows_.length + path_.length + decisions_.length + endpoint_.length + max_values_.length + max_indices_.length + expanded_.length + segment_bounds_.length + segment_means_.length + bounds_input_.length + bounds_output_.length + bounds_indices_.length + bounds_offsets_.length + stats_modes_.length + scale_parameters_.length + rounded_segments_.length + rounded_words_.length; }
+    uint64_t allocated_bytes() const { return e_.length + t_.length + invalid_.length + prefix_.length + rows_.length + path_.length + decisions_.length + endpoint_.length + max_values_.length + max_indices_.length + expanded_.length + segment_bounds_.length + segment_means_.length + bounds_input_.length + bounds_output_.length + bounds_indices_.length + bounds_offsets_.length + stats_modes_.length + scale_parameters_.length + rounded_segments_.length + rounded_words_.length + nearest_neighbors_.length; }
 
     void pipeline(id<MTLComputePipelineState> __strong& state, NSString* name) {
         if (state != nil) return;
@@ -258,6 +258,23 @@ public:
         const uint64_t* output = static_cast<const uint64_t*>(bounds_output_.contents);
         std::memcpy(caller_output, output, uint64_t(queries) * 24);
         if (word_rounding) std::memcpy(caller_output + uint64_t(queries) * 3, rounded_words_.contents, uint64_t(queries) * 8);
+        return {timing, allocated_bytes()};
+    }
+
+    NativeDirectStatsResult interpolate_nearest(const uint64_t* values, uint64_t count, uint64_t* output, uint64_t capacity) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(values != nullptr && output != nullptr && count > 0 && count <= 32768 && capacity >= count, "nearest_shape_or_output_invalid");
+        pipeline(nearest_neighbors_pipeline_, @"ctc_nearest_neighbors"); pipeline(nearest_fill_pipeline_, @"ctc_nearest_fill");
+        reserve(bounds_input_, count * 8); reserve(bounds_output_, count * 8); reserve(nearest_neighbors_, count * 8);
+        std::memcpy(bounds_input_.contents, values, count * 8);
+        auto started = std::chrono::steady_clock::now();
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "metal_command_creation_failed");
+        command.label = @"ctc_nearest_interpolation";
+        Dimensions dimensions{0, 0, static_cast<uint32_t>(count), 0};
+        encode(command, nearest_neighbors_pipeline_, @[bounds_input_, nearest_neighbors_], dimensions, 1, 1, 1, @"ctc_nearest_neighbors");
+        encode(command, nearest_fill_pipeline_, @[bounds_input_, nearest_neighbors_, bounds_output_], dimensions, 1, count, 256, @"ctc_nearest_fill");
+        auto timing = complete(command, started);
+        std::memcpy(output, bounds_output_.contents, count * 8);
         return {timing, allocated_bytes()};
     }
 

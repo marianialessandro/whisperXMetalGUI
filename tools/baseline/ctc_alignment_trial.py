@@ -177,6 +177,7 @@ def main(argv=None):
     parser.add_argument("--native-resident-character-rounding", action="store_true", help="Optional retained Metal character bounds/means, exact bounded binary64 scaling and rounding without intermediate character readback/reupload; requires --native-character-rounding. Original ratio calculation remains CPU.")
     parser.add_argument("--native-resident-reductions", action="store_true", help="Optional shared retained rounded character triples for fused statistics; verifies original row values and maps NaN positions without uploading character values. Requires --native-fused-reductions and --native-resident-character-rounding.")
     parser.add_argument("--native-word-rounding", action="store_true", help="Optional pinned NumPy three-decimal word mean rounding on Metal in the resident fused-stat command group; preserves unrounded numerical means. Requires --native-resident-reductions.")
+    parser.add_argument("--native-nearest-interpolation", action="store_true", help="Optional default nearest timestamp interpolation and end filling on Metal for pinned Pandas/SciPy and contiguous zero-based Series; requires native-persistent. Adds one command group per numerical Series.")
     args = parser.parse_args(argv)
     if not 1 <= args.replicas <= 10: parser.error("replicas must be between 1 and 10")
     if args.ctc_backend == "native" and (args.native_binary is None or args.native_binary_sha256 is None): parser.error("native backend requires binary and its expected SHA256")
@@ -186,6 +187,7 @@ def main(argv=None):
     if args.native_wildcard_max and args.ctc_backend != "native-persistent": parser.error("--native-wildcard-max requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.ctc_backend != "native-persistent": parser.error("--native-fused-wildcard requires --ctc-backend native-persistent")
     if args.native_fused_wildcard and args.native_wildcard_max: parser.error("wildcard modes are mutually exclusive")
+    if args.native_nearest_interpolation and args.ctc_backend != "native-persistent": parser.error("native nearest interpolation requires native-persistent")
     if args.native_word_rounding and not args.native_resident_reductions: parser.error("native word rounding requires resident reductions")
     if args.native_resident_reductions and (not args.native_fused_reductions or not args.native_resident_character_rounding): parser.error("native resident reductions require fused reductions and resident character rounding")
     if args.native_resident_character_rounding and not args.native_character_rounding: parser.error("native resident character rounding requires native character rounding")
@@ -213,15 +215,18 @@ def main(argv=None):
         wildcard_spans = []
         timestamp_spans = []
         mean_spans = []
-        rounding_spans = []
+        rounding_spans, interpolation_spans = [], []
         native_identity = None
         if args.ctc_backend == "native":
             args.native_binary = args.native_binary.resolve(strict=True)
             if manifest.sha256(args.native_binary) != args.native_binary_sha256: raise ValueError("native_binary_hash_mismatch")
             native_identity = {"binary_sha256": args.native_binary_sha256, "shader_sha256": manifest.sha256(Path(__file__).with_name("native_ctc.metal"))}
         @contextlib.contextmanager
-        def candidate_context(records, maximum_records, bounds_records, word_records, round_records):
+        def candidate_context(records, maximum_records, bounds_records, word_records, round_records, interpolate_records):
             with contextlib.ExitStack() as scopes:
+                if args.native_nearest_interpolation:
+                    from tools.baseline.native_interpolation import native_nearest_interpolation
+                    scopes.enter_context(native_nearest_interpolation(alignment, persistent, interpolate_records))
                 if args.native_timestamp_bounds_batched:
                     from tools.baseline.native_timestamp_bounds import native_timestamp_bounds_batched
                     scopes.enter_context(native_timestamp_bounds_batched(alignment, persistent, bounds_records, fast_frames=args.native_timestamp_fast_frames, word_means=args.native_word_means, mean_records=word_records, fused_reductions=args.native_fused_reductions, compact_plan=args.native_compact_reduction_plan, resident_reductions=args.native_resident_reductions, word_rounding=args.native_word_rounding))
@@ -248,7 +253,7 @@ def main(argv=None):
             model, metadata = whisperx.load_align_model(args.language, "mps")
             if args.warmup:
                 alignment.align(original["segments"], model, metadata, audio, "mps", return_char_alignments=args.return_char_alignments)
-                with candidate_context([], [], [], [], []): alignment.align(original["segments"], model, metadata, audio, "mps", return_char_alignments=args.return_char_alignments)
+                with candidate_context([], [], [], [], [], []): alignment.align(original["segments"], model, metadata, audio, "mps", return_char_alignments=args.return_char_alignments)
                 torch.mps.synchronize()
             baseline_times, candidate_times, matches, orders = [], [], [], []
             for replica in range(args.replicas):
@@ -258,7 +263,7 @@ def main(argv=None):
                 for backend in order:
                     torch.mps.synchronize()
                     started = time.perf_counter_ns()
-                    with candidate_context(spans, wildcard_spans, timestamp_spans, mean_spans, rounding_spans) if backend == "candidate" else contextlib.nullcontext(): results[backend] = alignment.align(original["segments"], model, metadata, audio, "mps", return_char_alignments=args.return_char_alignments)
+                    with candidate_context(spans, wildcard_spans, timestamp_spans, mean_spans, rounding_spans, interpolation_spans) if backend == "candidate" else contextlib.nullcontext(): results[backend] = alignment.align(original["segments"], model, metadata, audio, "mps", return_char_alignments=args.return_char_alignments)
                     torch.mps.synchronize()
                     elapsed = time.perf_counter_ns() - started
                     (baseline_times if backend == "original" else candidate_times).append(elapsed)
@@ -276,6 +281,8 @@ def main(argv=None):
         report["native_fused_wildcard_dispatch_count"] = sum(record.get("wildcard_fused") is True for record in spans)
         report["native_character_rounding_enabled"], report["character_rounding_spans"] = args.native_character_rounding, rounding_spans
         report["native_character_rounding_dispatch_count"] = len(rounding_spans)
+        report["native_nearest_interpolation_enabled"], report["interpolation_spans"] = args.native_nearest_interpolation, interpolation_spans
+        report["native_nearest_interpolation_dispatch_count"] = sum(record["dispatch_completed"] for record in interpolation_spans)
         report["native_word_rounding_enabled"] = args.native_word_rounding
         report["native_resident_reductions_enabled"] = args.native_resident_reductions
         report["native_resident_character_rounding_enabled"] = args.native_resident_character_rounding
@@ -315,8 +322,12 @@ def main(argv=None):
             report["residuals"].append("cpu_final_rounded_character_readback_and_dataframe_upload")
         if args.native_resident_reductions: report["residuals"][-1] = "cpu_final_character_readback_dataframe_fingerprints_and_row_mapping_no_character_reupload"
         if args.native_word_rounding: report["residuals"][2] = "cpu_ratio_calculation_interpolation_selection_and_snapshot_validation"
+        if args.native_nearest_interpolation:
+            report["residuals"][2] = report["residuals"][2].replace("_interpolation", "")
+            report["residuals"].append("cpu_interpolation_series_metadata_and_upload_readback")
+            if args.native_word_rounding: report["residuals"][2] = "cpu_ratio_calculation_selection_snapshot_validation_and_series_metadata"
         with (args.output_dir / "comparison.json").open("x") as output: json.dump(report, output, indent=2)
-        print(json.dumps({key: value for key, value in report.items() if key not in ("ctc_spans", "wildcard_spans", "timestamp_bounds_spans", "word_mean_spans", "character_rounding_spans")}))
+        print(json.dumps({key: value for key, value in report.items() if key not in ("ctc_spans", "wildcard_spans", "timestamp_bounds_spans", "word_mean_spans", "character_rounding_spans", "interpolation_spans")}))
         return 0 if all(matches) else 2
     except (OSError, ValueError, RuntimeError, KeyError, StopIteration, AttributeError, subprocess.TimeoutExpired):
         print(json.dumps({"status": "trial_failed", "code": "ctc_alignment_trial_failed", "full_baseline_gate_passed": False}))
