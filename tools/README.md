@@ -36,3 +36,17 @@ This path performs stable turn ordering, timestamp intersections, per-speaker ov
 The experimental domain is at most 4096 turns and 256 speakers per call, with batches of at most 4096 queries and one million queries per transcript. Timestamps must be finite, nonnegative, ordered within each interval, and at most 2^32 seconds; negative zero and nonzero values smaller than 2^-900 are rejected. Query timestamps support Python binary64-compatible scalars, including the existing native alignment scalar subclasses; float32 query scalars are rejected because their original midpoint policy can differ. No unsupported case falls back to CPU assignment. Stable ranking currently uses quadratic work in the number of turns, bounded by the explicit turn limit; this is a correctness implementation with no speedup claim.
 
 `operations.speaker_assignment` in the private run report records both kernels, actual command-buffer GPU duration, retained buffer capacity, logical uploads and compact label readback bytes. Segmentation, embeddings, clustering and other community-1 operations keep their existing backends; this flag does not move the entire diarization pipeline to GPU.
+
+## Native embedding-normalization primitive
+
+The separate `tools/baseline/native_embedding.py` experiment builds a C ABI library for float32 row normalization, the operation preceding community-1 centroid linkage:
+
+```bash
+.venv/bin/python tools/baseline/native_embedding.py --build .cache/native/embedding.dylib
+```
+
+Use `NativeEmbeddingNormalization(library_path, library_sha256)` as a context manager and call `normalize(contiguous_float32_matrix)`; it returns a new array and a metadata-only dispatch report. The matrix remains unchanged, including readonly arrays. This primitive is deliberately separate from the pipeline hooks: `metal_cli.py` still uses the original clustering and PLDA/VBx implementation.
+
+The kernel computes squared components, the contiguous NumPy pairwise reduction order, square root and division in one Metal command buffer. Fast math is disabled. The experimental domain is 1–4096 rows and 1–1024 components; finite nonzero components must have magnitude between 2^-32 and 2^32. Zero components and signed zero are supported, but an entirely zero row is rejected because the current primitive has no NaN-output contract. Unsupported dtypes, strided arrays and values outside this domain fail explicitly without CPU normalization. Input validation runs on the host; normalization arithmetic runs on Metal.
+
+Input and normalized output cross the host boundary as float32 arrays. Two retained shared buffers use at most 32 MiB total; initialization, wall time, actual GPU completion time, logical upload/readback sizes and retained capacity are reported separately. Logical bytes are not physical-copy measurements. Tests compare float32 bits with NumPy over reduction boundaries, realistic dimensions, signed zero, extreme supported magnitudes and repeated/threaded calls. The C ABI is also exercised under AddressSanitizer and UndefinedBehaviorSanitizer. Identical results on those cases establish bounded parity evidence; integration into clustering, complete numerical-domain certification and end-to-end quality/performance remain pending.
