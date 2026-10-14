@@ -43,7 +43,7 @@ def summarize(audit, spans):
     return {"scope": audit["scope"], **counts, "failed_dispatches": audit["failed_dispatches"], "physical_copy_bytes": None, "mlx_transfer_coverage": "unobserved", "compiled_backend_internal_transfer_coverage": "unobserved", "other_thread_transfer_coverage": "unobserved", "numerical_values_retained": False, "benchmark_timing_eligible": False, "full_pipeline_gpu_certified": False}
 
 
-def capture(root, snapshot, catalog, licenses, case_id, quality, voices, source, runtime, reference_root, specs, bridge=None, timeout=1800):
+def capture(root, snapshot, catalog, licenses, case_id, quality, voices, source, runtime, reference_root, specs, bridge=None, timeout=1800, python_readbacks=False):
     corpus.require(Path(snapshot).name == snapshot and snapshot not in ("", ".", "..") and 30 <= timeout <= 1800, "transfer_settings_invalid")
     folder = corpus.safe_target(root, snapshot)
     corpus.require(not folder.exists(), "transfer_destination_exists")
@@ -75,12 +75,13 @@ def capture(root, snapshot, catalog, licenses, case_id, quality, voices, source,
     token = None
     request = {}
     owned = {}
+    observer_options = ["--python-readback-report", folder / "python-readbacks.json"] if python_readbacks else []
     try:
         token = provision.read_credential(bridge) if voices else None
         request = dict(settings, audio=str(corpus.safe_target(root, asset["path"])), token=token)
         common = {"cache_root": hf_cache, "torch_home": torch_cache}
         first = run.execute(runtime, [source / "tools/baseline/offline_worker.py", "--worker", source / "macOS/Worker/transcribe_worker.py", "--source-root", source, "--seed", "1729"], dict(request, output=str(original)), timeout, **common)
-        second = run.execute(runtime, [source / "tools/observability/worker.py", "--transfer-report", folder / "transfers.json", "--worker", source / "macOS/Worker/transcribe_worker.py", "--source-root", source, "--spans", folder / "spans.json", "--run-id", snapshot, "--synchronized", "--seed", "1729"], dict(request, output=str(observed)), timeout, process_audit=owned, **common)
+        second = run.execute(runtime, [source / "tools/observability/worker.py", "--transfer-report", folder / "transfers.json", *observer_options, "--worker", source / "macOS/Worker/transcribe_worker.py", "--source-root", source, "--spans", folder / "spans.json", "--run-id", snapshot, "--synchronized", "--seed", "1729"], dict(request, output=str(observed)), timeout, process_audit=owned, **common)
     finally:
         request.clear()
         token = None
@@ -92,8 +93,17 @@ def capture(root, snapshot, catalog, licenses, case_id, quality, voices, source,
     corpus.require(spans["run_id"] == snapshot and spans["timing_kind"] == "synchronized_completion" and owned.get("pid") == spans["pid"] and owned.get("returncode") == 0, "transfer_span_identity_invalid")
     freeze.seal(root, snapshot + "/controller.json", owned)
     report = {"schema_version": 1, "status": "paired_transfer_audit_verified", "paired_equivalent": True, "snapshot": snapshot, **summarize(json.loads((folder / "transfers.json").read_text()), spans)}
+    if python_readbacks:
+        report["python_method_readbacks"] = method_summary(folder, spans)
     report["artifacts"] = released_baseline.artifact_hashes(root, snapshot)
     return report, freeze.seal(root, snapshot + "/review.json", report)
+
+
+def method_summary(folder, spans):
+    from tools.observability import python_readbacks
+    report = json.loads((folder / "python-readbacks.json").read_text())
+    corpus.require(report.get("pid") == spans["pid"] and report.get("status") == "python_readback_audit_completed", "python_readback_identity_invalid")
+    return python_readbacks.summarize(report, spans)
 
 
 def verify(root, snapshot, checksum):
@@ -117,6 +127,9 @@ def verify(root, snapshot, checksum):
         corpus.require(run.semantic_bundle(folder / name, semantics[name]["events"], semantics["basename"]) == semantics[name], "transfer_pair_artifacts_changed")
     corpus.require(not semantics["original"]["events"][-1]["warnings"] and not semantics["observed"]["events"][-1]["warnings"] and contracts.equivalent(semantics["original"], semantics["observed"], semantics["original"]["events"][-1]["output"], semantics["observed"]["events"][-1]["output"]), "transfer_pair_semantics_changed")
     rebuilt = summarize(json.loads((folder / "transfers.json").read_text()), spans)
+    if "python_method_readbacks" in report:
+        corpus.require(snapshot + "/python-readbacks.json" in report["artifacts"], "python_readback_artifact_missing")
+        rebuilt["python_method_readbacks"] = method_summary(folder, spans)
     corpus.require(all(report.get(key) == value for key, value in rebuilt.items()), "transfer_review_changed")
     return report
 
@@ -128,6 +141,7 @@ def main(argv=None):
     parser.add_argument("--case-id")
     parser.add_argument("--quality", choices=tuple(contracts.PROFILES), default="Rapida")
     parser.add_argument("--voices", action="store_true")
+    parser.add_argument("--python-readbacks", action="store_true", help="Optional separate Tensor.cpu/numpy method observations, including inference tensor API boundaries.")
     parser.add_argument("--bridge", type=Path, help="Private credential bridge for optional voice diagnostics; credentials only in memory/stdin.")
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--verify-sha256", help="Archive-only verification; requires just evidence-root and snapshot.")
@@ -140,8 +154,10 @@ def main(argv=None):
             report = verify(args.evidence_root, args.snapshot, args.verify_sha256)
             checksum = args.verify_sha256
         else:
-            report, checksum = capture(args.evidence_root.resolve(strict=True), args.snapshot, json.loads(args.catalog.read_text()), json.loads(args.licenses.read_text()), args.case_id, args.quality, args.voices, args.source_root.resolve(strict=True), args.runtime.resolve(strict=True), args.reference_root.resolve(strict=True), json.loads(args.model_specs.read_text()), args.bridge, args.timeout)
-        print(json.dumps({"status": report["status"], "sha256": checksum, "device_to_host_source_logical_bytes": report["device_to_host_source_logical_bytes"], "full_pipeline_gpu_certified": False}))
+            report, checksum = capture(args.evidence_root.resolve(strict=True), args.snapshot, json.loads(args.catalog.read_text()), json.loads(args.licenses.read_text()), args.case_id, args.quality, args.voices, args.source_root.resolve(strict=True), args.runtime.resolve(strict=True), args.reference_root.resolve(strict=True), json.loads(args.model_specs.read_text()), args.bridge, args.timeout, args.python_readbacks)
+        summary = {"status": report["status"], "sha256": checksum, "device_to_host_source_logical_bytes": report["device_to_host_source_logical_bytes"], "full_pipeline_gpu_certified": False}
+        if "python_method_readbacks" in report: summary["python_method_readbacks"] = report["python_method_readbacks"]
+        print(json.dumps(summary))
         return 0
     except (ValueError, OSError, KeyError, TypeError, StopIteration):
         print(json.dumps({"status": "transfer_audit_incomplete", "full_pipeline_gpu_certified": False}))
