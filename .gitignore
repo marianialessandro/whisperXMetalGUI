@@ -174,3 +174,4 @@ cython_debug/
 macOS/.build/
 macOS/.packaging/
 macOS/output/
+outputs/

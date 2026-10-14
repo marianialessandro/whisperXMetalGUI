@@ -27,6 +27,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
     # fmt: off
 
     model_name: str = args.pop("model")
+    asr_backend = args.pop("asr_backend", "faster-whisper")
     batch_size: int = args.pop("batch_size")
     model_dir: str = args.pop("model_dir")
     model_cache_only: bool = args.pop("model_cache_only")
@@ -125,25 +126,11 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
     # Part 1: VAD & ASR Loop
     results = []
     # model = load_model(model_name, device=device, download_root=model_dir)
-    model = load_model(
-        model_name,
-        device=device,
-        device_index=device_index,
-        download_root=model_dir,
-        compute_type=compute_type,
-        language=args["language"],
-        asr_options=asr_options,
-        vad_method=vad_method,
-        vad_options={
-            "chunk_size": chunk_size,
-            "vad_onset": vad_onset,
-            "vad_offset": vad_offset,
-        },
-        task=task,
-        local_files_only=model_cache_only,
-        threads=faster_whisper_threads,
-        use_auth_token=hf_token,
-    )
+    if asr_backend == "mlx":
+        from whisperx.mlx_asr import MlxPipeline
+        model = MlxPipeline(model_name, language=args["language"], task=task, compute_type=compute_type, download_root=model_dir, local_files_only=model_cache_only, asr_options=asr_options)
+    else:
+        model = load_model(model_name, device=device, device_index=device_index, download_root=model_dir, compute_type=compute_type, language=args["language"], asr_options=asr_options, vad_method=vad_method, vad_options={"chunk_size": chunk_size, "vad_onset": vad_onset, "vad_offset": vad_offset}, task=task, local_files_only=model_cache_only, threads=faster_whisper_threads, use_auth_token=hf_token)
 
     for audio_path in args.pop("audio"):
         audio = load_audio(audio_path)
@@ -160,6 +147,8 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
         results.append((result, audio_path))
 
     # Unload Whisper and VAD
+    if asr_backend == "mlx":
+        model.unload()
     del model
     gc.collect()
     torch.cuda.empty_cache()
@@ -188,7 +177,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                     align_model, align_metadata = load_align_model(
                         result["language"], device, model_dir=model_dir, model_cache_only=model_cache_only
                     )
-                logger.info("Performing alignment...")
+                logger.info(f"Performing alignment (PyTorch device: {device})...")
                 result: AlignedTranscriptionResult = align(
                     result["segments"],
                     align_model,
@@ -214,7 +203,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                 "No --hf_token provided, needs to be saved in environment variable, otherwise will throw error loading diarization model"
             )
         tmp_results = results
-        logger.info("Performing diarization...")
+        logger.info(f"Performing diarization (PyTorch device: {device})...")
         logger.info(f"Using model: {diarize_model_name}")
         results = []
         diarize_model = DiarizationPipeline(model_name=diarize_model_name, token=hf_token, device=device, cache_dir=model_dir)

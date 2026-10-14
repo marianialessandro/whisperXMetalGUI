@@ -1,5 +1,21 @@
 <h1 align="center">WhisperX</h1>
 
+## Apple GPU from the command line
+
+Run the checkout directly on Apple Silicon, using a standalone Python environment and FFmpeg installed on the system:
+
+```bash
+uv venv --python 3.12.12 .venv
+uv pip install --python .venv/bin/python -e '.[apple]'
+.venv/bin/python -m whisperx recording.wav --asr_backend mlx --model base --device mps --language it --output_dir outputs/recording
+```
+
+`--asr_backend mlx` uses MLX/Metal for recognition; `--device mps` selects PyTorch/MPS for alignment and optional `--diarize`. The existing FasterWhisper CLI remains the default. MLX uses its own long-audio decoder, without FasterWhisper VAD, batching or beam-search settings. Use `--initial_prompt` for context; hotwords, numeral suppression and interleaved context are rejected. Supported precision values are `default`, `float16` and `float32`. A short model name selects `mlx-community/whisper-<name>-mlx`; a Hugging Face repository or local model directory can also be supplied.
+
+Models can be cached outside the checkout using `HF_HUB_CACHE` and `TORCH_HOME`. For offline execution, populate these caches first and add `HF_HUB_OFFLINE=1` and `--model_cache_only True`. Outputs go to the requested directory. This CLI does not load an app bundle or require a packaged runtime. GPU use does not imply that every operation runs on GPU: audio decoding, CTC processing, clustering and exports also involve the CPU.
+
+For TorchCodec 0.7 on a Homebrew installation with FFmpeg 7, set `DYLD_LIBRARY_PATH=/opt/homebrew/opt/ffmpeg@7/lib` when launching Python so the matching shared libraries can be found.
+
 ## Recall.ai - Meeting Transcription API
 
 If you’re looking for a transcription API for meetings, consider checking out [Recall.ai's Meeting Transcription API](https://www.recall.ai/product/meeting-transcription-api?utm_source=github&utm_medium=sponsorship&utm_campaign=mbain-whisperx), an API that works with Zoom, Google Meet, Microsoft Teams, and more. Recall.ai diarizes by pulling the speaker data and separate audio streams from the meeting platforms, which means 100% accurate speaker diarization with actual speaker names.
