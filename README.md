@@ -16,6 +16,8 @@ Models can be cached outside the checkout using `HF_HUB_CACHE` and `TORCH_HOME`.
 
 For TorchCodec 0.7 on a Homebrew installation with FFmpeg 7, set `DYLD_LIBRARY_PATH=/opt/homebrew/opt/ffmpeg@7/lib` when launching Python so the matching shared libraries can be found.
 
+The separate [native CTC development CLI](tools/README.md) can run experimental Metal trellis/backtracking and resident timestamp statistics directly from MPS emissions, with an explicit native library hash and a private per-run report.
+
 ## Recall.ai - Meeting Transcription API
 
 If you’re looking for a transcription API for meetings, consider checking out [Recall.ai's Meeting Transcription API](https://www.recall.ai/product/meeting-transcription-api?utm_source=github&utm_medium=sponsorship&utm_campaign=mbain-whisperx), an API that works with Zoom, Google Meet, Microsoft Teams, and more. Recall.ai diarizes by pulling the speaker data and separate audio streams from the meeting platforms, which means 100% accurate speaker diarization with actual speaker names.
