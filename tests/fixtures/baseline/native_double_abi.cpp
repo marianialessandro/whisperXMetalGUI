@@ -8,6 +8,7 @@
 struct DoubleMetrics { uint32_t version, kernels; uint64_t wall_ns; double gpu_seconds; uint64_t allocated_bytes; };
 extern "C" int wxdouble_create(const char*, uint64_t, void**, char*, uint32_t);
 extern "C" int wxdouble_normalize(void*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_matmul(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -37,6 +38,24 @@ int main(int argc, char** argv) {
     assert(output[0] == 91. && output[1] == 92.);
     input[0] = 3.; input[1] = 4.;
     assert(wxdouble_normalize(context, input, 1, 2, 0, output, &metrics, error, sizeof(error)) == 0);
+    input[0] = 3.; input[1] = 4.;
+    double right[] = {2., -1.};
+    assert(wxdouble_matmul(context, input, right, 1, 2, 1, output, &metrics, error, sizeof(error)) == 0 && output[0] == 2.);
+    output[0] = 91.;
+    assert(wxdouble_matmul(context, input, right, 1, 1025, 1, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_matmul(context, input, right, 4096, 1024, 9, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_matmul(nullptr, input, right, 1, 2, 1, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_matmul(context, nullptr, right, 1, 2, 1, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_matmul(context, input, nullptr, 1, 2, 1, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_matmul(context, input, right, 1, 2, 1, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(output[0] == 91.);
     wxdouble_destroy(context);
     wxdouble_destroy(nullptr);
+    std::string legacy_shader = shader.substr(0, shader.find("\nstruct MatrixDimensions"));
+    context = nullptr;
+    assert(wxdouble_create(legacy_shader.data(), legacy_shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    assert(wxdouble_normalize(context, input, 1, 2, 0, output, &metrics, error, sizeof(error)) == 0 && output[0] == .6 && output[1] == .8);
+    output[0] = 91.;
+    assert(wxdouble_matmul(context, input, right, 1, 2, 1, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
+    wxdouble_destroy(context);
 }

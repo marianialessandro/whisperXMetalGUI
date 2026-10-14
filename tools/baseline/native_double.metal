@@ -105,3 +105,25 @@ kernel void double_normalize(device const ulong* input [[buffer(0)]], constant D
         output[start + column] = divide_positive_binary64(value & (sign - 1), norm) | (value & sign);
     }
 }
+
+struct MatrixDimensions { uint rows, inner, columns; };
+
+// Zero-sign handling here follows IEEE addition, including the positive-zero result of opposite signed zeros.
+ulong matrix_add(ulong a, ulong b) {
+    ulong sign = 1ul << 63;
+    if (((a | b) & (sign - 1)) == 0) return a & b & sign;
+    return add_signed_double(a, b);
+}
+
+// Each output has an explicit increasing-inner-index sum with separately rounded products and additions.
+kernel void double_matmul(device const ulong* left [[buffer(0)]], constant MatrixDimensions& d [[buffer(1)]], device const ulong* right [[buffer(2)]], device ulong* output [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index >= d.rows * d.columns) return;
+    uint row = index / d.columns, column = index % d.columns;
+    ulong sign = 1ul << 63, sum = 0;
+    for (uint inner = 0; inner < d.inner; ++inner) {
+        ulong a = left[row * d.inner + inner], b = right[inner * d.columns + column];
+        ulong product = multiply_positive_binary64(a & (sign - 1), b & (sign - 1)) | ((a ^ b) & sign);
+        sum = matrix_add(sum, product);
+    }
+    output[index] = sum;
+}

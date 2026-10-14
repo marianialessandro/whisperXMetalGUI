@@ -5,6 +5,8 @@ import sys
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -89,6 +91,51 @@ class NativeDoubleTests(unittest.TestCase):
         context.close()
         with self.assertRaisesRegex(ValueError, "closed"):
             context.normalize(np.ones((1, 8), dtype=np.float64))
+
+    def ordered_product(self, left, right):
+        result = np.zeros((len(left), right.shape[1]), dtype=np.float64)
+        for k in range(left.shape[1]):
+            result = np.add(result, np.multiply(left[:, k, None], right[k, None, :]))
+        return result
+
+    def test_matrix_products_match_separately_rounded_sequential_reference(self):
+        rng = np.random.default_rng(917)
+        with self.context() as context:
+            for inner in (1, 7, 8, 31, 128, 256, 1024):
+                left, right = rng.normal(size=(17, inner)), rng.normal(size=(inner, 19))
+                expected = self.ordered_product(left, right)
+                actual, record = context.matmul(left, right)
+                np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+                self.assertGreater(record["computation_gpu_seconds"], 0)
+                self.assertFalse(record["reference_blas_bitwise_certified"])
+                self.assertEqual(record["logical_result_readback_bytes"], actual.nbytes)
+            left = np.array([[2. ** 100, -(2. ** 100), 2. ** -100, 0., -0.], [1., np.nextafter(-1., 0.), -0., 2., -2.]])
+            right = np.array([[2. ** 100, 1.], [2. ** 100, 1.], [2. ** -100, 1.], [-0., 1.], [0., 1.]])
+            actual, _ = context.matmul(left, right)
+            np.testing.assert_array_equal(actual.view(np.uint64), self.ordered_product(left, right).view(np.uint64))
+            self.compare(context, np.ones((1, 256)))
+
+    def test_matrix_validation_lifetime_hash_capability_and_work_budget(self):
+        with self.context() as context:
+            valid = np.ones((2, 8))
+            for left, right in ((valid.astype(np.float32), valid.T.copy()), (valid[:, ::2], valid.T.copy()), (valid, np.ones((7, 3))), (np.ones((4096, 1024)), np.ones((1024, 9)))):
+                with self.assertRaises(ValueError):
+                    context.matmul(left, right)
+            for invalid in (np.inf, np.nan, 2. ** 101, 2. ** -101):
+                with self.assertRaisesRegex(ValueError, "domain_invalid"):
+                    context.matmul(np.full((2, 8), invalid), valid.T.copy())
+            left, right = valid.copy(), valid.T.copy()
+            left.flags.writeable = right.flags.writeable = False
+            actual, _ = context.matmul(left, right)
+            np.testing.assert_array_equal(actual, np.full((2, 2), 8.))
+            with patch.object(context, "library", SimpleNamespace()), self.assertRaisesRegex(ValueError, "abi_unavailable"):
+                context.matmul(left, right)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(context.matmul, left, right) for _ in range(4)]
+                for future in futures:
+                    np.testing.assert_array_equal(future.result()[0], actual)
+        with self.assertRaisesRegex(ValueError, "closed"):
+            context.matmul(left, right)
 
     def test_native_abi_under_address_and_undefined_sanitizers(self):
         root = Path(__file__).resolve().parents[2]

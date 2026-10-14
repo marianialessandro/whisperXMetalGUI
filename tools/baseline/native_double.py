@@ -90,6 +90,35 @@ class NativeDoubleNormalization:
             raise ValueError("double_native_result_invalid")
         return output, {"scope": "experimental_native_double_normalization", "reduction_order": reduction_order, "arithmetic": "bounded_binary64_integer_emulation", "rows": rows, "columns": columns, "gpu_kernels": ["double_normalize"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
 
+    def matmul(self, left, right):
+        for values in (left, right):
+            if not isinstance(values, np.ndarray) or values.dtype != np.float64 or values.ndim != 2 or not values.flags.c_contiguous:
+                raise ValueError("double_matrix_input_format_invalid")
+        rows, inner = left.shape
+        if right.shape[0] != inner or not 0 < rows <= 4096 or not 0 < inner <= 1024 or not 0 < right.shape[1] <= 1024:
+            raise ValueError("double_matrix_shape_invalid")
+        columns = right.shape[1]
+        if rows * inner * columns > 32 * 1024 * 1024:
+            raise ValueError("double_matrix_work_budget_invalid")
+        output = np.empty((rows, columns), dtype=np.float64)
+        metrics = Metrics()
+        error = ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                operation = self.library.wxdouble_matmul
+            except AttributeError as failure:
+                raise ValueError("double_matrix_abi_unavailable") from failure
+            operation.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            operation.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if operation(self.context, left.ctypes.data, right.ctypes.data, rows, inner, columns, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 1 or not np.isfinite(output).all():
+            raise ValueError("double_matrix_native_result_invalid")
+        return output, {"scope": "experimental_native_binary64_matrix_product", "rows": rows, "inner": inner, "columns": columns, "accumulation_policy": "sequential_separately_rounded_binary64_multiply_add", "reference_blas_bitwise_certified": False, "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": ["double_matmul"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": left.nbytes + right.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
