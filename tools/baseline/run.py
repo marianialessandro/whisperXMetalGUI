@@ -242,6 +242,7 @@ def main(argv=None):
     run.add_argument("--seed", type=int, help="Optional explicit paired bootstrap RNG seed; default legacy policy remains unchanged, and freeze must retain the selected seed policy.")
     run.add_argument("--synchronized", action="store_true", help="Instrumented process drains registered MLX/MPS work; dispatch still requires reviewed trace evidence.")
     evaluate = sub.add_parser("evaluate", help="Score a licensed natural_annotated case; parity_only is never natural accuracy.")
+    evaluate.add_argument("--reference-policy", choices=("independent-human", "released-dataset"), default="independent-human", help="Optional released-dataset benchmark: use source-verified FLEURS/AMI references directly without local review passes. Text/timing/turn reference agreement remains distinct from independently reviewed timing accuracy; default human-annotation evaluation stays unchanged.")
     evaluate.add_argument("--case-id", required=True)
     evaluate.add_argument("--result", required=True, help="Result JSON path relative to evidence root.")
     evaluate.add_argument("--speaker-turns", help="Optional actual pyannote turn intermediate, never inferred from dominant transcript labels.")
@@ -273,9 +274,13 @@ def main(argv=None):
             imports = args.source_root if args.baseline_source == "gui-checkout" else args.source_root / "Contents/Resources"
             vad_selection = vad_inventory.inspect_runtime(args.runtime, imports, args.model_specs)
         if args.command == "evaluate":
-            result = metrics.evaluate_case(catalog, licenses, args.evidence_root, args.case_id, args.result, args.speaker_turns)
+            if args.reference_policy == "released-dataset":
+                from tools.baseline import dataset_reference
+                result = dataset_reference.evaluate(args.evidence_root, catalog, licenses, args.case_id, args.result, args.speaker_turns)
+            else:
+                result = metrics.evaluate_case(catalog, licenses, args.evidence_root, args.case_id, args.result, args.speaker_turns)
             identity = freeze.seal(args.evidence_root, args.output, result)
-            print(json.dumps({"status": "evaluated_not_certified", "case_id": args.case_id, "sha256": identity}))
+            print(json.dumps({"status": result.get("status", "evaluated_not_certified"), "case_id": args.case_id, "sha256": identity}))
             return 0
         if args.command in ("calibrate", "freeze"):
             prerequisites = preflight(catalog, coverage, licenses, args.evidence_root, specs, selection, verify_hf_alignment=args.verify_hf_alignment, vad_selection=vad_selection, contract_snapshot=args.contract_snapshot, runtime=args.runtime, source_root=args.source_root)
