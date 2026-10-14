@@ -1,0 +1,9 @@
+# Released prerequisite verification
+
+Run with the bundled runtime: `python3 -I -B tools/certification/released.py --evidence-root ROOT --manifest MANIFEST.json`. This archive-only command reads no credentials and performs no inference. It checks every archive with its existing verifier, including hashes, scores and raw trace review. Exit status2 means incomplete or invalid evidence. Null checksums represent pending collection; they are never discovered or accepted automatically.
+
+The manifest has `schema_version: 1`, `reference_policy: "released-dataset"` and an `evidence` array. Each row has `id`, `kind`, `snapshot` and externally pinned `sha256`. Required IDs are `text` (kind `text`), `voices` (kind `voices`), `pipeline` (kind `pipeline`) and `wav2vec2`, `alignment_log_softmax`, `ctc_trellis`, `ctc_backtrack` (kind `isolated`). Snapshots must be distinct directory names. This version requires all three profiles and540text/54voice paired jobs; a smaller pilot cannot replace the planned collection. The pipeline context must enable voices; isolated operator identities and observed dispatch must match.
+
+Add `--report NAME.json` to seal a complete report exclusively under the evidence root. Recheck with `--evidence-root ROOT --report NAME.json --verify-sha256 CHECKSUM`; this verifies the report checksum and rechecks every underlying archive. Existing reports cannot be overwritten. Missing or changed evidence cannot produce a verified report.
+
+This report verifies the released benchmark and the selected diagnostic operations. Original CTC CPU dispatch stays explicitly CPU. It requires no new local human reviews. It does not certify the current installed environment, full corpus coverage, resource budgets or placement of all operators. Promotion and complete GPU certification remain false.
