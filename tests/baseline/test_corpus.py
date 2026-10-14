@@ -91,7 +91,7 @@ class CorpusTests(unittest.TestCase):
     def test_annotation_requires_independent_two_pass_review_and_valid_uem(self):
         annotation = {"audio_sha256": "a" * 64, "provenance": "independent_human", "reviewers": ["reviewer-1", "reviewer-2"], "reviewed": True, "uncertainties": [], "transcript": "ciao", "uem": [[0, 1]], "words": [{"word": "ciao", "start": 0, "end": 1}], "turns": [{"speaker": "speaker-1", "start": 0, "end": 1}]}
         corpus.validate_annotation(annotation)
-        for patch in ({"reviewers": ["reviewer-1"]}, {"provenance": "oracle"}, {"uem": [[1, 0]]}, {"uncertainties": ["unresolved boundary"]}):
+        for patch in ({"reviewers": ["reviewer-1"]}, {"reviewers": ["reviewer-1", " REVIEWER-1 "]}, {"reviewers": [" ", "r2"]}, {"provenance": "oracle"}, {"uem": [[1, 0]]}, {"uncertainties": ["unresolved boundary"]}):
             with self.assertRaises(corpus.CorpusError):
                 corpus.validate_annotation(dict(annotation, **patch))
 
@@ -99,6 +99,11 @@ class CorpusTests(unittest.TestCase):
         cases = [{"split": "calibration", "recording_id": "a", "source_group": "a", "speaker_ids": ["same"]}, {"split": "evaluation", "recording_id": "b", "source_group": "b", "speaker_ids": ["same"]}]
         with self.assertRaises(corpus.CorpusError):
             corpus.validate_splits(cases)
+
+    def test_split_identities_require_named_people_and_not_an_iterable_string(self):
+        valid = {"split": "calibration", "recording_id": "recording", "source_group": "session", "speaker_ids": ["person"]}
+        for change in ({"recording_id": " "}, {"source_group": []}, {"speaker_ids": "person"}, {"speaker_ids": [" person"]}, {"speaker_ids": [" "]}, {"speaker_ids": ["person", "person"]}):
+            with self.subTest(change=change), self.assertRaises(corpus.CorpusError): corpus.validate_splits([dict(valid, **change)])
 
     def test_review_flag_cannot_hide_missing_word_annotation(self):
         annotation = {"audio_sha256": "a" * 64, "provenance": "independent_human", "reviewers": ["r1", "r2"], "reviewed": True, "uncertainties": [], "transcript": "ciao", "uem": [[0, 1]], "words": [], "turns": [{"speaker": "A", "start": 0, "end": 1}]}

@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 import sys
 import types
+import subprocess
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -58,6 +60,22 @@ class AdapterTests(unittest.TestCase):
         self.assertIs(module.run, original)
         self.assertEqual(stages, ["asr"])
         self.assertEqual(spans[0]["status"], "synchronized")
+
+    def test_private_failure_message_flag_redacts_credentials_and_default_stays_generic(self):
+        source = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worker = root / "worker.py"
+            worker.write_text('def run(request):\n    raise RuntimeError("test failure " + request["token"])\n')
+            for preserve in (False, True):
+                spans = root / ("private.json" if preserve else "default.json")
+                arguments = [sys.executable, "-I", "-B", str(source / "tools/baseline/adapter.py"), "--source-root", str(source), "--worker", str(worker), "--spans", str(spans)]
+                if preserve: arguments.append("--preserve-failure-message")
+                result = subprocess.run(arguments, input=json.dumps({"token": "test-private-token", "voices": False}), capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 2)
+                event = json.loads(result.stdout)
+                self.assertEqual(event["message"], "test failure [token]" if preserve else "worker_failed")
+                self.assertNotIn("test-private-token", result.stdout + result.stderr + spans.read_text())
 
 
 if __name__ == "__main__":

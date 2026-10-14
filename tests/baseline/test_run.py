@@ -15,6 +15,22 @@ from tools.baseline import run, corpus
 
 
 class RunnerTests(unittest.TestCase):
+    def test_failure_events_are_available_only_when_explicitly_requested_and_protocol_stays_strict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worker = root / "failed.py"
+            worker.write_text('import json, sys\njson.load(sys.stdin)\nprint(json.dumps({"event": "failed", "message": "actual error"}))\nsys.exit(1)\n')
+            with self.assertRaisesRegex(run.RunError, "worker_failed"):
+                run.execute(sys.executable, [worker], {"output": str(root)}, 5)
+            audit = {}
+            events = run.execute(sys.executable, [worker], {"output": str(root)}, 5, allow_failure=True, process_audit=audit)
+            self.assertEqual(events, [{"event": "failed", "message": "actual error"}])
+            self.assertFalse(audit["process_group_alive"])
+            self.assertTrue(audit["stdin_closed"] and audit["stdout_closed"])
+            worker.write_text('import sys\nprint("invalid protocol")\nsys.exit(1)\n')
+            with self.assertRaisesRegex(run.RunError, "worker_protocol_invalid"):
+                run.execute(sys.executable, [worker], {"output": str(root)}, 5, allow_failure=True)
+
     def test_source_vad_requires_loader_evidence_routes_torch_cache_and_skips_hf_refs(self):
         checkpoint = "src/silero_vad/data/silero_vad.jit"
         spec = {"transport": "torch_hub_source", "role": "vad", "repository": "snakers4/silero-vad", "revision": "a" * 40, "cache_root": "/private/torch", "torch_version": "2.8.0", "sha256": {checkpoint: "b" * 64}, "license_verified": True, "license_source": "https://official.test/LICENSE"}
@@ -50,6 +66,7 @@ class RunnerTests(unittest.TestCase):
             children = []
             original = run.subprocess.Popen
             stop = threading.Event()
+            audit = {}
             def launch(*args, **kwargs):
                 child = original(*args, **kwargs)
                 children.append(child)
@@ -65,12 +82,15 @@ class RunnerTests(unittest.TestCase):
             if thread is not None: thread.start()
             try:
                 with patch.object(run.subprocess, "Popen", launch), self.assertRaisesRegex(run.RunError, "job_cancelled" if interrupt else "job_interrupted"):
-                    run.execute(Path(sys.executable), [fixture, "--markers", root], {"output": str(root / "output")}, 10 if interrupt else 1)
+                    run.execute(Path(sys.executable), [fixture, "--markers", root], {"output": str(root / "output")}, 10 if interrupt else 1, process_audit=audit)
             finally:
                 stop.set()
                 if thread is not None: thread.join(timeout=6)
                 for child in children:
                     if child.poll() is None: run.stop_child(child)
+            self.assertFalse(audit["process_group_alive"])
+            self.assertTrue(audit["stdin_closed"] and audit["stdout_closed"])
+            self.assertIsInstance(audit["returncode"], int)
             self.assertTrue((root / "parent-stopped").exists())
             self.assertTrue((root / "grandchild-stopped").exists())
             self.assertTrue(all(child.poll() is not None for child in children))

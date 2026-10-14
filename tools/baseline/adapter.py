@@ -78,6 +78,7 @@ def main(argv=None):
     parser.add_argument("--synchronized", action="store_true", help="Drain registered MLX streams and MPS, evaluate lazy arrays and sample separate memory domains; never a GPU dispatch claim.")
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--seed", type=int, help="Optional paired diagnostic RNG initialization; same bootstrap seed as original entrypoint, no decoder policy changes.")
+    parser.add_argument("--preserve-failure-message", action="store_true", help="Optional private contract diagnostic: preserve the original exception message with the original token redaction. Default still emits only worker_failed; never use unsanitized events as public evidence.")
     args = parser.parse_args(argv)
     request = json.load(sys.stdin)
     spans = []
@@ -91,8 +92,12 @@ def main(argv=None):
                 with observe(boundaries(request), spans, probe.profile if probe else None):
                     worker.run(request)
             code = 0
-        except Exception:
-            sys.__stdout__.write(json.dumps({"event": "failed", "message": "worker_failed"}) + "\n")
+        except Exception as error:
+            message = "worker_failed"
+            if args.preserve_failure_message:
+                message = str(error) or "Il motore non è riuscito a completare la trascrizione."
+                if request.get("token"): message = message.replace(request["token"], "[token]")
+            sys.__stdout__.write(json.dumps({"event": "failed", "message": message}) + "\n")
             sys.__stdout__.flush()
             code = 2
     request.clear()

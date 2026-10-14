@@ -173,7 +173,7 @@ def validate_annotation(annotation):
     require(valid_digest(annotation.get("audio_sha256")), "annotation_audio_hash_missing")
     require(annotation.get("provenance") == "independent_human" and annotation.get("reviewed") is True, "annotation_review_missing")
     reviewers = annotation.get("reviewers", [])
-    require(isinstance(reviewers, list) and len(reviewers) >= 2 and all(isinstance(item, str) and item for item in reviewers), "annotation_second_review_missing")
+    require(isinstance(reviewers, list) and len(reviewers) >= 2 and all(isinstance(item, str) and item.strip() for item in reviewers) and len({item.strip().casefold() for item in reviewers}) >= 2, "annotation_second_review_missing")
     require(annotation.get("uncertainties") == [], "annotation_uncertainty_unresolved")
     require(isinstance(annotation.get("transcript"), str), "annotation_transcript_missing")
     uem = annotation.get("uem")
@@ -181,7 +181,7 @@ def validate_annotation(annotation):
     for key, label in (("words", "word"), ("turns", "speaker")):
         require(isinstance(annotation.get(key), list), "annotation_labels_missing")
         for item in annotation[key]:
-            require(isinstance(item, dict) and isinstance(item.get(label), str) and interval([item.get("start"), item.get("end")]), "annotation_label_invalid")
+            require(isinstance(item, dict) and isinstance(item.get(label), str) and bool(item[label].strip()) and interval([item.get("start"), item.get("end")]), "annotation_label_invalid")
             require(any(start <= item["start"] and item["end"] <= end for start, end in uem), "annotation_outside_uem")
     from tools.baseline.metrics import normalize
     expected_text = "".join(normalize(annotation["transcript"]).split())
@@ -204,7 +204,7 @@ def validate_splits(cases):
     groups = {}
     for case in cases:
         require(case.get("split") in ("calibration", "evaluation"), "split_missing")
-        require(case.get("recording_id") and case.get("source_group") and case.get("speaker_ids"), "split_identity_missing")
+        require(all(isinstance(case.get(field), str) and case[field].strip() and case[field] == case[field].strip() for field in ("recording_id", "source_group")) and isinstance(case.get("speaker_ids"), list) and bool(case["speaker_ids"]) and all(isinstance(identity, str) and identity.strip() and identity == identity.strip() for identity in case["speaker_ids"]) and len(set(case["speaker_ids"])) == len(case["speaker_ids"]), "split_identity_missing")
         for field, identities in (("recording_id", [case["recording_id"]]), ("source_group", [case["source_group"]]), ("speaker", case["speaker_ids"])):
             for identity in identities:
                 key = (field, identity)

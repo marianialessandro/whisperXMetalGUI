@@ -49,12 +49,14 @@ class FleursTests(unittest.TestCase):
                 output.writeframes(b"\0" * 16)
             archive = io.BytesIO()
             with tarfile.open(fileobj=archive, mode="w:gz") as output:
-                member = tarfile.TarInfo("dev/123.wav")
-                member.size = len(audio.getvalue())
-                output.addfile(member, io.BytesIO(audio.getvalue()))
+                for filename in ("123.wav", "124.wav", "125.wav"):
+                    member = tarfile.TarInfo("dev/" + filename)
+                    member.size = len(audio.getvalue())
+                    output.addfile(member, io.BytesIO(audio.getvalue()))
             payload = archive.getvalue()
             card = b"license: cc-by-4.0"
             metadata = b"1\t123.wav\tCiao, Giulia!\tciao giulia\tcharacters\t8\tFEMALE\n"
+            metadata += b"2\t124.wav\tSecondo testo\tsecondo testo\tcharacters\t8\tMALE\n3\t125.wav\tTerzo testo\tterzo testo\tcharacters\t8\tMALE\n"
             sources = []
             def read(url, limit=0):
                 sources.append(url)
@@ -69,6 +71,13 @@ class FleursTests(unittest.TestCase):
             with patch.object(fleurs, "CARD_HASH", hashlib.sha256(card).hexdigest()), patch.object(fleurs, "read_public", read), patch.object(fleurs, "acquire", acquire), patch.object(fleurs, "audio_info", return_value=info):
                 result = fleurs.acquire_language("it", root, 1)
                 again = fleurs.acquire_language("it", root, 1, raw_metadata=True)
+                initial = (root / "it-acquisition.json").read_bytes()
+                additional = fleurs.acquire_language("it", root, 2, raw_metadata=True, selection_offset=1)
+                resumed = fleurs.acquire_language("it", root, 2, raw_metadata=True, selection_offset=1)
+                self.assertEqual(additional, resumed)
+                self.assertEqual((root / "it-acquisition.json").read_bytes(), initial)
+                self.assertTrue((root / "it-acquisition-offset-1-count-2.json").is_file())
+                self.assertEqual([item["id"] for item in additional["audio"]], ["fleurs-it-124", "fleurs-it-125"])
             self.assertEqual(result, again)
             self.assertIn("https://huggingface.co/datasets/google/fleurs/raw/" + fleurs.REVISION + "/data/it_it/dev.tsv", sources)
             self.assertEqual(result["audio"][0]["transcript"], "Ciao, Giulia!")

@@ -30,10 +30,25 @@ def model_cache_roots(model_specs):
     return tuple(next(iter(roots[name]), None) for name in ("huggingface", "torch_hub"))
 
 
-def preflight(catalog, coverage, licenses, evidence_root, model_specs, alignment_selection=None, verify_hf_alignment=False, vad_selection=None):
+def preflight(catalog, coverage, licenses, evidence_root, model_specs, alignment_selection=None, verify_hf_alignment=False, vad_selection=None, contract_snapshot=None, runtime=None, source_root=None):
     corpus_report = corpus.preflight(catalog, coverage, licenses, evidence_root, evidence_root)
     models = [provision.inspect_spec(spec) for spec in model_specs]
     missing = list(corpus_report["missing"])
+    contract_report = None
+    if contract_snapshot is not None:
+        try:
+            from tools.baseline.contract_audit import audit
+            if runtime is None or source_root is None: raise corpus.CorpusError("contract_runtime_source_missing")
+            if not corpus.safe_target(evidence_root, contract_snapshot + "/artifact-audit.json").is_file(): raise corpus.CorpusError("contract_audit_seal_missing")
+            contract_report = audit(evidence_root, contract_snapshot, runtime, source_root, model_specs)
+            inventory = json.loads(corpus.safe_target(evidence_root, contract_snapshot + "/fixture-inventory.json").read_text())
+            for case in inventory["cases"]:
+                if next((item for item in catalog["cases"] if item["id"] == case["id"]), None) != case: raise corpus.CorpusError("contract_catalog_mismatch")
+            for asset in inventory["assets"]:
+                if next((item for item in catalog["assets"] if item["id"] == asset["id"]), None) != asset: raise corpus.CorpusError("contract_catalog_mismatch")
+        except (ValueError, OSError, KeyError, TypeError, StopIteration):
+            missing.append({"code": "contract_evidence_unverified"})
+            contract_report = None
     if not models:
         missing.append({"code": "model_inventory_missing"})
     for model in models:
@@ -76,6 +91,7 @@ def preflight(catalog, coverage, licenses, evidence_root, model_specs, alignment
     report = {"status": "prerequisite_missing" if missing else "prerequisites_verified", "missing": missing, "models": models, "gpu_placement_certified": False}
     if alignment_selection is not None: report["alignment_selection"] = alignment_selection
     if vad_selection is not None: report["vad_selection"] = vad_selection
+    if contract_report is not None: report["contracts"] = {key: value for key, value in contract_report.items() if key != "artifact_sha256"}
     return report
 
 
@@ -105,7 +121,18 @@ def stop_child(child):
                 except OSError: pass
 
 
-def execute(runtime, arguments, request, timeout, cache_root=None, torch_home=None):
+def process_snapshot(child, audit):
+    if audit is None: return
+    try:
+        os.killpg(child.pid, 0)
+        alive = True
+    except ProcessLookupError:
+        alive = False
+    audit.update(pid=child.pid, returncode=child.poll(), process_group_alive=alive, stdin_closed=child.stdin.closed, stdout_closed=child.stdout.closed)
+
+
+def execute(runtime, arguments, request, timeout, cache_root=None, torch_home=None, allow_failure=False, process_audit=None):
+    if process_audit is not None and type(process_audit) is not dict: raise RunError("process_audit_invalid")
     runtime = Path(runtime).resolve()
     environment = manifest.clean_environment(runtime.parent.parent, os.environ)
     if cache_root is not None:
@@ -117,10 +144,13 @@ def execute(runtime, arguments, request, timeout, cache_root=None, torch_home=No
         output, _ = child.communicate(json.dumps(request).encode(), timeout=timeout)
     except subprocess.TimeoutExpired:
         stop_child(child)
+        process_snapshot(child, process_audit)
         raise RunError("job_interrupted") from None
     except KeyboardInterrupt:
         stop_child(child)
+        process_snapshot(child, process_audit)
         raise RunError("job_cancelled") from None
+    process_snapshot(child, process_audit)
     if len(output) > 1024 * 1024:
         raise RunError("worker_event_budget_exceeded")
     try:
@@ -129,7 +159,7 @@ def execute(runtime, arguments, request, timeout, cache_root=None, torch_home=No
         contracts.validate_events(events, outcome, request["output"])
     except (ValueError, UnicodeError):
         raise RunError("worker_protocol_invalid") from None
-    if outcome != "completed":
+    if outcome != "completed" and not allow_failure:
         raise RunError("worker_failed")
     return events
 
@@ -201,6 +231,7 @@ def main(argv=None):
     parser.add_argument("--evidence-root", type=Path, required=True, help="Existing private corpus/evidence directory; no personal catalog or outputs.")
     parser.add_argument("--model-specs", type=Path, required=True)
     parser.add_argument("--verify-hf-alignment", action="store_true", help="Optional stronger offline gate: verify declared HF alignment defaults, pinned processor metadata and installed Transformers version in the selected runtime. No neural checkpoints are loaded; legacy Torch-only inspection stays unchanged without this flag.")
+    parser.add_argument("--contract-snapshot", help="Optional stronger offline contract gate: private snapshot relative to evidence root containing measured pairs, archived harness and sealed artifact audit; natural quality requirements remain mandatory.")
     parser.add_argument("--bridge", type=Path, help="Private Keychain pipe for voices; never token argv/env/file.")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("preflight", help="Offline corpus/model gate and Torch default/config inspection in the selected runtime; no checkpoint loading, network or Keychain.")
@@ -247,7 +278,7 @@ def main(argv=None):
             print(json.dumps({"status": "evaluated_not_certified", "case_id": args.case_id, "sha256": identity}))
             return 0
         if args.command in ("calibrate", "freeze"):
-            prerequisites = preflight(catalog, coverage, licenses, args.evidence_root, specs, selection, verify_hf_alignment=args.verify_hf_alignment, vad_selection=vad_selection)
+            prerequisites = preflight(catalog, coverage, licenses, args.evidence_root, specs, selection, verify_hf_alignment=args.verify_hf_alignment, vad_selection=vad_selection, contract_snapshot=args.contract_snapshot, runtime=args.runtime, source_root=args.source_root)
             if prerequisites["missing"]:
                 print(json.dumps(prerequisites))
                 return 2
@@ -275,7 +306,7 @@ def main(argv=None):
             reports = [provision.provision_spec(spec, token) for spec in specs]
             print(json.dumps(manifest.sanitize({"status": "files_verified", "models": reports}, secrets=[token] if token else [])))
             return 0
-        report = preflight(catalog, coverage, licenses, args.evidence_root, specs, selection, verify_hf_alignment=args.verify_hf_alignment, vad_selection=vad_selection)
+        report = preflight(catalog, coverage, licenses, args.evidence_root, specs, selection, verify_hf_alignment=args.verify_hf_alignment, vad_selection=vad_selection, contract_snapshot=args.contract_snapshot, runtime=args.runtime, source_root=args.source_root)
         if args.command in ("preflight", "full-gate") or report["missing"]:
             if args.command == "full-gate" and not report["missing"]:
                 frozen = freeze.verify_frozen(args.evidence_root, args.frozen, args.sha256, coverage)
