@@ -21,6 +21,16 @@ class MetalCLITests(unittest.TestCase):
                     main([*common, *extra])
                 self.assertEqual(caught.exception.code, 2)
 
+    def test_embedding_backend_requires_paired_hash_and_diarization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "unused-report.json"
+            common = ["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "audio.wav"]
+            for extra in [["--embedding-library", "embedding.dylib"], ["--embedding-library-sha256", "0" * 64], ["--embedding-library", "embedding.dylib", "--embedding-library-sha256", "0" * 64]]:
+                with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                    main([*common, *extra])
+                self.assertEqual(caught.exception.code, 2)
+                self.assertFalse(report.exists())
+
     def test_experimental_scope_rejects_cpu_and_unsupported_language_before_original(self):
         calls = []
         def original(transcript, model, align_model_metadata, audio, device, interpolate_method="nearest"):
@@ -70,6 +80,24 @@ class MetalCLITests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 main(arguments)
             self.assertEqual(report.read_text(), text)
+
+    def test_optional_embedding_load_failure_is_reported_and_does_not_leak_arguments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            original_argv = sys.argv
+            with patch("tools.baseline.mps_storage_probe.MPSCTC") as native, patch("tools.baseline.native_embedding.NativeEmbeddingNormalization", side_effect=ValueError("injected_embedding_failure")):
+                native.return_value.__enter__.return_value.identity = {"library_sha256": "0" * 64}
+                native.return_value.__enter__.return_value.initialization_wall_ns = 1
+                with self.assertRaisesRegex(ValueError, "injected_embedding_failure"):
+                    main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--embedding-library", "private.dylib", "--embedding-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--hf_token", "private-secret"])
+            data = json.loads(report.read_text())
+            self.assertEqual(data["status"], "failed")
+            self.assertTrue(data["embedding_normalization_requested"])
+            self.assertFalse(data["embedding_normalization_observed"])
+            self.assertEqual(data["native_embedding_normalization_calls"], 0)
+            self.assertNotIn("private-secret", report.read_text())
+            self.assertNotIn("private.wav", report.read_text())
+            self.assertIs(sys.argv, original_argv)
 
     def test_no_ctc_calls_are_explicit_and_original_argv_is_restored(self):
         with tempfile.TemporaryDirectory() as directory:
