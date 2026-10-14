@@ -45,7 +45,8 @@ def inspect(root, document):
                     result.update(observed_tensor_backend="cpu" if row["id"].startswith("ctc_") else "mps", gpu_activity_observed=evidence["gpu_activity_observed"], placement_gate_eligible=False)
                 if row["kind"] == "pipeline":
                     context = json.loads(corpus.safe_target(root, row["snapshot"] + "/context.json").read_text())
-                    corpus.require(context.get("settings", {}).get("voices") is True, "prerequisites_voice_trace_missing")
+                    corpus.require(context.get("settings", {}).get("voices") is True and evidence.get("gpu_activity_observed") is True, "prerequisites_voice_trace_missing")
+                    result["input_scope"] = evidence.get("input_scope", {"kind": "full_source_recording"})
                 result["status"] = "verified"
             except (ValueError, OSError, KeyError, TypeError):
                 result["status"] = "invalid_or_missing"

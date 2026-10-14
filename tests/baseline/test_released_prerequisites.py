@@ -18,7 +18,7 @@ class ReleasedPrerequisitesTests(unittest.TestCase):
     def verifiers(self):
         def isolated(root, snapshot, checksum):
             return {"operator": snapshot, "individual_operator_dispatch_verified": True, "gpu_activity_observed": not snapshot.startswith("ctc_")}
-        return {"text": lambda *args: {"profiles": ["Rapida", "Bilanciata", "Massima"], "jobs": 540}, "voices": lambda *args: {"profiles": ["Rapida", "Bilanciata", "Massima"], "jobs": 54}, "pipeline": lambda *args: {}, "isolated": isolated}
+        return {"text": lambda *args: {"profiles": ["Rapida", "Bilanciata", "Massima"], "jobs": 540}, "voices": lambda *args: {"profiles": ["Rapida", "Bilanciata", "Massima"], "jobs": 54}, "pipeline": lambda *args: {"gpu_activity_observed": True}, "isolated": isolated}
 
     def fixture(self, root):
         (root / "pipeline").mkdir()
@@ -85,6 +85,16 @@ class ReleasedPrerequisitesTests(unittest.TestCase):
             self.fixture(root)
             verifiers = self.verifiers()
             verifiers["text"] = lambda *args: {"profiles": ["Rapida"], "jobs": 180}
+            with patch.dict(released.VERIFIERS, verifiers):
+                report = released.inspect(root, self.document())
+            self.assertEqual(report["status"], "incomplete")
+
+    def test_valid_trace_archive_without_target_gpu_activity_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            verifiers = self.verifiers()
+            verifiers["pipeline"] = lambda *args: {"gpu_activity_observed": False}
             with patch.dict(released.VERIFIERS, verifiers):
                 report = released.inspect(root, self.document())
             self.assertEqual(report["status"], "incomplete")
