@@ -57,6 +57,8 @@ def main(argv=None):
     parser.add_argument("--speaker-library-sha256", help="Expected SHA256 of the optional speaker-assignment dylib; no default backend change.")
     parser.add_argument("--embedding-library", type=Path, help="Optional native Metal VBx training-embedding normalization dylib; requires --diarize and --embedding-library-sha256, with pinned pyannote 4.0.4.")
     parser.add_argument("--embedding-library-sha256", help="Expected SHA256 of the optional embedding-normalization dylib; clustering defaults remain unchanged.")
+    parser.add_argument("--plda-normalization-library", type=Path, help="Optional native binary64 L2 normalization inside PLDA preprocessing; requires --diarize and its paired SHA256 flag. Matrix products and model setup remain original.")
+    parser.add_argument("--plda-normalization-library-sha256", help="Expected SHA256 of the binary64-normalization dylib; requires pyannote 4.0.4 and NumPy 2.2.6.")
     args, forwarded = parser.parse_known_args(argv)
     if not forwarded:
         parser.error("WhisperX audio paths and pipeline options are required.")
@@ -70,8 +72,12 @@ def main(argv=None):
         parser.error("--embedding-library and --embedding-library-sha256 must be supplied together.")
     if args.embedding_library and "--diarize" not in forwarded:
         parser.error("--embedding-library requires --diarize.")
-    report = {"schema_version": 1, "scope": "source_checkout_native_mps_ctc", "status": "failed", "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False, "resident_statistics": args.resident_statistics, "embedding_normalization_requested": bool(args.embedding_library)}
-    records = {key: [] for key in ("ctc", "bounds", "means", "rounding", "interpolation", "speaker_assignment", "embedding_normalization")}
+    if bool(args.plda_normalization_library) != bool(args.plda_normalization_library_sha256):
+        parser.error("--plda-normalization-library and --plda-normalization-library-sha256 must be supplied together.")
+    if args.plda_normalization_library and "--diarize" not in forwarded:
+        parser.error("--plda-normalization-library requires --diarize.")
+    report = {"schema_version": 1, "scope": "source_checkout_native_mps_ctc", "status": "failed", "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False, "resident_statistics": args.resident_statistics, "embedding_normalization_requested": bool(args.embedding_library), "plda_normalization_requested": bool(args.plda_normalization_library)}
+    records = {key: [] for key in ("ctc", "bounds", "means", "rounding", "interpolation", "speaker_assignment", "embedding_normalization", "plda_normalization")}
     with args.native_report.open("x", encoding="utf-8") as output:
         try:
             import whisperx.transcribe as task
@@ -91,6 +97,13 @@ def main(argv=None):
                     report["native_identity"] = context.identity
                     report["initialization_wall_ns"] = context.initialization_wall_ns
                     with contextlib.ExitStack() as scopes:
+                        if args.plda_normalization_library:
+                            from tools.baseline.native_double import NativeDoubleNormalization
+                            from tools.baseline.native_plda_adapter import native_plda_normalization
+                            plda_context = scopes.enter_context(NativeDoubleNormalization(args.plda_normalization_library, args.plda_normalization_library_sha256))
+                            report["plda_normalization_native_identity"] = plda_context.identity
+                            report["plda_normalization_initialization_wall_ns"] = plda_context.initialization_wall_ns
+                            scopes.enter_context(native_plda_normalization(plda_context, records["plda_normalization"]))
                         if args.embedding_library:
                             from tools.baseline.native_embedding import NativeEmbeddingNormalization
                             from tools.baseline.native_embedding_adapter import native_embedding_normalization
@@ -113,6 +126,8 @@ def main(argv=None):
         finally:
             report["operations"] = records
             report["native_ctc_calls"] = len(records["ctc"])
+            report["native_plda_normalization_calls"] = len(records["plda_normalization"])
+            report["plda_normalization_observed"] = bool(records["plda_normalization"])
             report["native_embedding_normalization_calls"] = len(records["embedding_normalization"])
             report["embedding_normalization_observed"] = bool(records["embedding_normalization"])
             report["native_speaker_assignment_calls"] = len(records["speaker_assignment"])

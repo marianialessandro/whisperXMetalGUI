@@ -1,0 +1,107 @@
+struct DoubleDimensions { uint rows, columns, sequential; };
+
+// Normal bounded binary64 multiplication with an exact 106-bit significand product and nearest-even rounding.
+ulong multiply_positive_binary64(ulong a, ulong b) {
+    if (a == 0 || b == 0) return 0;
+    ulong mask = (1ul << 52) - 1, x = (a & mask) | (1ul << 52), y = (b & mask) | (1ul << 52);
+    ulong x0 = uint(x), x1 = x >> 32, y0 = uint(y), y1 = y >> 32;
+    ulong p00 = x0 * y0, p01 = x0 * y1, p10 = x1 * y0, p11 = x1 * y1;
+    ulong middle = (p00 >> 32) + uint(p01) + uint(p10);
+    ulong low = (middle << 32) | uint(p00), high = p11 + (p01 >> 32) + (p10 >> 32) + (middle >> 32);
+    uint shift = (high & (1ul << 41)) ? 53 : 52;
+    int exponent = int(a >> 52) + int(b >> 52) - 1023 + int(shift == 53);
+    ulong rounded = (high << (64 - shift)) | (low >> shift), remainder = low & ((1ul << shift) - 1), halfway = 1ul << (shift - 1);
+    if (remainder > halfway || (remainder == halfway && (rounded & 1))) ++rounded;
+    if (rounded == (1ul << 53)) { rounded >>= 1; ++exponent; }
+    return (ulong(exponent) << 52) | (rounded & mask);
+}
+
+// Long division emits all 53 significand bits, followed by exact nearest-even rounding from the remainder.
+ulong divide_positive_binary64(ulong a, ulong b) {
+    if (a == 0) return 0;
+    ulong mask = (1ul << 52) - 1, x = (a & mask) | (1ul << 52), y = (b & mask) | (1ul << 52);
+    int exponent = int(a >> 52) - int(b >> 52) + 1023;
+    if (x < y) { x <<= 1; --exponent; }
+    ulong quotient = 1, remainder = x - y;
+    for (uint i = 0; i < 52; ++i) {
+        quotient <<= 1; remainder <<= 1;
+        if (remainder >= y) { ++quotient; remainder -= y; }
+    }
+    if (remainder * 2 > y || (remainder * 2 == y && (quotient & 1))) ++quotient;
+    if (quotient == (1ul << 53)) { quotient >>= 1; ++exponent; }
+    return (ulong(exponent) << 52) | (quotient & mask);
+}
+
+// Digit-by-digit integer square root of the 105/106-bit radicand preserves binary64 rounding without float arithmetic.
+ulong sqrt_positive_binary64(ulong a) {
+    if (a == 0) return 0;
+    ulong mask = (1ul << 52) - 1, significand = (a & mask) | (1ul << 52);
+    int exponent = int(a >> 52) - 1023, odd = exponent & 1;
+    uint shift = 52 + uint(odd);
+    ulong low = significand << shift, high = significand >> (64 - shift), root = 0, remainder = 0;
+    for (int pair = 52; pair >= 0; --pair) {
+        uint position = uint(pair) * 2;
+        ulong digit = position >= 64 ? (high >> (position - 64)) & 3ul : (low >> position) & 3ul;
+        remainder = (remainder << 2) | digit;
+        ulong trial = (root << 2) | 1ul;
+        root <<= 1;
+        if (remainder >= trial) { remainder -= trial; ++root; }
+    }
+    if (remainder > root) ++root;
+    exponent = (exponent - odd) / 2 + 1023;
+    if (root == (1ul << 53)) { root >>= 1; ++exponent; }
+    return (ulong(exponent) << 52) | (root & mask);
+}
+
+ulong double_square(device const ulong* values, uint index) {
+    ulong value = values[index] & ((1ul << 63) - 1);
+    return multiply_positive_binary64(value, value);
+}
+
+ulong double_leaf(device const ulong* values, uint start, uint count) {
+    ulong result = 0;
+    if (count < 8) {
+        for (uint i = 0; i < count; ++i) result = add_positive_double(result, double_square(values, start + i));
+        return result;
+    }
+    ulong sums[8];
+    for (uint lane = 0; lane < 8; ++lane) sums[lane] = double_square(values, start + lane);
+    uint i = 8;
+    for (; i < count - count % 8; i += 8) for (uint lane = 0; lane < 8; ++lane) sums[lane] = add_positive_double(sums[lane], double_square(values, start + i + lane));
+    result = add_positive_double(add_positive_double(add_positive_double(sums[0], sums[1]), add_positive_double(sums[2], sums[3])), add_positive_double(add_positive_double(sums[4], sums[5]), add_positive_double(sums[6], sums[7])));
+    for (; i < count; ++i) result = add_positive_double(result, double_square(values, start + i));
+    return result;
+}
+
+ulong double_sum(device const ulong* values, uint count, uint sequential) {
+    if (sequential) {
+        ulong result = 0;
+        for (uint i = 0; i < count; ++i) result = add_positive_double(result, double_square(values, i));
+        return result;
+    }
+    uint starts[16], lengths[16], states[16], depth = 0;
+    ulong left[16], result = 0;
+    starts[0] = 0; lengths[0] = count; states[0] = 0;
+    while (true) {
+        uint length = lengths[depth], start = starts[depth];
+        if (length <= 128) result = double_leaf(values, start, length);
+        else {
+            uint split = (length / 2) & ~7u;
+            if (states[depth] == 0) { states[depth] = 1; ++depth; starts[depth] = start; lengths[depth] = split; states[depth] = 0; continue; }
+            if (states[depth] == 1) { left[depth] = result; states[depth] = 2; ++depth; starts[depth] = start + split; lengths[depth] = length - split; states[depth] = 0; continue; }
+            result = add_positive_double(left[depth], result);
+        }
+        if (depth == 0) return result;
+        --depth;
+    }
+}
+
+kernel void double_normalize(device const ulong* input [[buffer(0)]], constant DoubleDimensions& d [[buffer(1)]], device ulong* output [[buffer(2)]], uint row [[thread_position_in_grid]]) {
+    if (row >= d.rows) return;
+    uint start = row * d.columns;
+    ulong norm = sqrt_positive_binary64(double_sum(input + start, d.columns, d.sequential)), sign = 1ul << 63;
+    for (uint column = 0; column < d.columns; ++column) {
+        ulong value = input[start + column];
+        output[start + column] = divide_positive_binary64(value & (sign - 1), norm) | (value & sign);
+    }
+}
