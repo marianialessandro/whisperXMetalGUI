@@ -53,13 +53,19 @@ def main(argv=None):
     parser.add_argument("--native-report", type=Path, required=True, help="New private JSON report; existing files are never overwritten. No CLI arguments, credentials, audio or transcript values are stored.")
     parser.add_argument("--resident-statistics", action="store_true", help="Additionally keep character statistics resident and run timestamp/word reductions, rounding and paired nearest interpolation on Metal; nearest interpolation only.")
     parser.add_argument("--seed", type=int, help="Optional reproducible diagnostic RNG initialization; omitted by default, with no decoder policy change.")
+    parser.add_argument("--speaker-library", type=Path, help="Optional prebuilt native Metal speaker-assignment dylib; requires --diarize and --speaker-library-sha256.")
+    parser.add_argument("--speaker-library-sha256", help="Expected SHA256 of the optional speaker-assignment dylib; no default backend change.")
     args, forwarded = parser.parse_known_args(argv)
     if not forwarded:
         parser.error("WhisperX audio paths and pipeline options are required.")
     if "--no_align" in forwarded:
         parser.error("The native CTC experiment requires alignment.")
+    if bool(args.speaker_library) != bool(args.speaker_library_sha256):
+        parser.error("--speaker-library and --speaker-library-sha256 must be supplied together.")
+    if args.speaker_library and "--diarize" not in forwarded:
+        parser.error("--speaker-library requires --diarize.")
     report = {"schema_version": 1, "scope": "source_checkout_native_mps_ctc", "status": "failed", "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False, "resident_statistics": args.resident_statistics}
-    records = {key: [] for key in ("ctc", "bounds", "means", "rounding", "interpolation")}
+    records = {key: [] for key in ("ctc", "bounds", "means", "rounding", "interpolation", "speaker_assignment")}
     with args.native_report.open("x", encoding="utf-8") as output:
         try:
             import whisperx.transcribe as task
@@ -78,7 +84,14 @@ def main(argv=None):
                 with MPSCTC(args.mps_library, args.mps_library_sha256, kernels, shader_hash, retain_timestamps=args.resident_statistics) as context:
                     report["native_identity"] = context.identity
                     report["initialization_wall_ns"] = context.initialization_wall_ns
-                    with native_alignment(task, context, records, args.resident_statistics):
+                    with contextlib.ExitStack() as scopes:
+                        if args.speaker_library:
+                            from tools.baseline.native_speaker import NativeSpeakerAssignment, native_speaker_assignment
+                            speaker_context = scopes.enter_context(NativeSpeakerAssignment(args.speaker_library, args.speaker_library_sha256))
+                            report["speaker_native_identity"] = speaker_context.identity
+                            report["speaker_initialization_wall_ns"] = speaker_context.initialization_wall_ns
+                            scopes.enter_context(native_speaker_assignment(task, speaker_context, records["speaker_assignment"]))
+                        scopes.enter_context(native_alignment(task, context, records, args.resident_statistics))
                         sys.argv = ["whisperx", *forwarded]
                         cli()
                     report["status"] = "completed_with_native_ctc" if records["ctc"] else "completed_without_native_ctc"
@@ -87,6 +100,7 @@ def main(argv=None):
         finally:
             report["operations"] = records
             report["native_ctc_calls"] = len(records["ctc"])
+            report["native_speaker_assignment_calls"] = len(records["speaker_assignment"])
             report["logical_emission_host_readback_bytes"] = sum(item["logical_emission_host_readback_bytes"] for item in records["ctc"])
             report["logical_cpu_to_native_emission_bytes"] = sum(item["logical_cpu_to_native_emission_bytes"] for item in records["ctc"])
             json.dump(report, output, allow_nan=False, indent=2)

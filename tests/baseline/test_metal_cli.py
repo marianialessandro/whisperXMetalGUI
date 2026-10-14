@@ -1,4 +1,5 @@
 import contextlib
+import io
 import json
 from pathlib import Path
 import sys
@@ -12,6 +13,14 @@ from tools.metal_cli import main, native_alignment
 
 
 class MetalCLITests(unittest.TestCase):
+    def test_speaker_backend_requires_paired_hash_and_diarization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            common = ["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(Path(directory) / "unused-report.json"), "audio.wav"]
+            for extra in [["--speaker-library", "speaker.dylib"], ["--speaker-library-sha256", "0" * 64], ["--speaker-library", "speaker.dylib", "--speaker-library-sha256", "0" * 64]]:
+                with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                    main([*common, *extra])
+                self.assertEqual(caught.exception.code, 2)
+
     def test_experimental_scope_rejects_cpu_and_unsupported_language_before_original(self):
         calls = []
         def original(transcript, model, align_model_metadata, audio, device, interpolate_method="nearest"):
