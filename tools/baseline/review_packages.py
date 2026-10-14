@@ -11,13 +11,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.baseline import corpus, freeze, manifest, provision
 
 
-def prepare(root, name, catalog, licenses, coverage):
+def prepare(root, name, catalog, licenses, coverage, use_proposed_splits=False):
     corpus.require(Path(name).name == name and name not in ("", ".", ".."), "package_name_invalid")
     destination = corpus.safe_target(root, name)
     corpus.require(not destination.exists(), "destination_exists")
     corpus.validate_coverage(coverage, Path(__file__).resolve().parents[2])
     audio = [item for item in catalog["assets"] if item.get("type") in ("parity_only", "natural_candidate") and item.get("duration", 0) > 0]
     corpus.require(audio and len({item["id"] for item in audio}) == len(audio), "review_audio_inventory_invalid")
+    if use_proposed_splits:
+        corpus.validate_splits([dict(item, split=item["proposed_split"], recording_id=item.get("recording_id", item["id"])) for item in audio if item.get("proposed_split")])
     with tempfile.TemporaryDirectory(prefix=".review-prepare-", dir=root) as temporary:
         staging = Path(temporary) / "package"
         staging.mkdir()
@@ -40,7 +42,7 @@ def prepare(root, name, catalog, licenses, coverage):
                 reference["manual_dataset_reference"] = json.loads(path.read_text())
                 corpus.require(reference["manual_dataset_reference"].get("audio_sha256") == asset["sha256"] and reference["manual_dataset_reference"].get("reviewed") is False, "review_reference_scope_invalid")
             annotation = {"audio_sha256": asset["sha256"], "provenance": "pending_independent_human", "reviewed": False, "reviewers": [], "uncertainties": ["Word boundaries, speaker turns and evaluation intervals require independent listening and two review passes."], "transcript": "", "words": [], "turns": [], "uem": []}
-            assignment = {"recording_id": asset.get("recording_id", asset["id"]), "source_group": asset.get("source_group", ""), "speaker_ids": asset.get("speaker_ids", []), "split": "", "case_ids": [], "status": "pending_identity_and_split_adjudication"}
+            assignment = {"recording_id": asset.get("recording_id", asset["id"]), "source_group": asset.get("source_group", ""), "speaker_ids": asset.get("speaker_ids", []), "split": asset.get("proposed_split", "") if use_proposed_splits else "", "case_ids": [], "status": "pending_identity_and_split_adjudication"}
             freeze.seal(staging, str((folder / "source-reference.json").relative_to(staging)), reference)
             freeze.seal(staging, str((folder / "annotation.json").relative_to(staging)), annotation)
             freeze.seal(staging, str((folder / "assignment.json").relative_to(staging)), assignment)
@@ -85,12 +87,13 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     create = commands.add_parser("prepare")
     for name in ("catalog", "licenses", "coverage"): create.add_argument("--" + name, type=Path, required=True)
+    create.add_argument("--use-proposed-splits", action="store_true", help="Optional: preserve proposed calibration/evaluation splits from actual source metadata, only after checking recording/source/speaker disjointness. Missing proposals stay unresolved; annotations remain unreviewed.")
     commands.add_parser("check", help="Verify immutable sources, completed annotations and disjoint split identities; drafts return exit 2.")
     args = parser.parse_args(argv)
     try:
         root = args.evidence_root.resolve(strict=True)
         if args.command == "prepare":
-            report = prepare(root, args.package, json.loads(args.catalog.read_text()), json.loads(args.licenses.read_text()), json.loads(args.coverage.read_text()))
+            report = prepare(root, args.package, json.loads(args.catalog.read_text()), json.loads(args.licenses.read_text()), json.loads(args.coverage.read_text()), args.use_proposed_splits)
             print(json.dumps({"status": report["status"], "recordings": len(report["recordings"]), "quality_certified": False}))
             return 0
         report = check(root, args.package)

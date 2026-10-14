@@ -66,3 +66,20 @@ class ReviewPackageTests(unittest.TestCase):
             (root / "source.wav").write_bytes(b"changed")
             with self.assertRaises(ValueError): review_packages.prepare(root, "review", catalog, licenses, coverage)
             self.assertFalse((root / "review").exists())
+
+    def test_optional_source_split_proposals_require_disjoint_verified_identities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog, licenses, coverage = self.inputs(root)
+            asset = catalog["assets"][0]
+            asset.update(proposed_split="calibration", source_group="session", speaker_ids=["person"])
+            review_packages.prepare(root, "default", catalog, licenses, coverage)
+            self.assertEqual(json.loads((root / "default/recordings/source/assignment.json").read_text())["split"], "")
+            review_packages.prepare(root, "proposed", catalog, licenses, coverage, use_proposed_splits=True)
+            assignment = json.loads((root / "proposed/recordings/source/assignment.json").read_text())
+            self.assertEqual(assignment["split"], "calibration")
+            self.assertFalse(json.loads((root / "proposed/recordings/source/annotation.json").read_text())["reviewed"])
+            asset["speaker_ids"] = []
+            with self.assertRaisesRegex(ValueError, "split_identity_missing"):
+                review_packages.prepare(root, "invalid", catalog, licenses, coverage, use_proposed_splits=True)
+            self.assertFalse((root / "invalid").exists())
