@@ -11,6 +11,26 @@ from importlib.metadata import PackageNotFoundError
 
 
 class SourceCheckoutCLITests(unittest.TestCase):
+    def test_automatic_language_survives_alignment_and_export_for_multiple_files(self):
+        from whisperx.__main__ import cli
+        results = [{"segments": [{"text": "Ciao"}], "language": "it"}, {"segments": [{"text": "Bonjour"}], "language": "fr"}]
+        with tempfile.TemporaryDirectory() as directory:
+            arguments = ["whisperx", "it.wav", "fr.wav", "--output_dir", directory, "--verbose", "False"]
+            with patch.object(sys, "argv", arguments), patch("whisperx.transcribe.load_audio", return_value=object()), patch("whisperx.transcribe.get_writer") as writer, patch("whisperx.transcribe.load_model") as model, patch("whisperx.transcribe.load_align_model", side_effect=lambda language, *a, **k: (object(), {"language": language})) as loader, patch("whisperx.transcribe.align", side_effect=lambda *a, **k: {"segments": []}):
+                model.return_value.transcribe.side_effect = results
+                cli()
+                self.assertEqual([call.args[0]["language"] for call in writer.return_value.call_args_list], ["it", "fr"])
+                self.assertEqual([call.args[0] for call in loader.call_args_list], ["it", "fr"])
+
+    def test_automatic_language_is_preserved_without_alignment(self):
+        from whisperx.__main__ import cli
+        with tempfile.TemporaryDirectory() as directory:
+            arguments = ["whisperx", "it.wav", "--no_align", "--output_dir", directory, "--verbose", "False"]
+            with patch.object(sys, "argv", arguments), patch("whisperx.transcribe.load_audio", return_value=object()), patch("whisperx.transcribe.get_writer") as writer, patch("whisperx.transcribe.load_model") as model:
+                model.return_value.transcribe.return_value = {"segments": [], "language": "it"}
+                cli()
+                self.assertEqual(writer.return_value.call_args.args[0]["language"], "it")
+
     def test_mlx_is_opt_in_and_classic_cli_keeps_its_original_backend(self):
         from whisperx.__main__ import cli
         for backend in [None, "mlx"]:

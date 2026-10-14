@@ -157,9 +157,8 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
     if not no_align:
         tmp_results = results
         results = []
-        align_model, align_metadata = load_align_model(
-            align_language, device, model_name=align_model, model_dir=model_dir, model_cache_only=model_cache_only
-        )
+        initial_align_language = next((result.get("language") for result, _ in tmp_results if result.get("segments") and result.get("language")), align_language)
+        align_model, align_metadata = load_align_model(initial_align_language, device, model_name=align_model, model_dir=model_dir, model_cache_only=model_cache_only)
         for result, audio_path in tmp_results:
             # >> Align
             if len(tmp_results) > 1:
@@ -178,6 +177,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                         result["language"], device, model_dir=model_dir, model_cache_only=model_cache_only
                     )
                 logger.info(f"Performing alignment (PyTorch device: {device})...")
+                result_language = result.get("language") or align_language
                 result: AlignedTranscriptionResult = align(
                     result["segments"],
                     align_model,
@@ -188,6 +188,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                     return_char_alignments=return_char_alignments,
                     print_progress=print_progress,
                 )
+                result["language"] = result_language
 
             results.append((result, audio_path))
 
@@ -199,9 +200,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
     # >> Diarize
     if diarize:
         if hf_token is None:
-            logger.warning(
-                "No --hf_token provided, needs to be saved in environment variable, otherwise will throw error loading diarization model"
-            )
+            logger.info("No --hf_token provided; cached or environment credentials will be used if needed.")
         tmp_results = results
         logger.info(f"Performing diarization (PyTorch device: {device})...")
         logger.info(f"Using model: {diarize_model_name}")
@@ -225,5 +224,5 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
             results.append((result, input_audio_path))
     # >> Write
     for result, audio_path in results:
-        result["language"] = align_language
+        result["language"] = result.get("language") or align_language
         writer(result, audio_path, writer_args)
