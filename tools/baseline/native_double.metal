@@ -53,30 +53,30 @@ ulong sqrt_positive_binary64(ulong a) {
     return (ulong(exponent) << 52) | (root & mask);
 }
 
-ulong double_square(device const ulong* values, uint index) {
+ulong double_square(device const ulong* values, uint index, bool squared = true) {
     ulong value = values[index] & ((1ul << 63) - 1);
-    return multiply_positive_binary64(value, value);
+    return squared ? multiply_positive_binary64(value, value) : value;
 }
 
-ulong double_leaf(device const ulong* values, uint start, uint count) {
+ulong double_leaf(device const ulong* values, uint start, uint count, bool squared = true) {
     ulong result = 0;
     if (count < 8) {
-        for (uint i = 0; i < count; ++i) result = add_positive_double(result, double_square(values, start + i));
+        for (uint i = 0; i < count; ++i) result = add_positive_double(result, double_square(values, start + i, squared));
         return result;
     }
     ulong sums[8];
-    for (uint lane = 0; lane < 8; ++lane) sums[lane] = double_square(values, start + lane);
+    for (uint lane = 0; lane < 8; ++lane) sums[lane] = double_square(values, start + lane, squared);
     uint i = 8;
-    for (; i < count - count % 8; i += 8) for (uint lane = 0; lane < 8; ++lane) sums[lane] = add_positive_double(sums[lane], double_square(values, start + i + lane));
+    for (; i < count - count % 8; i += 8) for (uint lane = 0; lane < 8; ++lane) sums[lane] = add_positive_double(sums[lane], double_square(values, start + i + lane, squared));
     result = add_positive_double(add_positive_double(add_positive_double(sums[0], sums[1]), add_positive_double(sums[2], sums[3])), add_positive_double(add_positive_double(sums[4], sums[5]), add_positive_double(sums[6], sums[7])));
-    for (; i < count; ++i) result = add_positive_double(result, double_square(values, start + i));
+    for (; i < count; ++i) result = add_positive_double(result, double_square(values, start + i, squared));
     return result;
 }
 
-ulong double_sum(device const ulong* values, uint count, uint sequential) {
+ulong double_sum(device const ulong* values, uint count, uint sequential, bool squared = true) {
     if (sequential) {
         ulong result = 0;
-        for (uint i = 0; i < count; ++i) result = add_positive_double(result, double_square(values, i));
+        for (uint i = 0; i < count; ++i) result = add_positive_double(result, double_square(values, i, squared));
         return result;
     }
     uint starts[16], lengths[16], states[16], depth = 0;
@@ -84,7 +84,7 @@ ulong double_sum(device const ulong* values, uint count, uint sequential) {
     starts[0] = 0; lengths[0] = count; states[0] = 0;
     while (true) {
         uint length = lengths[depth], start = starts[depth];
-        if (length <= 128) result = double_leaf(values, start, length);
+        if (length <= 128) result = double_leaf(values, start, length, squared);
         else {
             uint split = (length / 2) & ~7u;
             if (states[depth] == 0) { states[depth] = 1; ++depth; starts[depth] = start; lengths[depth] = split; states[depth] = 0; continue; }
@@ -160,4 +160,25 @@ kernel void double_vbx_rho(device const ulong* input [[buffer(0)]], constant Dou
     if (index >= d.rows * d.columns) return;
     ulong a = input[index], b = terms[d.rows + index % d.columns], sign = 1ul << 63;
     output[index] = multiply_positive_binary64(a & (sign - 1), b & (sign - 1)) | ((a ^ b) & sign);
+}
+
+struct StatisticsDimensions { uint rows, columns, features, operation, sequential, reserved; ulong fa, fb; };
+
+// Responsibilities are staged as contiguous speaker rows; their original axis-zero reduction order is explicit.
+kernel void double_vbx_gamma_sum(device const ulong* input [[buffer(0)]], constant StatisticsDimensions& d [[buffer(1)]], device ulong* sums [[buffer(2)]], uint speaker [[thread_position_in_grid]]) {
+    if (speaker < d.rows) sums[speaker] = double_sum(input + speaker * d.columns, d.columns, d.sequential, false);
+}
+
+// Division and each multiplication are separately rounded in the original Python expression order.
+kernel void double_vbx_statistics(device const ulong* input [[buffer(0)]], constant StatisticsDimensions& d [[buffer(1)]], device const ulong* right [[buffer(2)]], device const ulong* sums [[buffer(3)]], device ulong* output [[buffer(4)]], uint index [[thread_position_in_grid]]) {
+    if (index >= d.rows * d.features) return;
+    ulong ratio = divide_positive_binary64(d.fa, d.fb), sign = 1ul << 63;
+    if (d.operation == 0) {
+        ulong weighted = multiply_positive_binary64(ratio, sums[index / d.features]);
+        ulong precision = add_positive_double(0x3ff0000000000000ul, multiply_positive_binary64(weighted, right[index % d.features] & (sign - 1)));
+        output[index] = divide_positive_binary64(0x3ff0000000000000ul, precision);
+    } else {
+        ulong value = right[index];
+        output[index] = multiply_positive_binary64(multiply_positive_binary64(ratio, input[index]), value & (sign - 1)) | (value & sign);
+    }
 }

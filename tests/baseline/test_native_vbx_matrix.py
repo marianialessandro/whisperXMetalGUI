@@ -178,6 +178,50 @@ class NativeVBXMatrixTests(unittest.TestCase):
                     pass
         self.assertIs(vbx.VBx, original)
 
+    def test_native_statistics_complete_result_layouts_and_skipped_initial_update(self):
+        features, phi, gamma = self.fixture()
+        with self.context() as context:
+            for layout, speakers in (("C", 3), ("F", 3), ("C", 1)):
+                initial_gamma = np.array(gamma[:, :speakers], order=layout)
+                with native_vbx_matrix_products(context, [], [], precompute=True, precompute_records=[]):
+                    expected = vbx.VBx(features, phi, Fa=.07, Fb=.8, pi=speakers, gamma=initial_gamma.copy(order="K"), maxIters=5, return_model=True)
+                records, calls, statistics = [], [], []
+                with native_vbx_matrix_products(context, records, calls, precompute=True, precompute_records=[], statistics=True, statistics_records=statistics):
+                    actual = vbx.VBx(features, phi, Fa=.07, Fb=.8, pi=speakers, gamma=initial_gamma.copy(order="K"), maxIters=5, return_model=True)
+                self.compare(expected, actual)
+                self.assertEqual(calls[0]["native_statistics_calls"], 2 * len(actual[2]))
+                self.assertEqual(len(records), 3 * len(actual[2]))
+                self.assertEqual(statistics[0]["reduction_order"], "sequential" if layout == "C" and speakers > 1 else "pairwise")
+                self.assertEqual({r["operation"] for r in statistics}, {"invL", "alpha"})
+                self.assertTrue(all(r["computation_gpu_seconds"] > 0 for r in statistics))
+            statistics, calls = [], []
+            with native_vbx_matrix_products(context, [], calls, statistics=True, statistics_records=statistics):
+                vbx.VBx(features, phi, pi=3, gamma=gamma, maxIters=1, alpha=np.zeros((3, 8)), invL=np.ones((3, 8)))
+                vbx.VBx(features, phi, pi=3, gamma=gamma, maxIters=0)
+            self.assertEqual(statistics, [])
+            self.assertEqual([c["native_statistics_calls"] for c in calls], [0, 0])
+
+    def test_statistics_failure_capability_and_ast_contract_restore(self):
+        features, phi, gamma = self.fixture()
+        original = vbx.VBx
+        with self.context() as context:
+            with self.assertRaisesRegex(ValueError, "statistics_records_required"):
+                with native_vbx_matrix_products(context, [], [], statistics=True):
+                    pass
+            with patch.object(context, "library", SimpleNamespace(wxdouble_matmul=object())), self.assertRaisesRegex(ValueError, "statistics_abi_unavailable"):
+                with native_vbx_matrix_products(context, [], [], statistics=True, statistics_records=[]):
+                    pass
+            calls, statistics = [], []
+            with self.assertRaisesRegex(ValueError, "injected_statistics_failure"):
+                with native_vbx_matrix_products(context, [], calls, statistics=True, statistics_records=statistics), patch.object(context, "inv_l_vbx", side_effect=ValueError("injected_statistics_failure")):
+                    vbx.VBx(features, phi, pi=3, gamma=gamma, maxIters=1)
+            self.assertEqual(calls[0]["status"], "failed")
+            self.assertEqual(statistics, [])
+            self.assertIs(vbx.VBx, original)
+            changed = textwrap.dedent(inspect.getsource(original)).replace("Fa / Fb * invL", "(Fa * invL) / Fb")
+            with patch("tools.baseline.native_vbx_matrix.inspect.getsource", return_value=changed), patch("tools.baseline.native_vbx_matrix.VBX_SHA256", hashlib.sha256(changed.encode()).hexdigest()), self.assertRaisesRegex(ValueError, "statistics_expression_contract_changed"):
+                compile_native_vbx(original, object(), statistics=object())
+
     def test_unrelated_threads_and_multiple_calls_keep_separate_metadata(self):
         features, phi, gamma = self.fixture()
         expected = vbx.VBx(features, phi, Fa=.07, Fb=.8, pi=3, gamma=gamma.copy(), maxIters=3)

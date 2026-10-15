@@ -241,6 +241,63 @@ class NativeDoubleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "closed"):
             context.precompute_vbx(values, phi)
 
+    def test_vbx_statistics_bitwise_reductions_alpha_and_bounds(self):
+        rng = np.random.default_rng(923)
+        with self.context() as context:
+            for frames in (1, 7, 8, 127, 128, 129, 256, 1024, 4096):
+                gamma = rng.uniform(0., 1., (frames, 3))
+                phi = rng.uniform(.1, 8., 17)
+                for layout in ("C", "F"):
+                    source = np.array(gamma, order=layout)
+                    expected = 1. / (1 + .07 / .8 * source.sum(axis=0, keepdims=True).T * phi)
+                    actual, record = context.inv_l_vbx(np.ascontiguousarray(source.T), phi, .07, .8, "sequential" if layout == "C" else "pairwise")
+                    np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+                    statistics = rng.normal(size=actual.shape)
+                    statistics[0, :2] = (0., -0.)
+                    alpha, alpha_record = context.alpha_vbx(actual, statistics, .07, .8)
+                    reference = .07 / .8 * expected * statistics
+                    np.testing.assert_array_equal(alpha.view(np.uint64), reference.view(np.uint64))
+                    self.assertGreater(record["computation_gpu_seconds"], 0)
+                    self.assertEqual(alpha_record["gpu_kernels"], ["double_vbx_statistics"])
+            for fa, fb in ((2. ** -20, 2. ** 20), (2. ** 20, 2. ** -20)):
+                gamma = np.array([[0., 2. ** -160, 1.]])
+                phi = np.array([0., 2. ** -100, 2. ** 100])
+                expected = 1. / (1 + fa / fb * gamma.sum(axis=1, keepdims=True) * phi)
+                actual, _ = context.inv_l_vbx(gamma, phi, fa, fb)
+                np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+                stats = np.array([[-0., 2. ** -100, -(2. ** 100)]])
+                alpha, _ = context.alpha_vbx(actual, stats, fa, fb)
+                np.testing.assert_array_equal(alpha.view(np.uint64), (fa / fb * expected * stats).view(np.uint64))
+
+    def test_vbx_statistics_validation_lifetime_threads_and_capability(self):
+        gamma, phi = np.full((3, 19), .2), np.ones(8)
+        gamma.flags.writeable = phi.flags.writeable = False
+        with self.context() as context:
+            for invalid in (np.nan, np.inf, -1., 1.1, 2. ** -161):
+                with self.assertRaisesRegex(ValueError, "input_domain_invalid"):
+                    context.inv_l_vbx(np.full_like(gamma, invalid), phi, .07, .8)
+            for invalid in (0., -1., np.inf, 2. ** -21, 2. ** 21):
+                with self.assertRaisesRegex(ValueError, "scalar_domain_invalid"):
+                    context.inv_l_vbx(gamma, phi, invalid, .8)
+            for invalid in (np.nan, np.inf, -1., 2. ** -101, 2. ** 101):
+                with self.assertRaisesRegex(ValueError, "right_domain_invalid"):
+                    context.inv_l_vbx(gamma, np.full_like(phi, invalid), .07, .8)
+            for left, right in ((gamma.astype(np.float32), phi), (gamma[:, ::2], phi), (gamma, phi.astype(np.float32)), (gamma, phi.reshape(1, -1)), (np.empty((0, 19)), phi)):
+                with self.assertRaises(ValueError):
+                    context.inv_l_vbx(left, right, .07, .8)
+            with self.assertRaises(ValueError):
+                context.alpha_vbx(np.ones((3, 8)), np.ones((3, 7)), .07, .8)
+            with self.assertRaisesRegex(ValueError, "input_domain_invalid"):
+                context.alpha_vbx(np.zeros((3, 8)), np.ones((3, 8)), .07, .8)
+            with patch.object(context, "library", SimpleNamespace()), self.assertRaisesRegex(ValueError, "abi_unavailable"):
+                context.inv_l_vbx(gamma, phi, .07, .8)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(context.inv_l_vbx, gamma, phi, .07, .8) for _ in range(4)]
+                for future in futures:
+                    self.assertEqual(future.result()[0].shape, (3, 8))
+        with self.assertRaisesRegex(ValueError, "closed"):
+            context.inv_l_vbx(gamma, phi, .07, .8)
+
     def test_native_abi_under_address_and_undefined_sanitizers(self):
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory:

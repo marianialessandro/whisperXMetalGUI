@@ -63,6 +63,7 @@ def main(argv=None):
     parser.add_argument("--plda-centering-scaling", action="store_true", help="Additionally run all three PLDA centering and both dimension-scaling steps on Metal, including scalar square roots; requires --plda-matrix-products and elementwise ABI.")
     parser.add_argument("--vbx-matrix-products", action="store_true", help="Run the three recurring VBx matrix/vector products on native Metal; requires --plda-normalization-library with matrix ABI. Other VBx arithmetic and stopping remain original.")
     parser.add_argument("--vbx-precomputed-terms", action="store_true", help="Additionally prepare G, sqrt(Phi) and rho on Metal; requires --vbx-matrix-products and precompute ABI. NumPy reduction order and pinned log(2*pi) constant are preserved.")
+    parser.add_argument("--vbx-statistics", action="store_true", help="Additionally reduce gamma and update invL/alpha on Metal; requires --vbx-matrix-products and statistics ABI. Log/exp, posteriors and ELBO remain original.")
     args, forwarded = parser.parse_known_args(argv)
     if not forwarded:
         parser.error("WhisperX audio paths and pipeline options are required.")
@@ -86,10 +87,12 @@ def main(argv=None):
         parser.error("--plda-centering-scaling requires --plda-matrix-products.")
     if args.vbx_matrix_products and not args.plda_normalization_library:
         parser.error("--vbx-matrix-products requires --plda-normalization-library and its SHA256.")
+    if args.vbx_statistics and not args.vbx_matrix_products:
+        parser.error("--vbx-statistics requires --vbx-matrix-products.")
     if args.vbx_precomputed_terms and not args.vbx_matrix_products:
         parser.error("--vbx-precomputed-terms requires --vbx-matrix-products.")
-    report = {"schema_version": 1, "scope": "source_checkout_native_mps_ctc", "status": "failed", "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False, "resident_statistics": args.resident_statistics, "embedding_normalization_requested": bool(args.embedding_library), "plda_normalization_requested": bool(args.plda_normalization_library), "plda_matrix_products_requested": args.plda_matrix_products, "plda_centering_scaling_requested": args.plda_centering_scaling, "vbx_matrix_products_requested": args.vbx_matrix_products, "vbx_precomputed_terms_requested": args.vbx_precomputed_terms}
-    records = {key: [] for key in ("ctc", "bounds", "means", "rounding", "interpolation", "speaker_assignment", "embedding_normalization", "plda_normalization", "plda_matrix_products", "plda_centering_scaling", "vbx_matrix_products", "vbx_precomputed_terms")}
+    report = {"schema_version": 1, "scope": "source_checkout_native_mps_ctc", "status": "failed", "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False, "resident_statistics": args.resident_statistics, "embedding_normalization_requested": bool(args.embedding_library), "plda_normalization_requested": bool(args.plda_normalization_library), "plda_matrix_products_requested": args.plda_matrix_products, "plda_centering_scaling_requested": args.plda_centering_scaling, "vbx_matrix_products_requested": args.vbx_matrix_products, "vbx_statistics_requested": args.vbx_statistics, "vbx_precomputed_terms_requested": args.vbx_precomputed_terms}
+    records = {key: [] for key in ("ctc", "bounds", "means", "rounding", "interpolation", "speaker_assignment", "embedding_normalization", "plda_normalization", "plda_matrix_products", "plda_centering_scaling", "vbx_matrix_products", "vbx_precomputed_terms", "vbx_statistics")}
     vbx_calls = []
     with args.native_report.open("x", encoding="utf-8") as output:
         try:
@@ -122,7 +125,7 @@ def main(argv=None):
                                 scopes.enter_context(native_plda_matrix_products(plda_context, records["plda_matrix_products"], centering_scaling=args.plda_centering_scaling, elementwise_records=records["plda_centering_scaling"]))
                             if args.vbx_matrix_products:
                                 from tools.baseline.native_vbx_matrix import native_vbx_matrix_products
-                                scopes.enter_context(native_vbx_matrix_products(plda_context, records["vbx_matrix_products"], vbx_calls, precompute=args.vbx_precomputed_terms, precompute_records=records["vbx_precomputed_terms"]))
+                                scopes.enter_context(native_vbx_matrix_products(plda_context, records["vbx_matrix_products"], vbx_calls, precompute=args.vbx_precomputed_terms, precompute_records=records["vbx_precomputed_terms"], statistics=args.vbx_statistics, statistics_records=records["vbx_statistics"]))
                         if args.embedding_library:
                             from tools.baseline.native_embedding import NativeEmbeddingNormalization
                             from tools.baseline.native_embedding_adapter import native_embedding_normalization
@@ -145,6 +148,8 @@ def main(argv=None):
         finally:
             report["operations"] = records
             report["native_ctc_calls"] = len(records["ctc"])
+            report["native_vbx_statistics_calls"] = len(records["vbx_statistics"])
+            report["vbx_statistics_observed"] = bool(records["vbx_statistics"])
             report["vbx_calls"] = vbx_calls
             report["native_vbx_precompute_calls"] = len(records["vbx_precomputed_terms"])
             report["vbx_precomputed_terms_observed"] = bool(records["vbx_precomputed_terms"])
