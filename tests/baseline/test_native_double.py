@@ -624,6 +624,47 @@ class NativeDoubleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "closed"):
             context.logsumexp_vbx(values)
 
+    def test_vbx_initialization_bitwise_numpy_reductions_and_uniform_prior(self):
+        rng = np.random.default_rng(1407)
+        with self.context() as context:
+            for columns in (1, 3, 7, 8, 10, 127, 128, 129, 1024):
+                actual, record = context.uniform_prior_vbx(columns)
+                np.testing.assert_array_equal(actual.view(np.uint64), (np.ones(columns) / columns).view(np.uint64))
+                self.assertEqual(record["logical_input_upload_bytes"], 0)
+                self.assertGreater(record["computation_gpu_seconds"], 0)
+                for order in ("C", "F"):
+                    values = np.array(rng.uniform(.01, 10., (19, columns)), order=order)
+                    values[0, 0] = -0. if columns > 1 else 1.
+                    expected = values / values.sum(1, keepdims=True)
+                    actual, _ = context.normalize_initial_gamma_vbx(np.ascontiguousarray(values), "pairwise" if order == "C" else "sequential")
+                    np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+            for values in (np.full((4096, 1), 2. ** -200), np.array([[2. ** -200, 2. ** 200, -0.]])):
+                actual, _ = context.normalize_initial_gamma_vbx(values)
+                np.testing.assert_array_equal(actual.view(np.uint64), (values / values.sum(1, keepdims=True)).view(np.uint64))
+
+    def test_vbx_initialization_domains_lifetime_threads_and_capability(self):
+        values = np.ones((3, 8))
+        values.flags.writeable = False
+        with self.context() as context:
+            for invalid in (True, 0, -1, 1025, 3., np.int64(3)):
+                with self.assertRaises(ValueError):
+                    context.uniform_prior_vbx(invalid)
+            for invalid in (0., -1., np.nan, np.inf, 2. ** 201, 2. ** -201):
+                with self.assertRaises(ValueError):
+                    context.normalize_initial_gamma_vbx(np.full_like(values, invalid))
+            for invalid in (values.astype(np.float32), values[:, ::2], np.ones((4097, 1)), np.ones((1, 1025)), np.ones(3)):
+                with self.assertRaises(ValueError):
+                    context.normalize_initial_gamma_vbx(invalid)
+            with self.assertRaises(ValueError):
+                context.normalize_initial_gamma_vbx(values, "invalid")
+            with patch.object(context, "library", SimpleNamespace()), self.assertRaisesRegex(ValueError, "abi_unavailable"):
+                context.uniform_prior_vbx(3)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                for result in executor.map(context.normalize_initial_gamma_vbx, [values] * 4):
+                    np.testing.assert_array_equal(result[0], np.full_like(values, .125))
+        with self.assertRaisesRegex(ValueError, "closed"):
+            context.uniform_prior_vbx(3)
+
     def test_native_abi_under_address_and_undefined_sanitizers(self):
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory:

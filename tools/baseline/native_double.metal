@@ -435,3 +435,20 @@ kernel void double_vbx_lse_final(device const ulong* exponentials [[buffer(0)]],
     ulong scaled = divide_positive_binary64(sum, mass);
     output[row] = matrix_add(matrix_add(bounded_binary64_log1p(scaled), bounded_binary64_log(mass)), metadata[row * 3]);
 }
+
+struct InitializationDimensions { uint rows, columns, operation, sequential; };
+
+// Uniform-prior division and initial responsibility normalization retain binary64 rounding without changing the random sample sequence.
+kernel void double_vbx_initialize(device const ulong* input [[buffer(0)]], constant InitializationDimensions& d [[buffer(1)]], device ulong* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    if (d.operation == 0) {
+        if (index < d.columns) output[index] = divide_positive_binary64(0x3ff0000000000000ul, dimension_binary64(d.columns));
+        return;
+    }
+    if (index >= d.rows) return;
+    uint start = index * d.columns;
+    ulong mass = double_sum(input + start, d.columns, d.sequential, false), sign = 1ul << 63;
+    for (uint column = 0; column < d.columns; ++column) {
+        ulong value = input[start + column];
+        output[start + column] = divide_positive_binary64(value & (sign - 1), mass) | (value & sign);
+    }
+}

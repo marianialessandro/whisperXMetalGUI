@@ -70,6 +70,7 @@ def main(argv=None):
     parser.add_argument("--vbx-elbo-arithmetic", action="store_true", help="Additionally reduce likelihood and compute ELBO regularization on Metal; requires --vbx-matrix-products and ELBO ABI. Inverse-precision log and stopping remain original.")
     parser.add_argument("--vbx-transcendentals", action="store_true", help="Additionally run bounded OpenLibm-policy binary64 log/exp on Metal; requires --vbx-matrix-products and transcendental ABI. Rounding can differ from NumPy; logsumexp remains original.")
     parser.add_argument("--vbx-logsumexp", action="store_true", help="Additionally run bounded finite unweighted logsumexp on Metal; requires --vbx-matrix-products, logsumexp ABI and pinned SciPy 1.15.3. Uses OpenLibm-policy math; may differ from SciPy rounding.")
+    parser.add_argument("--vbx-initialization", action="store_true", help="Additionally initialize uniform VBx priors and normalize generated gamma on Metal; requires --vbx-matrix-products and initialization ABI. NumPy random sampling remains unchanged on CPU.")
     parser.add_argument("--vbx-scalar-arithmetic", action="store_true", help="Additionally add prior epsilon and subtract ELBO scalars on Metal; requires --vbx-matrix-products and posterior ABI. Original comparisons and stopping control are preserved.")
     args, forwarded = parser.parse_known_args(argv)
     if not forwarded:
@@ -94,6 +95,8 @@ def main(argv=None):
         parser.error("--plda-centering-scaling requires --plda-matrix-products.")
     if args.vbx_matrix_products and not args.plda_normalization_library:
         parser.error("--vbx-matrix-products requires --plda-normalization-library and its SHA256.")
+    if args.vbx_initialization and not args.vbx_matrix_products:
+        parser.error("--vbx-initialization requires --vbx-matrix-products.")
     if args.vbx_scalar_arithmetic and not args.vbx_matrix_products:
         parser.error("--vbx-scalar-arithmetic requires --vbx-matrix-products.")
     if args.vbx_logsumexp and not args.vbx_matrix_products:
@@ -112,8 +115,8 @@ def main(argv=None):
         parser.error("--vbx-statistics requires --vbx-matrix-products.")
     if args.vbx_precomputed_terms and not args.vbx_matrix_products:
         parser.error("--vbx-precomputed-terms requires --vbx-matrix-products.")
-    report = {"schema_version": 1, "scope": "source_checkout_native_mps_ctc", "status": "failed", "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False, "resident_statistics": args.resident_statistics, "embedding_normalization_requested": bool(args.embedding_library), "plda_normalization_requested": bool(args.plda_normalization_library), "plda_matrix_products_requested": args.plda_matrix_products, "plda_centering_scaling_requested": args.plda_centering_scaling, "vbx_matrix_products_requested": args.vbx_matrix_products, "vbx_scalar_arithmetic_requested": args.vbx_scalar_arithmetic, "vbx_logsumexp_requested": args.vbx_logsumexp, "vbx_transcendentals_requested": args.vbx_transcendentals, "vbx_elbo_arithmetic_requested": args.vbx_elbo_arithmetic, "vbx_posterior_arithmetic_requested": args.vbx_posterior_arithmetic, "vbx_prior_updates_requested": args.vbx_prior_updates, "vbx_score_arithmetic_requested": args.vbx_score_arithmetic, "vbx_statistics_requested": args.vbx_statistics, "vbx_precomputed_terms_requested": args.vbx_precomputed_terms}
-    records = {key: [] for key in ("ctc", "bounds", "means", "rounding", "interpolation", "speaker_assignment", "embedding_normalization", "plda_normalization", "plda_matrix_products", "plda_centering_scaling", "vbx_matrix_products", "vbx_precomputed_terms", "vbx_statistics", "vbx_score_arithmetic", "vbx_prior_updates", "vbx_posterior_arithmetic", "vbx_elbo_arithmetic", "vbx_transcendentals", "vbx_logsumexp", "vbx_scalar_arithmetic")}
+    report = {"schema_version": 1, "scope": "source_checkout_native_mps_ctc", "status": "failed", "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False, "resident_statistics": args.resident_statistics, "embedding_normalization_requested": bool(args.embedding_library), "plda_normalization_requested": bool(args.plda_normalization_library), "plda_matrix_products_requested": args.plda_matrix_products, "plda_centering_scaling_requested": args.plda_centering_scaling, "vbx_matrix_products_requested": args.vbx_matrix_products, "vbx_initialization_requested": args.vbx_initialization, "vbx_scalar_arithmetic_requested": args.vbx_scalar_arithmetic, "vbx_logsumexp_requested": args.vbx_logsumexp, "vbx_transcendentals_requested": args.vbx_transcendentals, "vbx_elbo_arithmetic_requested": args.vbx_elbo_arithmetic, "vbx_posterior_arithmetic_requested": args.vbx_posterior_arithmetic, "vbx_prior_updates_requested": args.vbx_prior_updates, "vbx_score_arithmetic_requested": args.vbx_score_arithmetic, "vbx_statistics_requested": args.vbx_statistics, "vbx_precomputed_terms_requested": args.vbx_precomputed_terms}
+    records = {key: [] for key in ("ctc", "bounds", "means", "rounding", "interpolation", "speaker_assignment", "embedding_normalization", "plda_normalization", "plda_matrix_products", "plda_centering_scaling", "vbx_matrix_products", "vbx_precomputed_terms", "vbx_statistics", "vbx_score_arithmetic", "vbx_prior_updates", "vbx_posterior_arithmetic", "vbx_elbo_arithmetic", "vbx_transcendentals", "vbx_logsumexp", "vbx_scalar_arithmetic", "vbx_initialization")}
     vbx_calls = []
     with args.native_report.open("x", encoding="utf-8") as output:
         try:
@@ -146,7 +149,7 @@ def main(argv=None):
                                 scopes.enter_context(native_plda_matrix_products(plda_context, records["plda_matrix_products"], centering_scaling=args.plda_centering_scaling, elementwise_records=records["plda_centering_scaling"]))
                             if args.vbx_matrix_products:
                                 from tools.baseline.native_vbx_matrix import native_vbx_matrix_products
-                                scopes.enter_context(native_vbx_matrix_products(plda_context, records["vbx_matrix_products"], vbx_calls, precompute=args.vbx_precomputed_terms, precompute_records=records["vbx_precomputed_terms"], statistics=args.vbx_statistics, statistics_records=records["vbx_statistics"], scores=args.vbx_score_arithmetic, score_records=records["vbx_score_arithmetic"], prior=args.vbx_prior_updates, prior_records=records["vbx_prior_updates"], posterior=args.vbx_posterior_arithmetic, posterior_records=records["vbx_posterior_arithmetic"], elbo=args.vbx_elbo_arithmetic, elbo_records=records["vbx_elbo_arithmetic"], transcendentals=args.vbx_transcendentals, transcendental_records=records["vbx_transcendentals"], logsumexp=args.vbx_logsumexp, logsumexp_records=records["vbx_logsumexp"], scalars=args.vbx_scalar_arithmetic, scalar_records=records["vbx_scalar_arithmetic"]))
+                                scopes.enter_context(native_vbx_matrix_products(plda_context, records["vbx_matrix_products"], vbx_calls, precompute=args.vbx_precomputed_terms, precompute_records=records["vbx_precomputed_terms"], statistics=args.vbx_statistics, statistics_records=records["vbx_statistics"], scores=args.vbx_score_arithmetic, score_records=records["vbx_score_arithmetic"], prior=args.vbx_prior_updates, prior_records=records["vbx_prior_updates"], posterior=args.vbx_posterior_arithmetic, posterior_records=records["vbx_posterior_arithmetic"], elbo=args.vbx_elbo_arithmetic, elbo_records=records["vbx_elbo_arithmetic"], transcendentals=args.vbx_transcendentals, transcendental_records=records["vbx_transcendentals"], logsumexp=args.vbx_logsumexp, logsumexp_records=records["vbx_logsumexp"], scalars=args.vbx_scalar_arithmetic, scalar_records=records["vbx_scalar_arithmetic"], initialization=args.vbx_initialization, initialization_records=records["vbx_initialization"]))
                         if args.embedding_library:
                             from tools.baseline.native_embedding import NativeEmbeddingNormalization
                             from tools.baseline.native_embedding_adapter import native_embedding_normalization
@@ -169,6 +172,8 @@ def main(argv=None):
         finally:
             report["operations"] = records
             report["native_ctc_calls"] = len(records["ctc"])
+            report["native_vbx_initialization_calls"] = len(records["vbx_initialization"])
+            report["vbx_initialization_observed"] = bool(records["vbx_initialization"])
             report["native_vbx_scalar_calls"] = len(records["vbx_scalar_arithmetic"])
             report["vbx_scalar_arithmetic_observed"] = bool(records["vbx_scalar_arithmetic"])
             report["native_vbx_logsumexp_calls"] = len(records["vbx_logsumexp"])

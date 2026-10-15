@@ -18,7 +18,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.baseline.native_double import NativeDoubleNormalization, build_library
-from tools.baseline.native_vbx_matrix import compile_native_vbx, native_vbx_matrix_products, prior_update, elbo_arithmetic, transcendental_update, logsumexp_update, scalar_arithmetic
+from tools.baseline.native_vbx_matrix import compile_native_vbx, native_vbx_matrix_products, prior_update, elbo_arithmetic, transcendental_update, logsumexp_update, scalar_arithmetic, initialization_update
 
 
 @unittest.skipUnless(platform.system() == "Darwin" and torch.backends.mps.is_available(), "Apple Metal required")
@@ -592,6 +592,75 @@ class NativeVBXMatrixTests(unittest.TestCase):
             changed = textwrap.dedent(inspect.getsource(original)).replace("pi + eps", "eps + pi")
             with patch("tools.baseline.native_vbx_matrix.inspect.getsource", return_value=changed), patch("tools.baseline.native_vbx_matrix.VBX_SHA256", hashlib.sha256(changed.encode()).hexdigest()), self.assertRaisesRegex(ValueError, "scalar_expression_contract_changed"):
                 compile_native_vbx(original, object(), scalar=object())
+
+    def test_initialization_all_flags_bitwise_and_seeded_rng_state(self):
+        features, phi, gamma = self.fixture()
+        names = ("precompute", "statistics", "scores", "prior", "posterior", "elbo", "transcendentals", "logsumexp", "scalars")
+        record_names = ("precompute_records", "statistics_records", "score_records", "prior_records", "posterior_records", "elbo_records", "transcendental_records", "logsumexp_records", "scalar_records")
+        with self.context() as context:
+            for mask in range(512):
+                options = {name: bool(mask & (1 << index)) for index, name in enumerate(names)}
+                options.update({name: [] for name in record_names})
+                with native_vbx_matrix_products(context, [], [], **options):
+                    expected = vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=2, return_model=True, epsilon=-np.inf)
+                records, calls = [], []
+                with native_vbx_matrix_products(context, [], calls, initialization=True, initialization_records=records, **options):
+                    actual = vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=2, return_model=True, epsilon=-np.inf)
+                self.compare(expected, actual)
+                self.assertEqual(calls[0]["native_initialization_calls"], 1)
+                self.assertFalse(calls[0]["rng_initialization_requested"])
+                self.assertFalse(calls[0]["rng_initialization_observed"])
+                self.assertEqual(records[0]["operation"], "uniform_prior")
+            saved_state = np.random.get_state()
+            try:
+                for iterations in (0, 3):
+                    np.random.seed(772)
+                    with native_vbx_matrix_products(context, [], []):
+                        expected = vbx.VBx(features, phi, pi=3, maxIters=iterations)
+                    expected_state = np.random.get_state()
+                    np.random.seed(772)
+                    records, calls = [], []
+                    with native_vbx_matrix_products(context, [], calls, initialization=True, initialization_records=records):
+                        actual = vbx.VBx(features, phi, pi=3, maxIters=iterations)
+                    actual_state = np.random.get_state()
+                    self.compare(expected, actual)
+                    for left, right in zip(expected_state, actual_state):
+                        np.testing.assert_array_equal(left, right)
+                    self.assertEqual(calls[0]["native_initialization_calls"], 2)
+                    self.assertTrue(calls[0]["rng_initialization_requested"])
+                    self.assertTrue(calls[0]["rng_initialization_observed"])
+            finally:
+                np.random.set_state(saved_state)
+
+    def test_initialization_layout_zero_iteration_capability_and_source_restore(self):
+        features, phi, gamma = self.fixture()
+        original = vbx.VBx
+        with self.context() as context:
+            values = np.asfortranarray(gamma)
+            result = initialization_update(context, [], values, "gamma_l1_normalization", 0)
+            self.assertTrue(result.flags.f_contiguous)
+            np.testing.assert_array_equal(result.view(np.uint64), (values / values.sum(1, keepdims=True)).view(np.uint64))
+            for pi, count in ((3, 1), (np.ones(3) / 3, 0)):
+                calls = []
+                with native_vbx_matrix_products(context, [], calls, initialization=True, initialization_records=[]):
+                    vbx.VBx(features, phi, pi=pi, gamma=gamma, maxIters=0)
+                self.assertEqual(calls[0]["native_initialization_calls"], count)
+            with self.assertRaisesRegex(ValueError, "initialization_records_required"):
+                with native_vbx_matrix_products(context, [], [], initialization=True):
+                    pass
+            with patch.object(context, "library", SimpleNamespace(wxdouble_matmul=object())), self.assertRaisesRegex(ValueError, "initialization_abi_unavailable"):
+                with native_vbx_matrix_products(context, [], [], initialization=True, initialization_records=[]):
+                    pass
+            calls, records = [], []
+            with self.assertRaisesRegex(ValueError, "injected_initialization_failure"):
+                with native_vbx_matrix_products(context, [], calls, initialization=True, initialization_records=records), patch.object(context, "uniform_prior_vbx", side_effect=ValueError("injected_initialization_failure")):
+                    vbx.VBx(features, phi, pi=3, gamma=gamma, maxIters=1)
+            self.assertEqual(calls[0]["status"], "failed")
+            self.assertEqual(records, [])
+            self.assertIs(vbx.VBx, original)
+            changed = textwrap.dedent(inspect.getsource(original)).replace("np.ones(pi) / pi", "np.full(pi, 1.) / pi")
+            with patch("tools.baseline.native_vbx_matrix.inspect.getsource", return_value=changed), patch("tools.baseline.native_vbx_matrix.VBX_SHA256", hashlib.sha256(changed.encode()).hexdigest()), self.assertRaisesRegex(ValueError, "initialization_expression_contract_changed"):
+                compile_native_vbx(original, object(), initialize=object())
 
     def test_unrelated_threads_and_multiple_calls_keep_separate_metadata(self):
         features, phi, gamma = self.fixture()

@@ -391,6 +391,39 @@ class NativeDoubleNormalization:
         return output, {"scope": "experimental_native_binary64_finite_logsumexp", "rows": rows, "columns": columns, "reduction_order": reduction_order, "shift_domain": [-60, 0], "approximation_policy": "scipy_1_15_3_separated_maxima_openlibm_math", "scipy_bitwise_certified": False, "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": ["double_vbx_lse_terms", "double_vbx_lse_final"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
 
+    def uniform_prior_vbx(self, speakers):
+        if type(speakers) is not int or not 0 < speakers <= 1024:
+            raise ValueError("double_vbx_uniform_prior_shape_invalid")
+        output, record = self._initialize_vbx(None, 1, speakers, 0, "pairwise")
+        return output[0], record
+
+    def normalize_initial_gamma_vbx(self, values, reduction_order="pairwise"):
+        if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim != 2 or not values.flags.c_contiguous:
+            raise ValueError("double_vbx_initialization_input_format_invalid")
+        rows, columns = values.shape
+        if not 0 < rows <= 4096 or not 0 < columns <= 1024 or reduction_order not in ("pairwise", "sequential"):
+            raise ValueError("double_vbx_initialization_shape_or_reduction_invalid")
+        return self._initialize_vbx(values, rows, columns, 1, reduction_order)
+
+    def _initialize_vbx(self, values, rows, columns, mode, reduction_order):
+        output, metrics, error = np.empty((rows, columns)), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_vbx_initialize
+            except AttributeError as failure:
+                raise ValueError("double_vbx_initialization_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, values.ctypes.data if values is not None else None, rows, columns, mode, int(reduction_order == "sequential"), output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 1 or not np.isfinite(output).all():
+            raise ValueError("double_vbx_initialization_native_result_invalid")
+        return output, {"scope": "experimental_native_binary64_vbx_initialization", "operation": "uniform_prior" if mode == 0 else "gamma_l1_normalization", "rows": rows, "columns": columns, "reduction_order": reduction_order if mode == 1 else None, "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": ["double_vbx_initialize"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes if values is not None else 0, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build", type=Path, required=True, help="Compile a new local dylib at this path; existing paths are never overwritten.")
