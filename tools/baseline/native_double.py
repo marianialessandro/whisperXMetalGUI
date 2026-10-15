@@ -344,6 +344,27 @@ class NativeDoubleNormalization:
         return output[0], {"scope": "experimental_native_binary64_vbx_elbo", "operation": "likelihood_sum" if mode == 0 else "elbo", "rows": rows, "columns": columns, "reduction_layout": "F" if column_order else "C", "reduction_order": "buffered_pairwise", "numpy_reduce_buffer_elements": 8192, "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": ["double_vbx_likelihood"] if mode == 0 else ["double_vbx_elbo_terms", "double_vbx_elbo_final"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": packed.nbytes + 16, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
 
+    def transcendental_vbx(self, values, operation):
+        if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim not in (1, 2) or not values.flags.c_contiguous or not 0 < values.size <= 65536 or operation not in ("log", "exp"):
+            raise ValueError("double_vbx_transcendental_input_format_invalid")
+        output, metrics, error = np.empty_like(values), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_vbx_transcendental
+            except AttributeError as failure:
+                raise ValueError("double_vbx_transcendental_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, values.ctypes.data, values.size, int(operation == "exp"), output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 1 or not np.isfinite(output).all():
+            raise ValueError("double_vbx_transcendental_native_result_invalid")
+        return output, {"scope": "experimental_native_binary64_log_exp", "operation": operation, "count": values.size, "arithmetic": "bounded_binary64_integer_emulation", "approximation_policy": "openlibm_fdlibm_separately_rounded", "numpy_bitwise_certified": False, "gpu_kernels": ["double_vbx_transcendental"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build", type=Path, required=True, help="Compile a new local dylib at this path; existing paths are never overwritten.")

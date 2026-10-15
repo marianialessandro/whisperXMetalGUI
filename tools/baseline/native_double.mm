@@ -16,13 +16,14 @@ struct ScoreDimensions { uint32_t rows, columns, operation, reserved; uint64_t f
 static_assert(sizeof(ScoreDimensions) == 24);
 struct ElboDimensions { uint32_t rows, columns, operation, column_order; uint64_t fb, likelihood; };
 static_assert(sizeof(ElboDimensions) == 32);
+struct TranscendentalDimensions { uint32_t count, operation; };
 struct DoubleMetrics { uint32_t version, kernels; uint64_t wall_ns; double gpu_seconds; uint64_t allocated_bytes; };
 static_assert(sizeof(DoubleMetrics) == 32);
 
 class DoubleContext {
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
-    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_;
+    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
     void reserve(id<MTLBuffer> __strong& buffer, uint64_t bytes) {
@@ -58,6 +59,8 @@ public:
         if (likelihood_function != nil) likelihood_pipeline_ = [device_ newComputePipelineStateWithFunction:likelihood_function error:&error];
         if (elbo_terms_function != nil) elbo_terms_pipeline_ = [device_ newComputePipelineStateWithFunction:elbo_terms_function error:&error];
         if (elbo_final_function != nil) elbo_final_pipeline_ = [device_ newComputePipelineStateWithFunction:elbo_final_function error:&error];
+        id<MTLFunction> transcendental_function = [library newFunctionWithName:@"double_vbx_transcendental"];
+        if (transcendental_function != nil) transcendental_pipeline_ = [device_ newComputePipelineStateWithFunction:transcendental_function error:&error];
         queue_ = [device_ newCommandQueue]; require(queue_ != nil, "double_queue_creation_failed");
     }
     DoubleMetrics normalize(const double* input, DoubleDimensions d, double* output) {
@@ -276,6 +279,24 @@ public:
         return {1, d.operation == 0 ? 1u : 2u, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
+    DoubleMetrics transcendental_vbx(const double* input, TranscendentalDimensions d, double* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(transcendental_pipeline_ != nil, "double_vbx_transcendental_kernel_unavailable");
+        require(d.count > 0 && d.count <= 65536 && d.operation <= 1 && input != nullptr && output != nullptr, "double_vbx_transcendental_shape_or_pointer_invalid");
+        for (uint32_t i = 0; i < d.count; ++i) require(std::isfinite(input[i]) && (d.operation == 0 ? input[i] >= 0x1p-200 && input[i] <= 0x1p200 : input[i] >= -60. && input[i] <= 0. && (input[i] == 0 || std::abs(input[i]) >= 0x1p-200)), "double_vbx_transcendental_input_domain_invalid");
+        auto started = std::chrono::steady_clock::now();
+        uint64_t bytes = uint64_t(d.count) * sizeof(double);
+        reserve(input_, bytes); reserve(output_, bytes); std::memcpy(input_.contents, input, bytes);
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental binary64 log/exp";
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:transcendental_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:output_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(d.count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, transcendental_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        std::memcpy(output, output_.contents, bytes);
+        return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
 };
 static void double_error(char* output, uint32_t capacity, const char* code) { if (output != nullptr && capacity) { std::strncpy(output, code, capacity - 1); output[capacity - 1] = 0; } }
 extern "C" int wxdouble_create(const char* source, uint64_t size, void** output, char* error, uint32_t capacity) {
@@ -346,6 +367,13 @@ extern "C" int wxdouble_vbx_elbo(void* context, const double* input, uint32_t ro
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->elbo_vbx(input, {rows, columns, operation, column_order, 0, 0}, fb, likelihood, output); return 0; }
         catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_vbx_elbo_failed"); return 1; }
+    }
+}
+extern "C" int wxdouble_vbx_transcendental(void* context, const double* input, uint32_t count, uint32_t operation, double* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->transcendental_vbx(input, {count, operation}, output); return 0; }
+        catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_vbx_transcendental_failed"); return 1; }
     }
 }
 extern "C" void wxdouble_destroy(void* context) { @autoreleasepool { delete static_cast<DoubleContext*>(context); } }

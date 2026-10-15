@@ -505,6 +505,54 @@ class NativeDoubleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "closed"):
             context.elbo_vbx(log, inv_l, alpha, -1., .8)
 
+    def test_vbx_transcendentals_bounded_accuracy_numpy_and_decimal(self):
+        from decimal import Decimal, localcontext
+        rng = np.random.default_rng(930)
+        log_values = np.concatenate((np.exp(rng.uniform(-130., 130., 20000)), np.ldexp(np.ones(401), np.arange(-200, 201)), np.array([np.nextafter(1., 0.), 1., np.nextafter(1., 2.)])))
+        exp_values = np.concatenate((rng.uniform(-60., 0., 20000), np.array([-60., -0., 0., -(2. ** -200)]), -np.arange(1, 80) * np.log(2)))
+        with self.context() as context:
+            for operation, values in (("log", log_values), ("exp", exp_values)):
+                actual, record = context.transcendental_vbx(values, operation)
+                expected = getattr(np, operation)(values)
+                a, b = actual.view(np.uint64), expected.view(np.uint64)
+                self.assertLessEqual(int(np.max(np.maximum(a, b) - np.minimum(a, b))), 1)
+                self.assertFalse(record["numpy_bitwise_certified"])
+                self.assertGreater(record["computation_gpu_seconds"], 0)
+                with localcontext() as precision:
+                    precision.prec = 90
+                    for index in np.linspace(0, len(values) - 1, 80, dtype=int):
+                        value = Decimal.from_float(float(values[index]))
+                        reference = np.float64(float(value.ln() if operation == "log" else value.exp()))
+                        self.assertLessEqual(abs(int(actual[index].view(np.uint64)) - int(reference.view(np.uint64))), 1)
+            result, _ = context.transcendental_vbx(np.array([1.]), "log")
+            self.assertEqual(result[0].view(np.uint64), np.uint64(0))
+            result, _ = context.transcendental_vbx(np.array([-0., 0.]), "exp")
+            np.testing.assert_array_equal(result, np.ones(2))
+            result, _ = context.transcendental_vbx(np.zeros(65536), "exp")
+            np.testing.assert_array_equal(result, np.ones(65536))
+
+    def test_vbx_transcendental_domain_lifetime_threads_and_capability(self):
+        values = np.ones((3, 8))
+        values.flags.writeable = False
+        with self.context() as context:
+            for operation, invalids in (("log", (0., -1., np.nan, np.inf, 2. ** -201, 2. ** 201)), ("exp", (-61., 1., np.nan, np.inf, -(2. ** -201)))):
+                for invalid in invalids:
+                    with self.assertRaisesRegex(ValueError, "domain_invalid"):
+                        context.transcendental_vbx(np.full_like(values, invalid), operation)
+            for invalid in (values.astype(np.float32), values[:, ::2], values.reshape(1, 3, 8), np.ones(65537), np.empty(0)):
+                with self.assertRaises(ValueError):
+                    context.transcendental_vbx(invalid, "log")
+            with self.assertRaises(ValueError):
+                context.transcendental_vbx(values, "invalid")
+            with patch.object(context, "library", SimpleNamespace()), self.assertRaisesRegex(ValueError, "abi_unavailable"):
+                context.transcendental_vbx(values, "log")
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(context.transcendental_vbx, values, "log") for _ in range(4)]
+                for future in futures:
+                    np.testing.assert_array_equal(future.result()[0], np.zeros_like(values))
+        with self.assertRaisesRegex(ValueError, "closed"):
+            context.transcendental_vbx(values, "log")
+
     def test_native_abi_under_address_and_undefined_sanitizers(self):
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory:

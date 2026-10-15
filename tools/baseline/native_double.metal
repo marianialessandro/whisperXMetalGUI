@@ -285,3 +285,80 @@ kernel void double_vbx_elbo_final(device const ulong* input [[buffer(0)]], const
     ulong penalty = multiply_positive_binary64(scale, sum & (sign - 1)) | (sum & sign);
     output[0] = matrix_add(d.likelihood, penalty);
 }
+
+// Algorithms adapted from OpenLibm e_log.c and e_exp.c for finite normal inputs using separately rounded integer-emulated binary64 operations.
+// Copyright (C) 1993, 2004 by Sun Microsystems, Inc. All rights reserved.
+// Developed at SunSoft, a Sun Microsystems, Inc. business.
+// Permission to use, copy, modify, and distribute this software is freely granted, provided that this notice is preserved.
+ulong df_sub(ulong a, ulong b) { return matrix_add(a, b ^ (1ul << 63)); }
+ulong df_mul(ulong a, ulong b) { ulong sign = 1ul << 63; return multiply_positive_binary64(a & (sign - 1), b & (sign - 1)) | ((a ^ b) & sign); }
+ulong df_div(ulong a, ulong b) { ulong sign = 1ul << 63; return divide_positive_binary64(a & (sign - 1), b & (sign - 1)) | ((a ^ b) & sign); }
+ulong df_integer(int value) { return value == 0 ? 0 : dimension_binary64(uint(value < 0 ? -value : value)) | (value < 0 ? 1ul << 63 : 0); }
+int df_truncate(ulong value) {
+    ulong sign = 1ul << 63, magnitude = value & (sign - 1);
+    int exponent = int(magnitude >> 52) - 1023;
+    if (exponent < 0) return 0;
+    ulong significand = (magnitude & ((1ul << 52) - 1)) | (1ul << 52);
+    int integer = int(significand >> uint(52 - exponent));
+    return value & sign ? -integer : integer;
+}
+
+ulong bounded_binary64_log(ulong value) {
+    ulong one = 0x3ff0000000000000ul, ln_hi = 0x3fe62e42fee00000ul, ln_lo = 0x3dea39ef35793c76ul;
+    uint hx = uint(value >> 32), low = uint(value);
+    int k = int(hx >> 20) - 1023;
+    hx &= 0x000fffffu;
+    uint adjust = (hx + 0x95f64u) & 0x100000u;
+    ulong normalized = (ulong(hx | (adjust ^ 0x3ff00000u)) << 32) | low;
+    k += int(adjust >> 20);
+    ulong f = df_sub(normalized, one), dk = df_integer(k);
+    if ((0x000fffffu & (2u + hx)) < 3u) {
+        if ((f & ((1ul << 63) - 1)) == 0) return k == 0 ? 0 : matrix_add(df_mul(dk, ln_hi), df_mul(dk, ln_lo));
+        ulong correction = df_mul(df_mul(f, f), df_sub(0x3fe0000000000000ul, df_mul(0x3fd5555555555555ul, f)));
+        return k == 0 ? df_sub(f, correction) : df_sub(df_mul(dk, ln_hi), df_sub(df_sub(correction, df_mul(dk, ln_lo)), f));
+    }
+    ulong ratio = df_div(f, matrix_add(0x4000000000000000ul, f)), z = df_mul(ratio, ratio), w = df_mul(z, z);
+    ulong even = df_mul(w, matrix_add(0x3fd999999997fa04ul, df_mul(w, matrix_add(0x3fcc71c51d8e78aful, df_mul(w, 0x3fc39a09d078c69ful)))));
+    ulong odd = df_mul(z, matrix_add(0x3fe5555555555593ul, df_mul(w, matrix_add(0x3fd2492494229359ul, df_mul(w, matrix_add(0x3fc7466496cb03deul, df_mul(w, 0x3fc2f112df3e5244ul)))))));
+    ulong correction = matrix_add(odd, even);
+    int upper = int(hx) - 0x6147a, lower = 0x6b851 - int(hx);
+    if ((upper | lower) > 0) {
+        ulong square_half = df_mul(df_mul(0x3fe0000000000000ul, f), f);
+        ulong reduced = df_mul(ratio, matrix_add(square_half, correction));
+        return k == 0 ? df_sub(f, df_sub(square_half, reduced)) : df_sub(df_mul(dk, ln_hi), df_sub(df_sub(square_half, matrix_add(reduced, df_mul(dk, ln_lo))), f));
+    }
+    ulong reduced = df_mul(ratio, df_sub(f, correction));
+    return k == 0 ? df_sub(f, reduced) : df_sub(df_mul(dk, ln_hi), df_sub(df_sub(reduced, df_mul(dk, ln_lo)), f));
+}
+
+ulong bounded_binary64_exp(ulong value) {
+    ulong one = 0x3ff0000000000000ul, two = 0x4000000000000000ul, sign = 1ul << 63, ln_hi = 0x3fe62e42fee00000ul, ln_lo = 0x3dea39ef35793c76ul;
+    uint high = uint((value & (sign - 1)) >> 32);
+    bool negative = (value & sign) != 0;
+    int k = 0;
+    ulong hi = 0, lo = 0;
+    if (high > 0x3fd62e42u) {
+        if (high < 0x3ff0a2b2u) {
+            hi = df_sub(value, ln_hi | (negative ? sign : 0)); lo = ln_lo | (negative ? sign : 0); k = negative ? -1 : 1;
+        } else {
+            k = df_truncate(matrix_add(df_mul(0x3ff71547652b82feul, value), 0x3fe0000000000000ul | (negative ? sign : 0)));
+            ulong integer = df_integer(k);
+            hi = df_sub(value, df_mul(integer, ln_hi)); lo = df_mul(integer, ln_lo);
+        }
+        value = df_sub(hi, lo);
+    } else if (high < 0x3e300000u) return matrix_add(one, value);
+    ulong square = df_mul(value, value);
+    ulong polynomial = matrix_add(0xbebbbd41c5d26bf1ul, df_mul(square, 0x3e66376972bea4d0ul));
+    polynomial = matrix_add(0x3f11566aaf25de2cul, df_mul(square, polynomial));
+    polynomial = matrix_add(0xbf66c16c16bebd93ul, df_mul(square, polynomial));
+    polynomial = matrix_add(0x3fc555555555553eul, df_mul(square, polynomial));
+    ulong correction = df_sub(value, df_mul(square, polynomial));
+    if (k == 0) return df_sub(one, df_sub(df_div(df_mul(value, correction), df_sub(correction, two)), value));
+    ulong result = df_sub(one, df_sub(df_sub(lo, df_div(df_mul(value, correction), df_sub(two, correction))), hi));
+    return (ulong(int(result >> 52) + k) << 52) | (result & ((1ul << 52) - 1));
+}
+
+struct TranscendentalDimensions { uint count, operation; };
+kernel void double_vbx_transcendental(device const ulong* input [[buffer(0)]], constant TranscendentalDimensions& d [[buffer(1)]], device ulong* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    if (index < d.count) output[index] = d.operation == 0 ? bounded_binary64_log(input[index]) : bounded_binary64_exp(input[index]);
+}

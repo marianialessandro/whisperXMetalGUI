@@ -17,6 +17,7 @@ extern "C" int wxdouble_vbx_scores(void*, const double*, const double*, uint32_t
 extern "C" int wxdouble_vbx_prior(void*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_posterior(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_elbo(void*, const double*, uint32_t, uint32_t, uint32_t, uint32_t, double, double, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_vbx_transcendental(void*, const double*, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -173,6 +174,20 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_elbo(context, elbo_packed, 1, 2, 1, 0, .8, -3., output, &metrics, error, sizeof(error)) != 0);
     elbo_packed[2] = 1.;
     assert(output[0] == 91.);
+    double math_input[] = {1., 2.};
+    assert(wxdouble_vbx_transcendental(context, math_input, 2, 0, math_input, &metrics, error, sizeof(error)) == 0 && math_input[0] == 0. && std::abs(math_input[1] - std::log(2.)) < 1e-15);
+    math_input[0] = -1.; math_input[1] = 0.;
+    assert(wxdouble_vbx_transcendental(context, math_input, 2, 1, output, &metrics, error, sizeof(error)) == 0 && std::abs(output[0] - std::exp(-1.)) < 1e-15 && output[1] == 1.);
+    output[0] = 91.;
+    assert(wxdouble_vbx_transcendental(context, math_input, 65537, 1, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_transcendental(context, math_input, 0, 1, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_transcendental(context, math_input, 2, 2, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_transcendental(context, math_input, 2, 0, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_transcendental(nullptr, math_input, 2, 1, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_transcendental(context, nullptr, 2, 1, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_transcendental(context, math_input, 2, 1, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_transcendental(context, math_input, 2, 1, output, nullptr, error, sizeof(error)) != 0);
+    assert(output[0] == 91.);
     wxdouble_destroy(context);
     wxdouble_destroy(nullptr);
     std::string legacy_shader = shader.substr(0, shader.find("\nstruct MatrixDimensions"));
@@ -212,6 +227,12 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_posterior(context, input, mean, 1, 2, 0, output, &metrics, error, sizeof(error)) == 0);
     output[0] = 91.;
     assert(wxdouble_vbx_elbo(context, input, 1, 2, 0, 0, 1., 0., output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
+    wxdouble_destroy(context);
+    std::string elbo_shader = shader.substr(0, shader.find("\n// Algorithms adapted from OpenLibm"));
+    assert(wxdouble_create(elbo_shader.data(), elbo_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_vbx_elbo(context, input, 1, 2, 0, 0, 1., 0., output, &metrics, error, sizeof(error)) == 0);
+    output[0] = 91.;
+    assert(wxdouble_vbx_transcendental(context, math_input, 2, 1, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
     wxdouble_destroy(context);
     std::string matrix_shader = shader.substr(0, shader.find("\nstruct ElementDimensions"));
     context = nullptr;
