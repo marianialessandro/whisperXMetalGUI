@@ -192,6 +192,55 @@ class NativeDoubleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "closed"):
             context.center(values, mean)
 
+    def test_vbx_precomputed_terms_bitwise_numpy_orders_and_boundaries(self):
+        rng = np.random.default_rng(922)
+        with self.context() as context:
+            for columns in (1, 7, 8, 127, 128, 129, 256, 1024):
+                values, phi = rng.normal(size=(37, columns)), rng.uniform(.1, 5., columns)
+                phi[0] = -0.
+                for order in ("pairwise", "sequential"):
+                    reference = values if order == "pairwise" else np.asfortranarray(values)
+                    expected = (-.5 * (np.sum(reference**2, axis=1, keepdims=True) + columns * np.log(2 * np.pi)), np.sqrt(phi), reference * np.sqrt(phi))
+                    actual, record = context.precompute_vbx(values, phi, order)
+                    for result, original in zip(actual, expected):
+                        np.testing.assert_array_equal(result.view(np.uint64), original.view(np.uint64))
+                    self.assertEqual(record["gpu_kernels"], ["double_vbx_terms", "double_vbx_rho"])
+                    self.assertEqual(record["logical_result_readback_bytes"], sum(a.nbytes for a in actual))
+                    self.assertGreater(record["computation_gpu_seconds"], 0)
+            values = np.array([[0., -0., 2. ** 200, -(2. ** -200)], [0., 0., 0., 0.]])
+            phi = np.array([-0., 0., 2. ** 200, 2. ** -200])
+            expected = (-.5 * (np.sum(values**2, axis=1, keepdims=True) + 4 * np.log(2 * np.pi)), np.sqrt(phi), values * np.sqrt(phi))
+            actual, _ = context.precompute_vbx(values, phi)
+            for result, original in zip(actual, expected):
+                np.testing.assert_array_equal(result.view(np.uint64), original.view(np.uint64))
+            actual, _ = context.precompute_vbx(np.ones((4096, 1)), np.ones(1))
+            self.assertEqual(actual[0].shape, (4096, 1))
+            self.compare(context, np.ones((1, 256)))
+
+    def test_vbx_precompute_validation_readonly_lifetime_and_capability(self):
+        values, phi = np.ones((3, 8)), np.ones(8)
+        values.flags.writeable = phi.flags.writeable = False
+        with self.context() as context:
+            for a, b in ((values.astype(np.float32), phi), (values, phi.astype(np.float32)), (values[:, ::2], phi), (values, phi[:7]), (np.ones((0, 8)), phi)):
+                with self.assertRaises(ValueError):
+                    context.precompute_vbx(a, b)
+            for invalid in (np.nan, np.inf, -1., 2. ** 201, 2. ** -201):
+                with self.assertRaisesRegex(ValueError, "phi_domain_invalid"):
+                    context.precompute_vbx(values, np.full(8, invalid))
+            for invalid in (np.nan, np.inf, 2. ** 201, 2. ** -201):
+                with self.assertRaisesRegex(ValueError, "value_domain_invalid"):
+                    context.precompute_vbx(np.full((3, 8), invalid), phi)
+            with self.assertRaisesRegex(ValueError, "reduction_invalid"):
+                context.precompute_vbx(values, phi, "invalid")
+            with patch.object(context, "library", SimpleNamespace()), self.assertRaisesRegex(ValueError, "abi_unavailable"):
+                context.precompute_vbx(values, phi)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(context.precompute_vbx, values, phi) for _ in range(4)]
+                for future in futures:
+                    np.testing.assert_array_equal(future.result()[0][2], values)
+        with self.assertRaisesRegex(ValueError, "closed"):
+            context.precompute_vbx(values, phi)
+
     def test_native_abi_under_address_and_undefined_sanitizers(self):
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory:

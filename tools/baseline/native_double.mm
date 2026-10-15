@@ -16,8 +16,8 @@ static_assert(sizeof(DoubleMetrics) == 32);
 class DoubleContext {
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
-    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_;
-    id<MTLBuffer> input_, output_, right_;
+    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_;
+    id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
     void reserve(id<MTLBuffer> __strong& buffer, uint64_t bytes) {
         if (buffer == nil || buffer.length < bytes) buffer = [device_ newBufferWithLength:bytes options:MTLResourceStorageModeShared];
@@ -36,6 +36,9 @@ public:
         if (matmul_function != nil) matmul_pipeline_ = [device_ newComputePipelineStateWithFunction:matmul_function error:&error];
         id<MTLFunction> element_function = [library newFunctionWithName:@"double_center_scale"];
         if (element_function != nil) element_pipeline_ = [device_ newComputePipelineStateWithFunction:element_function error:&error];
+        id<MTLFunction> terms_function = [library newFunctionWithName:@"double_vbx_terms"], rho_function = [library newFunctionWithName:@"double_vbx_rho"];
+        if (terms_function != nil) terms_pipeline_ = [device_ newComputePipelineStateWithFunction:terms_function error:&error];
+        if (rho_function != nil) rho_pipeline_ = [device_ newComputePipelineStateWithFunction:rho_function error:&error];
         queue_ = [device_ newCommandQueue]; require(queue_ != nil, "double_queue_creation_failed");
     }
     DoubleMetrics normalize(const double* input, DoubleDimensions d, double* output) {
@@ -60,7 +63,7 @@ public:
         [encoder dispatchThreads:MTLSizeMake(d.rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
         [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
         std::memcpy(output, output_.contents, bytes);
-        return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length};
+        return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
     DoubleMetrics matmul(const double* left, const double* right, MatrixDimensions d, double* output) {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -80,7 +83,7 @@ public:
         [encoder dispatchThreads:MTLSizeMake(uint64_t(d.rows) * d.columns, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, matmul_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
         [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
         std::memcpy(output, output_.contents, output_bytes);
-        return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length};
+        return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
     DoubleMetrics elementwise(const double* input, const double* mean, ElementDimensions d, double* output) {
@@ -101,7 +104,30 @@ public:
         [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, element_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
         [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
         std::memcpy(output, output_.contents, bytes);
-        return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length};
+        return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
+    DoubleMetrics precompute_vbx(const double* input, const double* phi, DoubleDimensions d, double* g, double* v, double* rho) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(terms_pipeline_ != nil && rho_pipeline_ != nil, "double_vbx_kernels_unavailable");
+        require(d.rows > 0 && d.rows <= 4096 && d.columns > 0 && d.columns <= 1024 && d.sequential <= 1 && input != nullptr && phi != nullptr && g != nullptr && v != nullptr && rho != nullptr, "double_vbx_shape_or_pointer_invalid");
+        uint64_t count = uint64_t(d.rows) * d.columns, bytes = count * sizeof(double);
+        for (uint64_t i = 0; i < count; ++i) require(std::isfinite(input[i]) && std::abs(input[i]) <= 0x1p200 && (input[i] == 0 || std::abs(input[i]) >= 0x1p-200), "double_vbx_value_domain_invalid");
+        for (uint32_t i = 0; i < d.columns; ++i) require(std::isfinite(phi[i]) && phi[i] >= 0 && phi[i] <= 0x1p200 && (phi[i] == 0 || phi[i] >= 0x1p-200), "double_vbx_phi_domain_invalid");
+        auto started = std::chrono::steady_clock::now();
+        reserve(input_, bytes); reserve(output_, bytes); reserve(right_, uint64_t(d.columns) * sizeof(double)); reserve(terms_, uint64_t(d.rows + d.columns) * sizeof(double));
+        std::memcpy(input_.contents, input, bytes); std::memcpy(right_.contents, phi, uint64_t(d.columns) * sizeof(double));
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental VBx precomputed terms";
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:terms_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:right_ offset:0 atIndex:2]; [encoder setBuffer:terms_ offset:0 atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(MAX(d.rows, d.columns), 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, terms_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:rho_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:terms_ offset:0 atIndex:2]; [encoder setBuffer:output_ offset:0 atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, rho_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        std::memcpy(g, terms_.contents, uint64_t(d.rows) * sizeof(double)); std::memcpy(v, static_cast<const double*>(terms_.contents) + d.rows, uint64_t(d.columns) * sizeof(double)); std::memcpy(rho, output_.contents, bytes);
+        return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
 };
@@ -132,6 +158,13 @@ extern "C" int wxdouble_elementwise(void* context, const double* input, const do
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->elementwise(input, mean, {rows, columns, operation, scale_dimension}, output); return 0; }
         catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_element_execution_failed"); return 1; }
+    }
+}
+extern "C" int wxdouble_vbx_precompute(void* context, const double* input, const double* phi, uint32_t rows, uint32_t columns, uint32_t sequential, double* g, double* v, double* rho, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->precompute_vbx(input, phi, {rows, columns, sequential}, g, v, rho); return 0; }
+        catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_vbx_precompute_failed"); return 1; }
     }
 }
 extern "C" void wxdouble_destroy(void* context) { @autoreleasepool { delete static_cast<DoubleContext*>(context); } }

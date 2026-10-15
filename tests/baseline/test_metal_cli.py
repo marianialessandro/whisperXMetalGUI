@@ -87,6 +87,14 @@ class MetalCLITests(unittest.TestCase):
             self.assertNotIn("private-secret", report.read_text())
             self.assertNotIn("private.wav", report.read_text())
 
+    def test_vbx_precompute_flag_requires_matrix_products(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "audio.wav", "--diarize", "--vbx-precomputed-terms"])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertFalse(report.exists())
+
     def test_experimental_scope_rejects_cpu_and_unsupported_language_before_original(self):
         calls = []
         def original(transcript, model, align_model_metadata, audio, device, interpolate_method="nearest"):

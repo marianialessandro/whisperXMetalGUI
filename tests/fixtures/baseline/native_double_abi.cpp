@@ -11,6 +11,7 @@ extern "C" int wxdouble_create(const char*, uint64_t, void**, char*, uint32_t);
 extern "C" int wxdouble_normalize(void*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_matmul(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_elementwise(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_vbx_precompute(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, double*, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -63,6 +64,19 @@ int main(int argc, char** argv) {
     assert(wxdouble_elementwise(context, nullptr, mean, 1, 2, 0, 0, output, &metrics, error, sizeof(error)) != 0);
     assert(wxdouble_elementwise(context, input, mean, 1, 1025, 0, 0, output, &metrics, error, sizeof(error)) != 0);
     assert(output[0] == 91.);
+    double phi[] = {4., 9.}, g[] = {91.}, v[] = {92., 93.}, rho[] = {94., 95.};
+    assert(wxdouble_vbx_precompute(context, input, phi, 1, 2, 0, g, v, rho, &metrics, error, sizeof(error)) == 0);
+    assert(v[0] == 2. && v[1] == 3. && rho[0] == 6. && rho[1] == 12. && g[0] < 0 && metrics.kernels == 2);
+    g[0] = 91.; v[0] = 92.; rho[0] = 94.;
+    assert(wxdouble_vbx_precompute(context, input, phi, 1, 1025, 0, g, v, rho, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_precompute(context, input, phi, 1, 2, 2, g, v, rho, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_precompute(context, input, phi, 1, 2, 0, nullptr, v, rho, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_precompute(context, input, phi, 1, 2, 0, g, nullptr, rho, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_precompute(context, input, phi, 1, 2, 0, g, v, nullptr, &metrics, error, sizeof(error)) != 0);
+    phi[0] = -1.;
+    assert(wxdouble_vbx_precompute(context, input, phi, 1, 2, 0, g, v, rho, &metrics, error, sizeof(error)) != 0);
+    phi[0] = 4.;
+    assert(g[0] == 91. && v[0] == 92. && rho[0] == 94.);
     wxdouble_destroy(context);
     wxdouble_destroy(nullptr);
     std::string legacy_shader = shader.substr(0, shader.find("\nstruct MatrixDimensions"));
@@ -79,5 +93,6 @@ int main(int argc, char** argv) {
     assert(wxdouble_matmul(context, input, right, 1, 2, 1, output, &metrics, error, sizeof(error)) == 0 && output[0] == 2.);
     output[0] = 91.;
     assert(wxdouble_elementwise(context, input, nullptr, 1, 2, 1, 2, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
+    assert(wxdouble_vbx_precompute(context, input, phi, 1, 2, 0, g, v, rho, &metrics, error, sizeof(error)) != 0 && g[0] == 91.);
     wxdouble_destroy(context);
 }

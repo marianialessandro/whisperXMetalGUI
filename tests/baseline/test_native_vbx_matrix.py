@@ -117,6 +117,50 @@ class NativeVBXMatrixTests(unittest.TestCase):
                         pass
         self.assertIs(vbx.VBx, original)
 
+    def test_native_precomputed_terms_preserve_complete_results_and_layout(self):
+        features, phi, gamma = self.fixture()
+        with self.context() as context:
+            for values in (features, np.asfortranarray(features)):
+                covariance = phi[::-1]
+                with native_vbx_matrix_products(context, [], []):
+                    expected = vbx.VBx(values, covariance, Fa=.07, Fb=.8, pi=3, gamma=gamma.copy(), maxIters=5, return_model=True)
+                records, calls, terms = [], [], []
+                with native_vbx_matrix_products(context, records, calls, precompute=True, precompute_records=terms), patch("numpy.sqrt", side_effect=AssertionError("CPU covariance square root executed")):
+                    actual = vbx.VBx(values, covariance, Fa=.07, Fb=.8, pi=3, gamma=gamma.copy(), maxIters=5, return_model=True)
+                self.compare(expected, actual)
+                self.assertEqual(len(terms), 1)
+                self.assertEqual(terms[0]["input_layout"], "C" if values.flags.c_contiguous else "F")
+                self.assertEqual(terms[0]["host_phi_staging_copy_bytes"], covariance.nbytes)
+                self.assertEqual(calls[0]["native_precompute_calls"], 1)
+                self.assertEqual(calls[0]["native_product_calls"], 3 * len(actual[2]))
+            records, calls, terms = [], [], []
+            with native_vbx_matrix_products(context, records, calls, precompute=True, precompute_records=terms):
+                vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=0)
+            self.assertEqual(records, [])
+            self.assertEqual(calls[0]["completed_iterations"], 0)
+            self.assertEqual(len(terms), 1)
+
+    def test_precompute_failure_capability_and_assignment_contract_restore(self):
+        features, phi, gamma = self.fixture()
+        original = vbx.VBx
+        with self.context() as context:
+            with self.assertRaisesRegex(ValueError, "precompute_records_required"):
+                with native_vbx_matrix_products(context, [], [], precompute=True):
+                    pass
+            with patch.object(context, "library", SimpleNamespace(wxdouble_matmul=object())), self.assertRaisesRegex(ValueError, "precompute_abi_unavailable"):
+                with native_vbx_matrix_products(context, [], [], precompute=True, precompute_records=[]):
+                    pass
+            terms, calls = [], []
+            with self.assertRaisesRegex(ValueError, "phi_domain_invalid"):
+                with native_vbx_matrix_products(context, [], calls, precompute=True, precompute_records=terms):
+                    vbx.VBx(features, -phi, pi=3, gamma=gamma.copy(), maxIters=1)
+            self.assertEqual(terms, [])
+            self.assertEqual(calls[0]["status"], "failed")
+            changed = textwrap.dedent(inspect.getsource(original)).replace("V = np.sqrt(Phi)", "V = Phi ** .5")
+            with patch("tools.baseline.native_vbx_matrix.inspect.getsource", return_value=changed), patch("tools.baseline.native_vbx_matrix.VBX_SHA256", hashlib.sha256(changed.encode()).hexdigest()), self.assertRaisesRegex(ValueError, "expression_contract_changed"):
+                compile_native_vbx(original, object(), object())
+        self.assertIs(vbx.VBx, original)
+
     def test_source_ast_version_and_capability_drift_are_rejected(self):
         original = vbx.VBx
         with self.context() as context:

@@ -142,3 +142,22 @@ kernel void double_center_scale(device const ulong* input [[buffer(0)]], constan
     if (d.operation == 0) output[index] = matrix_add(value, mean[index % d.columns] ^ sign);
     else output[index] = multiply_positive_binary64(value & (sign - 1), sqrt_positive_binary64(dimension_binary64(d.scale_dimension))) | (value & sign);
 }
+
+// The scalar log(2*pi) is pinned to the observed NumPy 2.2.6 binary64 value, not recomputed with lower precision.
+kernel void double_vbx_terms(device const ulong* input [[buffer(0)]], constant DoubleDimensions& d [[buffer(1)]], device const ulong* phi [[buffer(2)]], device ulong* terms [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index < d.rows) {
+        ulong log_term = multiply_positive_binary64(dimension_binary64(d.columns), 0x3ffd67f1c864beb4ul);
+        ulong sum = double_sum(input + index * d.columns, d.columns, d.sequential);
+        terms[index] = multiply_positive_binary64(add_positive_double(sum, log_term), 0x3fe0000000000000ul) | (1ul << 63);
+    }
+    if (index < d.columns) {
+        ulong value = phi[index], sign = 1ul << 63;
+        terms[d.rows + index] = sqrt_positive_binary64(value & (sign - 1)) | (value & sign);
+    }
+}
+
+kernel void double_vbx_rho(device const ulong* input [[buffer(0)]], constant DoubleDimensions& d [[buffer(1)]], device const ulong* terms [[buffer(2)]], device ulong* output [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index >= d.rows * d.columns) return;
+    ulong a = input[index], b = terms[d.rows + index % d.columns], sign = 1ul << 63;
+    output[index] = multiply_positive_binary64(a & (sign - 1), b & (sign - 1)) | ((a ^ b) & sign);
+}

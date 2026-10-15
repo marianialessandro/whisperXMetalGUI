@@ -152,6 +152,30 @@ class NativeDoubleNormalization:
             raise ValueError("double_element_native_result_invalid")
         return output, {"scope": "experimental_native_binary64_center_scale", "operation": "center" if mean is not None else "scale_sqrt_dimension", "rows": rows, "columns": columns, "scale_dimension": dimension, "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": ["double_center_scale"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes + (mean.nbytes if mean is not None else 0), "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
+    def precompute_vbx(self, features, phi, reduction_order="pairwise"):
+        if type(features) is not np.ndarray or features.dtype != np.float64 or features.ndim != 2 or not features.flags.c_contiguous or type(phi) is not np.ndarray or phi.dtype != np.float64 or phi.ndim != 1 or not phi.flags.c_contiguous:
+            raise ValueError("double_vbx_input_format_invalid")
+        rows, columns = features.shape
+        if not 0 < rows <= 4096 or not 0 < columns <= 1024 or phi.shape != (columns,) or reduction_order not in ("pairwise", "sequential"):
+            raise ValueError("double_vbx_shape_or_reduction_invalid")
+        g, v, rho = np.empty((rows, 1)), np.empty(columns), np.empty_like(features)
+        metrics, error = Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                operation = self.library.wxdouble_vbx_precompute
+            except AttributeError as failure:
+                raise ValueError("double_vbx_precompute_abi_unavailable") from failure
+            operation.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            operation.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if operation(self.context, features.ctypes.data, phi.ctypes.data, rows, columns, int(reduction_order == "sequential"), g.ctypes.data, v.ctypes.data, rho.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 2 or not all(np.isfinite(values).all() for values in (g, v, rho)):
+            raise ValueError("double_vbx_precompute_native_result_invalid")
+        return (g, v, rho), {"scope": "experimental_native_binary64_vbx_precompute", "rows": rows, "columns": columns, "reduction_order": reduction_order, "log_two_pi_binary64": "0x3ffd67f1c864beb4", "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": ["double_vbx_terms", "double_vbx_rho"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": features.nbytes + phi.nbytes, "logical_result_readback_bytes": g.nbytes + v.nbytes + rho.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
