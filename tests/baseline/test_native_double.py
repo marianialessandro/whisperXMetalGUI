@@ -404,6 +404,49 @@ class NativeDoubleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "closed"):
             context.prior_vbx(gamma)
 
+    def test_vbx_posterior_bitwise_numpy_broadcasting_and_cancellation(self):
+        rng = np.random.default_rng(926)
+        with self.context() as context:
+            for rows, columns in ((1, 1), (19, 3), (129, 17), (4096, 1), (1, 1024)):
+                values = rng.normal(size=(rows, columns))
+                for operation in ("log_prior_addition", "posterior_centering"):
+                    vector = rng.normal(size=columns if operation == "log_prior_addition" else rows)
+                    actual, record = context.posterior_vbx(values, vector, operation)
+                    expected = values + vector if operation == "log_prior_addition" else values - vector[:, None]
+                    np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+                    self.assertEqual(record["gpu_kernels"], ["double_vbx_posterior"])
+                    self.assertGreater(record["computation_gpu_seconds"], 0)
+            values = np.array([[0., -0., 2. ** 200, 2. ** -200], [-0., 0., -(2. ** 200), -(2. ** -200)]])
+            vector = np.array([-0., 0., -(2. ** 200), -(2. ** -200)])
+            actual, _ = context.posterior_vbx(values, vector)
+            np.testing.assert_array_equal(actual.view(np.uint64), (values + vector).view(np.uint64))
+            for vector in (np.array([0., -0.]), np.array([2. ** 200, -(2. ** 200)])):
+                actual, _ = context.posterior_vbx(values, vector, "posterior_centering")
+                np.testing.assert_array_equal(actual.view(np.uint64), (values - vector[:, None]).view(np.uint64))
+
+    def test_vbx_posterior_validation_lifetime_threads_and_capability(self):
+        values, vector = np.ones((3, 8)), np.ones(8)
+        values.flags.writeable = vector.flags.writeable = False
+        with self.context() as context:
+            for invalid in (np.nan, np.inf, 2. ** 201, 2. ** -201):
+                with self.assertRaisesRegex(ValueError, "input_domain_invalid"):
+                    context.posterior_vbx(np.full_like(values, invalid), vector)
+                with self.assertRaisesRegex(ValueError, "right_domain_invalid"):
+                    context.posterior_vbx(values, np.full_like(vector, invalid))
+            for left, right in ((values.astype(np.float32), vector), (values[:, ::2], vector), (values, vector.astype(np.float32)), (values, vector[:-1]), (np.ones((4097, 1)), np.ones(1))):
+                with self.assertRaises(ValueError):
+                    context.posterior_vbx(left, right)
+            with self.assertRaises(ValueError):
+                context.posterior_vbx(values, vector, "invalid")
+            with patch.object(context, "library", SimpleNamespace()), self.assertRaisesRegex(ValueError, "abi_unavailable"):
+                context.posterior_vbx(values, vector)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(context.posterior_vbx, values, vector) for _ in range(4)]
+                for future in futures:
+                    np.testing.assert_array_equal(future.result()[0], values + vector)
+        with self.assertRaisesRegex(ValueError, "closed"):
+            context.posterior_vbx(values, vector)
+
     def test_native_abi_under_address_and_undefined_sanitizers(self):
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory:

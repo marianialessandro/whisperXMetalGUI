@@ -336,6 +336,47 @@ class NativeVBXMatrixTests(unittest.TestCase):
             self.compare(expected, actual)
             self.assertEqual((records, calls), ([], []))
 
+    def test_native_posterior_complete_results_flag_combinations_and_counts(self):
+        features, phi, gamma = self.fixture()
+        with self.context() as context:
+            for mask in range(16):
+                options = {"precompute": bool(mask & 1), "precompute_records": [], "statistics": bool(mask & 2), "statistics_records": [], "scores": bool(mask & 4), "score_records": [], "prior": bool(mask & 8), "prior_records": []}
+                with native_vbx_matrix_products(context, [], [], **options):
+                    expected = vbx.VBx(features, phi, Fa=.07, Fb=.8, pi=3, gamma=gamma.copy(), maxIters=4, return_model=True)
+                records, calls = [], []
+                with native_vbx_matrix_products(context, [], calls, posterior=True, posterior_records=records, **options):
+                    actual = vbx.VBx(features, phi, Fa=.07, Fb=.8, pi=3, gamma=gamma.copy(), maxIters=4, return_model=True)
+                self.compare(expected, actual)
+                self.assertEqual(calls[0]["native_posterior_calls"], 3 * len(actual[2]))
+                self.assertEqual([r["operation"] for r in records[:3]], ["log_prior_addition", "log_prior_addition", "posterior_centering"])
+                self.assertTrue(all(r["computation_gpu_seconds"] > 0 for r in records))
+            records, calls = [], []
+            with native_vbx_matrix_products(context, [], calls, posterior=True, posterior_records=records):
+                vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=1, alpha=np.zeros((3, 8)), invL=np.ones((3, 8)))
+                vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=0)
+            self.assertEqual([call["native_posterior_calls"] for call in calls], [3, 0])
+
+    def test_posterior_failure_capability_and_ast_restore(self):
+        features, phi, gamma = self.fixture()
+        original = vbx.VBx
+        with self.context() as context:
+            with self.assertRaisesRegex(ValueError, "posterior_records_required"):
+                with native_vbx_matrix_products(context, [], [], posterior=True):
+                    pass
+            with patch.object(context, "library", SimpleNamespace(wxdouble_matmul=object())), self.assertRaisesRegex(ValueError, "posterior_abi_unavailable"):
+                with native_vbx_matrix_products(context, [], [], posterior=True, posterior_records=[]):
+                    pass
+            records, calls = [], []
+            with self.assertRaisesRegex(ValueError, "injected_posterior_failure"):
+                with native_vbx_matrix_products(context, [], calls, posterior=True, posterior_records=records), patch.object(context, "posterior_vbx", side_effect=ValueError("injected_posterior_failure")):
+                    vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=1)
+            self.assertEqual(calls[0]["status"], "failed")
+            self.assertEqual(records, [])
+            self.assertIs(vbx.VBx, original)
+            changed = textwrap.dedent(inspect.getsource(original)).replace("log_p_ + lpi - log_p_x[:, None]", "log_p_ - log_p_x[:, None] + lpi")
+            with patch("tools.baseline.native_vbx_matrix.inspect.getsource", return_value=changed), patch("tools.baseline.native_vbx_matrix.VBX_SHA256", hashlib.sha256(changed.encode()).hexdigest()), self.assertRaisesRegex(ValueError, "posterior_expression_contract_changed"):
+                compile_native_vbx(original, object(), posterior=object())
+
     def test_unrelated_threads_and_multiple_calls_keep_separate_metadata(self):
         features, phi, gamma = self.fixture()
         expected = vbx.VBx(features, phi, Fa=.07, Fb=.8, pi=3, gamma=gamma.copy(), maxIters=3)

@@ -280,6 +280,30 @@ class NativeDoubleNormalization:
         return output, {"scope": "experimental_native_binary64_vbx_prior", "speakers": speakers, "frames": frames, "frame_reduction_order": reduction_order, "speaker_reduction_order": "pairwise", "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": ["double_vbx_gamma_sum", "double_vbx_prior"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": gamma_transposed.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
 
+    def posterior_vbx(self, values, vector, operation="log_prior_addition"):
+        if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim != 2 or not values.flags.c_contiguous or type(vector) is not np.ndarray or vector.dtype != np.float64 or vector.ndim != 1 or not vector.flags.c_contiguous:
+            raise ValueError("double_vbx_posterior_input_format_invalid")
+        rows, columns = values.shape
+        if not 0 < rows <= 4096 or not 0 < columns <= 1024 or operation not in ("log_prior_addition", "posterior_centering") or vector.shape != (columns if operation == "log_prior_addition" else rows,):
+            raise ValueError("double_vbx_posterior_shape_or_operation_invalid")
+        output, metrics, error = np.empty_like(values), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_vbx_posterior
+            except AttributeError as failure:
+                raise ValueError("double_vbx_posterior_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, values.ctypes.data, vector.ctypes.data, rows, columns, int(operation == "posterior_centering"), output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 1 or not np.isfinite(output).all():
+            raise ValueError("double_vbx_posterior_native_result_invalid")
+        return output, {"scope": "experimental_native_binary64_vbx_posterior", "operation": operation, "rows": rows, "columns": columns, "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": ["double_vbx_posterior"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes + vector.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build", type=Path, required=True, help="Compile a new local dylib at this path; existing paths are never overwritten.")

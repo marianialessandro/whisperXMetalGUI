@@ -20,7 +20,7 @@ static_assert(sizeof(DoubleMetrics) == 32);
 class DoubleContext {
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
-    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_;
+    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
     void reserve(id<MTLBuffer> __strong& buffer, uint64_t bytes) {
@@ -50,6 +50,8 @@ public:
         if (score_function != nil) score_pipeline_ = [device_ newComputePipelineStateWithFunction:score_function error:&error];
         id<MTLFunction> prior_function = [library newFunctionWithName:@"double_vbx_prior"];
         if (prior_function != nil) prior_pipeline_ = [device_ newComputePipelineStateWithFunction:prior_function error:&error];
+        id<MTLFunction> posterior_function = [library newFunctionWithName:@"double_vbx_posterior"];
+        if (posterior_function != nil) posterior_pipeline_ = [device_ newComputePipelineStateWithFunction:posterior_function error:&error];
         queue_ = [device_ newCommandQueue]; require(queue_ != nil, "double_queue_creation_failed");
     }
     DoubleMetrics normalize(const double* input, DoubleDimensions d, double* output) {
@@ -219,6 +221,26 @@ public:
         return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
+    DoubleMetrics posterior_vbx(const double* input, const double* right, ScoreDimensions d, double* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(posterior_pipeline_ != nil, "double_vbx_posterior_kernel_unavailable");
+        require(d.rows > 0 && d.rows <= 4096 && d.columns > 0 && d.columns <= 1024 && d.operation <= 1 && input != nullptr && right != nullptr && output != nullptr, "double_vbx_posterior_shape_or_pointer_invalid");
+        uint64_t count = uint64_t(d.rows) * d.columns, right_count = d.operation == 0 ? d.columns : d.rows;
+        for (uint64_t i = 0; i < count; ++i) require(std::isfinite(input[i]) && std::abs(input[i]) <= 0x1p200 && (input[i] == 0 || std::abs(input[i]) >= 0x1p-200), "double_vbx_posterior_input_domain_invalid");
+        for (uint64_t i = 0; i < right_count; ++i) require(std::isfinite(right[i]) && std::abs(right[i]) <= 0x1p200 && (right[i] == 0 || std::abs(right[i]) >= 0x1p-200), "double_vbx_posterior_right_domain_invalid");
+        auto started = std::chrono::steady_clock::now();
+        reserve(input_, count * sizeof(double)); reserve(right_, right_count * sizeof(double)); reserve(output_, count * sizeof(double));
+        std::memcpy(input_.contents, input, count * sizeof(double)); std::memcpy(right_.contents, right, right_count * sizeof(double));
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental VBx posterior arithmetic";
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:posterior_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:right_ offset:0 atIndex:2]; [encoder setBuffer:output_ offset:0 atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, posterior_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        std::memcpy(output, output_.contents, count * sizeof(double));
+        return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
 };
 static void double_error(char* output, uint32_t capacity, const char* code) { if (output != nullptr && capacity) { std::strncpy(output, code, capacity - 1); output[capacity - 1] = 0; } }
 extern "C" int wxdouble_create(const char* source, uint64_t size, void** output, char* error, uint32_t capacity) {
@@ -275,6 +297,13 @@ extern "C" int wxdouble_vbx_prior(void* context, const double* input, uint32_t s
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->prior_vbx(input, {speakers, frames, 0, 0, sequential, 0, 0, 0}, output); return 0; }
         catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_vbx_prior_failed"); return 1; }
+    }
+}
+extern "C" int wxdouble_vbx_posterior(void* context, const double* input, const double* right, uint32_t rows, uint32_t columns, uint32_t operation, double* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->posterior_vbx(input, right, {rows, columns, operation, 0, 0}, output); return 0; }
+        catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_vbx_posterior_failed"); return 1; }
     }
 }
 extern "C" void wxdouble_destroy(void* context) { @autoreleasepool { delete static_cast<DoubleContext*>(context); } }

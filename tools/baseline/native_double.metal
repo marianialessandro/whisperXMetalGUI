@@ -206,3 +206,10 @@ kernel void double_vbx_prior(device const ulong* masses [[buffer(0)]], constant 
     ulong total = double_sum(masses, d.rows, 0, false);
     for (uint speaker = 0; speaker < d.rows; ++speaker) output[speaker] = divide_positive_binary64(masses[speaker], total);
 }
+
+// Log-prior addition and frame normalization retain the original two separately rounded binary64 operations.
+kernel void double_vbx_posterior(device const ulong* input [[buffer(0)]], constant ScoreDimensions& d [[buffer(1)]], device const ulong* right [[buffer(2)]], device ulong* output [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index >= d.rows * d.columns) return;
+    ulong value = right[d.operation == 0 ? index % d.columns : index / d.columns];
+    output[index] = matrix_add(input[index], d.operation == 0 ? value : value ^ (1ul << 63));
+}

@@ -15,6 +15,7 @@ extern "C" int wxdouble_vbx_precompute(void*, const double*, const double*, uint
 extern "C" int wxdouble_vbx_statistics(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, double, double, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_scores(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_prior(void*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_vbx_posterior(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -141,6 +142,18 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_prior(context, prior_gamma, 2, 2, 1, output, &metrics, error, sizeof(error)) != 0);
     prior_gamma[0] = 1.;
     assert(output[0] == 91. && output[1] == 92.);
+    assert(wxdouble_vbx_posterior(context, input, mean, 1, 2, 0, output, &metrics, error, sizeof(error)) == 0 && output[0] == 4. && output[1] == 6.);
+    assert(wxdouble_vbx_posterior(context, output, mean, 1, 2, 1, output, &metrics, error, sizeof(error)) == 0 && output[0] == 3. && output[1] == 5.);
+    output[0] = 91.; output[1] = 92.;
+    assert(wxdouble_vbx_posterior(context, input, mean, 4097, 2, 0, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_posterior(context, input, mean, 1, 1025, 0, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_posterior(context, input, mean, 1, 2, 2, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_posterior(context, nullptr, mean, 1, 2, 0, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_posterior(context, input, nullptr, 1, 2, 0, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_posterior(context, input, mean, 1, 2, 0, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_posterior(nullptr, input, mean, 1, 2, 0, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_posterior(context, input, mean, 1, 2, 0, output, nullptr, error, sizeof(error)) != 0);
+    assert(output[0] == 91. && output[1] == 92.);
     wxdouble_destroy(context);
     wxdouble_destroy(nullptr);
     std::string legacy_shader = shader.substr(0, shader.find("\nstruct MatrixDimensions"));
@@ -168,6 +181,12 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_scores(context, inv_l, alpha, 1, 2, 0, 1., output, &metrics, error, sizeof(error)) == 0);
     output[0] = 91.;
     assert(wxdouble_vbx_prior(context, prior_gamma, 2, 2, 1, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
+    wxdouble_destroy(context);
+    std::string prior_shader = shader.substr(0, shader.find("\nkernel void double_vbx_posterior"));
+    assert(wxdouble_create(prior_shader.data(), prior_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_vbx_prior(context, prior_gamma, 2, 2, 1, output, &metrics, error, sizeof(error)) == 0);
+    output[0] = 91.;
+    assert(wxdouble_vbx_posterior(context, input, mean, 1, 2, 0, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
     wxdouble_destroy(context);
     std::string matrix_shader = shader.substr(0, shader.find("\nstruct ElementDimensions"));
     context = nullptr;

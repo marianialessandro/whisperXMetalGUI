@@ -18,7 +18,7 @@ _ACTIVE = False
 _OPERATIONS = {"gamma.T.dot(rho)": "speaker_statistics", "rho.dot(alpha.T)": "frame_scores", "(invL + alpha**2).dot(Phi)": "speaker_penalty"}
 
 
-def compile_native_vbx(original, product, precompute=None, statistics=None, score=None, prior=None):
+def compile_native_vbx(original, product, precompute=None, statistics=None, score=None, prior=None, posterior=None):
     source = textwrap.dedent(inspect.getsource(original))
     if hashlib.sha256(source.encode()).hexdigest() != VBX_SHA256 or original.__closure__ or inspect.unwrap(original) is not original:
         raise ValueError("vbx_matrix_source_not_supported")
@@ -39,7 +39,19 @@ def compile_native_vbx(original, product, precompute=None, statistics=None, scor
     prior_expressions = {ast.dump(ast.parse(expression).body[0]): label for expression, label in [("pi = np.sum(gamma, axis=0)", "mass"), ("pi = pi / pi.sum()", "normalize")]}
     prior_counts = {label: 0 for label in ("mass", "normalize")}
 
+    posterior_expressions = {ast.dump(ast.parse(expression).body[0].value): label for expression, label in [("log_p_ + lpi", "log_prior_addition"), ("log_p_ + lpi - log_p_x[:, None]", "posterior_centering")]}
+    posterior_counts = {"log_prior_addition": 0, "posterior_centering": 0}
+
     class Substitute(ast.NodeTransformer):
+        def visit_BinOp(self, node):
+            operation = posterior_expressions.get(ast.dump(node)) if posterior is not None else None
+            if operation is None:
+                return self.generic_visit(node)
+            posterior_counts[operation] += 1
+            left = self.visit(node.left)
+            right = node.right if operation == "log_prior_addition" else ast.Name(id="log_p_x", ctx=ast.Load())
+            return ast.copy_location(ast.Call(func=ast.Name(id="__wx_vbx_posterior", ctx=ast.Load()), args=[left, right, ast.Name(id="ii", ctx=ast.Load()), ast.Constant(operation)], keywords=[]), node)
+
         def visit_Assign(self, node):
             prior_label = prior_expressions.get(ast.dump(node)) if prior is not None else None
             if prior_label is not None:
@@ -93,6 +105,8 @@ def compile_native_vbx(original, product, precompute=None, statistics=None, scor
         raise ValueError("vbx_score_expression_contract_changed")
     if prior is not None and any(count != 1 for count in prior_counts.values()):
         raise ValueError("vbx_prior_expression_contract_changed")
+    if posterior is not None and posterior_counts != {"log_prior_addition": 2, "posterior_centering": 1}:
+        raise ValueError("vbx_posterior_expression_contract_changed")
     ast.fix_missing_locations(tree)
     namespace = dict(original.__globals__)
     namespace["__wx_vbx_matrix_product"] = product
@@ -100,6 +114,7 @@ def compile_native_vbx(original, product, precompute=None, statistics=None, scor
     namespace["__wx_vbx_statistics"] = statistics
     namespace["__wx_vbx_score"] = score
     namespace["__wx_vbx_prior"] = prior
+    namespace["__wx_vbx_posterior"] = posterior
     exec(compile(tree, "<WhisperX scoped native VBx matrix products>", "exec"), namespace)
     candidate = namespace[tree.body[0].name]
     if inspect.signature(candidate) != inspect.signature(original):
@@ -107,16 +122,23 @@ def compile_native_vbx(original, product, precompute=None, statistics=None, scor
     return candidate
 
 
-def cpu_residuals(precomputed, statistics, scores, prior=False):
+def cpu_residuals(precomputed, statistics, scores, prior=False, posterior=False):
     residuals = ["initialization" if precomputed else "initialization_and_precomputed_terms"]
     if not statistics:
         residuals.append("statistics_reductions_and_elementwise_updates")
     elif not scores:
         residuals.append("score_elementwise_updates")
-    return residuals + ["log_exp_logsumexp", "posterior_updates" if prior else "posterior_and_prior_updates", "elbo_and_stopping"]
+    residuals.append("log_exp_logsumexp")
+    if posterior:
+        residuals.append("prior_log_epsilon_addition")
+        if not prior:
+            residuals.append("prior_updates")
+    else:
+        residuals.append("posterior_updates" if prior else "posterior_and_prior_updates")
+    return residuals + ["elbo_and_stopping"]
 
 
-def matrix_product(context, records, left, right, iteration, operation, call_index, precomputed_terms=False, statistics=False, scores=False, prior=False):
+def matrix_product(context, records, left, right, iteration, operation, call_index, precomputed_terms=False, statistics=False, scores=False, prior=False, posterior=False):
     if type(left) is not np.ndarray or type(right) is not np.ndarray or left.dtype != np.float64 or right.dtype != np.float64 or left.ndim != 2 or right.ndim not in (1, 2):
         raise ValueError("vbx_matrix_operand_format_not_supported")
     vector = right.ndim == 1
@@ -125,12 +147,12 @@ def matrix_product(context, records, left, right, iteration, operation, call_ind
     right_stage = np.ascontiguousarray(right_matrix)
     output, record = context.matmul(left_stage, right_stage)
     record = dict(record)
-    record.update({"adapter_scope": "vbx_iteration_matrix_products", "operation": operation, "iteration_index": iteration, "vbx_call_index": call_index, "original_vbx_sha256": VBX_SHA256, "vector_result": vector, "host_left_staging_copy_bytes": 0 if left_stage is left else left_stage.nbytes, "host_right_staging_copy_bytes": 0 if right_stage is right_matrix else right_stage.nbytes, "cpu_residuals": cpu_residuals(precomputed_terms, statistics, scores, prior)})
+    record.update({"adapter_scope": "vbx_iteration_matrix_products", "operation": operation, "iteration_index": iteration, "vbx_call_index": call_index, "original_vbx_sha256": VBX_SHA256, "vector_result": vector, "host_left_staging_copy_bytes": 0 if left_stage is left else left_stage.nbytes, "host_right_staging_copy_bytes": 0 if right_stage is right_matrix else right_stage.nbytes, "cpu_residuals": cpu_residuals(precomputed_terms, statistics, scores, prior, posterior)})
     records.append(record)
     return output[:, 0] if vector else output
 
 
-def precomputed_terms(context, records, features, phi, call_index, statistics=False, scores=False, prior=False):
+def precomputed_terms(context, records, features, phi, call_index, statistics=False, scores=False, prior=False, posterior=False):
     if type(features) is not np.ndarray or features.dtype != np.float64 or features.ndim != 2 or not (features.flags.c_contiguous or features.flags.f_contiguous) or type(phi) is not np.ndarray or phi.dtype != np.float64 or phi.ndim != 1:
         raise ValueError("vbx_precompute_operand_format_not_supported")
     column_contiguous = features.flags.f_contiguous and not features.flags.c_contiguous
@@ -139,12 +161,12 @@ def precomputed_terms(context, records, features, phi, call_index, statistics=Fa
     if column_contiguous:
         rho = np.asfortranarray(rho)
     record = dict(record)
-    record.update({"adapter_scope": "vbx_precomputed_terms", "vbx_call_index": call_index, "original_vbx_sha256": VBX_SHA256, "input_layout": "F" if column_contiguous else "C", "host_input_staging_copy_bytes": 0 if staged is features else staged.nbytes, "host_phi_staging_copy_bytes": 0 if phi_stage is phi else phi_stage.nbytes, "host_rho_layout_copy_bytes": rho.nbytes if column_contiguous else 0, "cpu_residuals": cpu_residuals(True, statistics, scores, prior)})
+    record.update({"adapter_scope": "vbx_precomputed_terms", "vbx_call_index": call_index, "original_vbx_sha256": VBX_SHA256, "input_layout": "F" if column_contiguous else "C", "host_input_staging_copy_bytes": 0 if staged is features else staged.nbytes, "host_phi_staging_copy_bytes": 0 if phi_stage is phi else phi_stage.nbytes, "host_rho_layout_copy_bytes": rho.nbytes if column_contiguous else 0, "cpu_residuals": cpu_residuals(True, statistics, scores, prior, posterior)})
     records.append(record)
     return g, v, rho
 
 
-def statistical_update(context, records, left, right, fa, fb, iteration, operation, call_index, precomputed=False, scores=False, prior=False):
+def statistical_update(context, records, left, right, fa, fb, iteration, operation, call_index, precomputed=False, scores=False, prior=False, posterior=False):
     if type(left) is not np.ndarray or left.dtype != np.float64 or left.ndim != 2 or not (left.flags.c_contiguous or left.flags.f_contiguous) or type(right) is not np.ndarray or right.dtype != np.float64:
         raise ValueError("vbx_statistics_operand_format_not_supported")
     column_contiguous = left.flags.f_contiguous and not left.flags.c_contiguous
@@ -155,12 +177,12 @@ def statistical_update(context, records, left, right, fa, fb, iteration, operati
     else:
         output, record = context.alpha_vbx(staged, right_stage, fa, fb)
     record = dict(record)
-    record.update({"adapter_scope": "vbx_statistics_updates", "vbx_call_index": call_index, "iteration_index": iteration, "original_vbx_sha256": VBX_SHA256, "input_layout": "F" if column_contiguous else "C", "host_left_staging_copy_bytes": 0 if np.shares_memory(staged, left) else staged.nbytes, "host_right_staging_copy_bytes": 0 if right_stage is right else right_stage.nbytes, "cpu_residuals": cpu_residuals(precomputed, True, scores, prior)})
+    record.update({"adapter_scope": "vbx_statistics_updates", "vbx_call_index": call_index, "iteration_index": iteration, "original_vbx_sha256": VBX_SHA256, "input_layout": "F" if column_contiguous else "C", "host_left_staging_copy_bytes": 0 if np.shares_memory(staged, left) else staged.nbytes, "host_right_staging_copy_bytes": 0 if right_stage is right else right_stage.nbytes, "cpu_residuals": cpu_residuals(precomputed, True, scores, prior, posterior)})
     records.append(record)
     return output
 
 
-def score_arithmetic(context, records, left, right, g, fa, iteration, operation, call_index, precomputed=False, statistics=False, prior=False):
+def score_arithmetic(context, records, left, right, g, fa, iteration, operation, call_index, precomputed=False, statistics=False, prior=False, posterior=False):
     if type(left) is not np.ndarray or left.dtype != np.float64 or left.ndim != 2 or type(right) is not np.ndarray or right.dtype != np.float64:
         raise ValueError("vbx_score_operand_format_not_supported")
     staged, right_stage = np.ascontiguousarray(left), np.ascontiguousarray(right)
@@ -174,12 +196,12 @@ def score_arithmetic(context, records, left, right, g, fa, iteration, operation,
         g_copy_bytes = 0 if np.shares_memory(g_stage, g) else g_stage.nbytes
         output, record = context.frame_scores_vbx(staged, right_stage, g_stage, fa)
     record = dict(record)
-    record.update({"adapter_scope": "vbx_score_arithmetic", "vbx_call_index": call_index, "iteration_index": iteration, "original_vbx_sha256": VBX_SHA256, "host_left_staging_copy_bytes": 0 if staged is left else staged.nbytes, "host_right_staging_copy_bytes": 0 if right_stage is right else right_stage.nbytes, "host_g_staging_copy_bytes": g_copy_bytes, "cpu_residuals": cpu_residuals(precomputed, statistics, True, prior)})
+    record.update({"adapter_scope": "vbx_score_arithmetic", "vbx_call_index": call_index, "iteration_index": iteration, "original_vbx_sha256": VBX_SHA256, "host_left_staging_copy_bytes": 0 if staged is left else staged.nbytes, "host_right_staging_copy_bytes": 0 if right_stage is right else right_stage.nbytes, "host_g_staging_copy_bytes": g_copy_bytes, "cpu_residuals": cpu_residuals(precomputed, statistics, True, prior, posterior)})
     records.append(record)
     return output
 
 
-def prior_update(context, records, gamma, iteration, call_index, precomputed=False, statistics=False, scores=False):
+def prior_update(context, records, gamma, iteration, call_index, precomputed=False, statistics=False, scores=False, posterior=False):
     if type(gamma) is not np.ndarray or gamma.dtype != np.float64 or gamma.ndim != 2 or not (gamma.flags.c_contiguous or gamma.flags.f_contiguous):
         raise ValueError("vbx_prior_operand_format_not_supported")
     if not 0 < gamma.shape[0] <= 4096 or not 0 < gamma.shape[1] <= 1024:
@@ -188,13 +210,26 @@ def prior_update(context, records, gamma, iteration, call_index, precomputed=Fal
     staged = np.ascontiguousarray(gamma.T)
     output, record = context.prior_vbx(staged, "pairwise" if column_contiguous or gamma.shape[1] == 1 else "sequential")
     record = dict(record)
-    record.update({"adapter_scope": "vbx_prior_updates", "vbx_call_index": call_index, "iteration_index": iteration, "original_vbx_sha256": VBX_SHA256, "input_layout": "F" if column_contiguous else "C", "host_input_staging_copy_bytes": 0 if np.shares_memory(staged, gamma) else staged.nbytes, "cpu_residuals": cpu_residuals(precomputed, statistics, scores, True)})
+    record.update({"adapter_scope": "vbx_prior_updates", "vbx_call_index": call_index, "iteration_index": iteration, "original_vbx_sha256": VBX_SHA256, "input_layout": "F" if column_contiguous else "C", "host_input_staging_copy_bytes": 0 if np.shares_memory(staged, gamma) else staged.nbytes, "cpu_residuals": cpu_residuals(precomputed, statistics, scores, True, posterior)})
+    records.append(record)
+    return output
+
+
+def posterior_arithmetic(context, records, values, vector, iteration, operation, call_index, precomputed=False, statistics=False, scores=False, prior=False):
+    if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim != 2 or type(vector) is not np.ndarray or vector.dtype != np.float64 or vector.ndim != 1:
+        raise ValueError("vbx_posterior_operand_format_not_supported")
+    if not 0 < values.shape[0] <= 4096 or not 0 < values.shape[1] <= 1024:
+        raise ValueError("vbx_posterior_shape_not_supported")
+    staged, vector_stage = np.ascontiguousarray(values), np.ascontiguousarray(vector)
+    output, record = context.posterior_vbx(staged, vector_stage, operation)
+    record = dict(record)
+    record.update({"adapter_scope": "vbx_posterior_arithmetic", "vbx_call_index": call_index, "iteration_index": iteration, "original_vbx_sha256": VBX_SHA256, "host_input_staging_copy_bytes": 0 if staged is values else staged.nbytes, "host_vector_staging_copy_bytes": 0 if vector_stage is vector else vector_stage.nbytes, "cpu_residuals": cpu_residuals(precomputed, statistics, scores, prior, True)})
     records.append(record)
     return output
 
 
 @contextlib.contextmanager
-def native_vbx_matrix_products(context, records, calls, precompute=False, precompute_records=None, statistics=False, statistics_records=None, scores=False, score_records=None, prior=False, prior_records=None):
+def native_vbx_matrix_products(context, records, calls, precompute=False, precompute_records=None, statistics=False, statistics_records=None, scores=False, score_records=None, prior=False, prior_records=None, posterior=False, posterior_records=None):
     global _ACTIVE
     import pyannote.audio.utils.vbx as vbx
 
@@ -223,26 +258,33 @@ def native_vbx_matrix_products(context, records, calls, precompute=False, precom
             raise ValueError("vbx_prior_records_required")
         if prior and getattr(context.library, "wxdouble_vbx_prior", None) is None:
             raise ValueError("double_vbx_prior_abi_unavailable")
+        if type(posterior) is not bool or (posterior and not isinstance(posterior_records, list)):
+            raise ValueError("vbx_posterior_records_required")
+        if posterior and getattr(context.library, "wxdouble_vbx_posterior", None) is None:
+            raise ValueError("double_vbx_posterior_abi_unavailable")
         original = vbx.VBx
         owner_thread = threading.get_ident()
         call_indices = []
 
         def product(left, right, iteration, operation):
-            return matrix_product(context, records, left, right, iteration, operation, call_indices[-1], precomputed_terms=precompute, statistics=statistics, scores=scores, prior=prior)
+            return matrix_product(context, records, left, right, iteration, operation, call_indices[-1], precomputed_terms=precompute, statistics=statistics, scores=scores, prior=prior, posterior=posterior)
 
         def prepare(features, phi):
-            return precomputed_terms(context, precompute_records, features, phi, call_indices[-1], statistics=statistics, scores=scores, prior=prior)
+            return precomputed_terms(context, precompute_records, features, phi, call_indices[-1], statistics=statistics, scores=scores, prior=prior, posterior=posterior)
 
         def update(left, right, fa, fb, iteration, operation):
-            return statistical_update(context, statistics_records, left, right, fa, fb, iteration, operation, call_indices[-1], precomputed=precompute, scores=scores, prior=prior)
+            return statistical_update(context, statistics_records, left, right, fa, fb, iteration, operation, call_indices[-1], precomputed=precompute, scores=scores, prior=prior, posterior=posterior)
 
         def score(left, right, g, fa, iteration, operation):
-            return score_arithmetic(context, score_records, left, right, g, fa, iteration, operation, call_indices[-1], precomputed=precompute, statistics=statistics, prior=prior)
+            return score_arithmetic(context, score_records, left, right, g, fa, iteration, operation, call_indices[-1], precomputed=precompute, statistics=statistics, prior=prior, posterior=posterior)
 
         def update_prior(gamma, iteration):
-            return prior_update(context, prior_records, gamma, iteration, call_indices[-1], precomputed=precompute, statistics=statistics, scores=scores)
+            return prior_update(context, prior_records, gamma, iteration, call_indices[-1], precomputed=precompute, statistics=statistics, scores=scores, posterior=posterior)
 
-        candidate = compile_native_vbx(original, product, prepare if precompute else None, update if statistics else None, score if scores else None, update_prior if prior else None)
+        def update_posterior(values, vector, iteration, operation):
+            return posterior_arithmetic(context, posterior_records, values, vector, iteration, operation, call_indices[-1], precomputed=precompute, statistics=statistics, scores=scores, prior=prior)
+
+        candidate = compile_native_vbx(original, product, prepare if precompute else None, update if statistics else None, score if scores else None, update_prior if prior else None, update_posterior if posterior else None)
 
         @functools.wraps(original)
         def wrapped(*args, **kwargs):
@@ -253,7 +295,8 @@ def native_vbx_matrix_products(context, records, calls, precompute=False, precom
             first_statistics = len(statistics_records) if statistics else 0
             first_score = len(score_records) if scores else 0
             first_prior = len(prior_records) if prior else 0
-            summary = {"scope": "vbx_iteration_matrix_products", "call_index": call_index, "status": "failed", "completed_iterations": None, "native_product_calls": 0, "native_precompute_calls": 0, "native_statistics_calls": 0, "native_score_calls": 0, "native_prior_calls": 0, "original_vbx_sha256": VBX_SHA256, "full_vbx_gpu_certified": False, "quality_certified": False}
+            first_posterior = len(posterior_records) if posterior else 0
+            summary = {"scope": "vbx_iteration_matrix_products", "call_index": call_index, "status": "failed", "completed_iterations": None, "native_product_calls": 0, "native_precompute_calls": 0, "native_statistics_calls": 0, "native_score_calls": 0, "native_prior_calls": 0, "native_posterior_calls": 0, "original_vbx_sha256": VBX_SHA256, "full_vbx_gpu_certified": False, "quality_certified": False}
             calls.append(summary)
             call_indices.append(call_index)
             try:
@@ -267,6 +310,7 @@ def native_vbx_matrix_products(context, records, calls, precompute=False, precom
                 summary["native_statistics_calls"] = len(statistics_records) - first_statistics if statistics else 0
                 summary["native_score_calls"] = len(score_records) - first_score if scores else 0
                 summary["native_prior_calls"] = len(prior_records) - first_prior if prior else 0
+                summary["native_posterior_calls"] = len(posterior_records) - first_posterior if posterior else 0
                 call_indices.pop()
 
         _ACTIVE = True
