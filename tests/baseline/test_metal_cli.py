@@ -57,6 +57,36 @@ class MetalCLITests(unittest.TestCase):
             self.assertEqual(caught.exception.code, 2)
             self.assertFalse(report.exists())
 
+    def test_vbx_matrix_flag_requires_native_library(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "audio.wav", "--diarize", "--vbx-matrix-products"])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertFalse(report.exists())
+
+    def test_vbx_capability_failure_restores_norm_scope_and_report_privacy(self):
+        import pyannote.audio.utils.vbx as vbx
+        original = vbx.l2_norm
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with patch("tools.baseline.mps_storage_probe.MPSCTC") as native, patch("tools.baseline.native_double.NativeDoubleNormalization") as double:
+                native.return_value.__enter__.return_value.identity = {}
+                native.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.identity = {}
+                double.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.library = object()
+                with self.assertRaisesRegex(ValueError, "matrix_abi_unavailable"):
+                    main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--plda-normalization-library", "unused.dylib", "--plda-normalization-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--vbx-matrix-products", "--hf_token", "private-secret"])
+            self.assertIs(vbx.l2_norm, original)
+            data = json.loads(report.read_text())
+            self.assertEqual(data["status"], "failed")
+            self.assertTrue(data["vbx_matrix_products_requested"])
+            self.assertFalse(data["vbx_matrix_products_observed"])
+            self.assertEqual(data["vbx_calls"], [])
+            self.assertNotIn("private-secret", report.read_text())
+            self.assertNotIn("private.wav", report.read_text())
+
     def test_experimental_scope_rejects_cpu_and_unsupported_language_before_original(self):
         calls = []
         def original(transcript, model, align_model_metadata, audio, device, interpolate_method="nearest"):
