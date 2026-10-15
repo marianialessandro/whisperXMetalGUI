@@ -359,6 +359,51 @@ class NativeDoubleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "closed"):
             context.penalty_terms_vbx(values, alpha)
 
+    def test_vbx_prior_bitwise_numpy_reductions_layouts_and_zero_speakers(self):
+        rng = np.random.default_rng(925)
+        with self.context() as context:
+            for frames, speakers in ((1, 1), (7, 3), (8, 7), (127, 8), (128, 127), (129, 128), (257, 129), (4096, 3), (17, 1024)):
+                gamma = rng.uniform(0., 1., (frames, speakers))
+                if speakers > 1:
+                    gamma[:, 0] = -0.
+                for layout in ("C", "F"):
+                    source = np.array(gamma, order=layout)
+                    masses = np.sum(source, axis=0)
+                    expected = masses / masses.sum()
+                    order = "pairwise" if layout == "F" or speakers == 1 else "sequential"
+                    actual, record = context.prior_vbx(np.ascontiguousarray(source.T), order)
+                    np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+                    self.assertEqual(record["gpu_kernels"], ["double_vbx_gamma_sum", "double_vbx_prior"])
+                    self.assertEqual(record["logical_result_readback_bytes"], speakers * 8)
+                    self.assertGreater(record["computation_gpu_seconds"], 0)
+            for gamma in (np.array([[0., -0.], [2. ** -200, 2. ** -200]]), np.array([[2. ** -200, 0.], [1., 1.]])):
+                masses = gamma.sum(axis=1)
+                actual, _ = context.prior_vbx(gamma)
+                np.testing.assert_array_equal(actual.view(np.uint64), (masses / masses.sum()).view(np.uint64))
+
+    def test_vbx_prior_validation_lifetime_threads_and_capability(self):
+        gamma = np.full((3, 19), .2)
+        gamma.flags.writeable = False
+        with self.context() as context:
+            for invalid in (np.nan, np.inf, -1., 1.01, 2. ** -201):
+                with self.assertRaisesRegex(ValueError, "input_domain_invalid"):
+                    context.prior_vbx(np.full_like(gamma, invalid))
+            with self.assertRaisesRegex(ValueError, "zero_mass_not_supported"):
+                context.prior_vbx(np.zeros_like(gamma))
+            for invalid in (gamma.astype(np.float32), gamma[:, ::2], np.ones((1025, 1)), np.ones((1, 4097)), np.empty((0, 19)), gamma.ravel()):
+                with self.assertRaises(ValueError):
+                    context.prior_vbx(invalid)
+            with self.assertRaisesRegex(ValueError, "reduction_invalid"):
+                context.prior_vbx(gamma, "invalid")
+            with patch.object(context, "library", SimpleNamespace()), self.assertRaisesRegex(ValueError, "abi_unavailable"):
+                context.prior_vbx(gamma)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(context.prior_vbx, gamma) for _ in range(4)]
+                for future in futures:
+                    np.testing.assert_array_equal(future.result()[0], np.full(3, 1. / 3))
+        with self.assertRaisesRegex(ValueError, "closed"):
+            context.prior_vbx(gamma)
+
     def test_native_abi_under_address_and_undefined_sanitizers(self):
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory:

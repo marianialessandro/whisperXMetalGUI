@@ -20,7 +20,7 @@ static_assert(sizeof(DoubleMetrics) == 32);
 class DoubleContext {
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
-    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_;
+    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
     void reserve(id<MTLBuffer> __strong& buffer, uint64_t bytes) {
@@ -48,6 +48,8 @@ public:
         if (statistics_function != nil) statistics_pipeline_ = [device_ newComputePipelineStateWithFunction:statistics_function error:&error];
         id<MTLFunction> score_function = [library newFunctionWithName:@"double_vbx_scores"];
         if (score_function != nil) score_pipeline_ = [device_ newComputePipelineStateWithFunction:score_function error:&error];
+        id<MTLFunction> prior_function = [library newFunctionWithName:@"double_vbx_prior"];
+        if (prior_function != nil) prior_pipeline_ = [device_ newComputePipelineStateWithFunction:prior_function error:&error];
         queue_ = [device_ newCommandQueue]; require(queue_ != nil, "double_queue_creation_failed");
     }
     DoubleMetrics normalize(const double* input, DoubleDimensions d, double* output) {
@@ -190,6 +192,33 @@ public:
         return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
+    DoubleMetrics prior_vbx(const double* input, StatisticsDimensions d, double* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(gamma_pipeline_ != nil && prior_pipeline_ != nil, "double_vbx_prior_kernels_unavailable");
+        require(d.rows > 0 && d.rows <= 1024 && d.columns > 0 && d.columns <= 4096 && d.sequential <= 1 && input != nullptr && output != nullptr, "double_vbx_prior_shape_or_pointer_invalid");
+        uint64_t count = uint64_t(d.rows) * d.columns;
+        bool nonzero = false;
+        for (uint64_t i = 0; i < count; ++i) {
+            require(std::isfinite(input[i]) && input[i] >= 0 && input[i] <= 1 && (input[i] == 0 || input[i] >= 0x1p-200), "double_vbx_prior_input_domain_invalid");
+            nonzero |= input[i] != 0;
+        }
+        require(nonzero, "double_vbx_prior_zero_mass_not_supported");
+        auto started = std::chrono::steady_clock::now();
+        reserve(input_, count * sizeof(double)); reserve(terms_, uint64_t(d.rows) * sizeof(double)); reserve(output_, uint64_t(d.rows) * sizeof(double));
+        std::memcpy(input_.contents, input, count * sizeof(double));
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental VBx prior update";
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:gamma_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:terms_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(d.rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, gamma_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:prior_pipeline_]; [encoder setBuffer:terms_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:output_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        std::memcpy(output, output_.contents, uint64_t(d.rows) * sizeof(double));
+        return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
 };
 static void double_error(char* output, uint32_t capacity, const char* code) { if (output != nullptr && capacity) { std::strncpy(output, code, capacity - 1); output[capacity - 1] = 0; } }
 extern "C" int wxdouble_create(const char* source, uint64_t size, void** output, char* error, uint32_t capacity) {
@@ -239,6 +268,13 @@ extern "C" int wxdouble_vbx_scores(void* context, const double* input, const dou
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->scores_vbx(input, right, {rows, columns, operation, 0, 0}, fa, output); return 0; }
         catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_vbx_scores_failed"); return 1; }
+    }
+}
+extern "C" int wxdouble_vbx_prior(void* context, const double* input, uint32_t speakers, uint32_t frames, uint32_t sequential, double* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->prior_vbx(input, {speakers, frames, 0, 0, sequential, 0, 0, 0}, output); return 0; }
+        catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_vbx_prior_failed"); return 1; }
     }
 }
 extern "C" void wxdouble_destroy(void* context) { @autoreleasepool { delete static_cast<DoubleContext*>(context); } }

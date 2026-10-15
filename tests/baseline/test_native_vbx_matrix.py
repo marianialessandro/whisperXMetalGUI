@@ -16,7 +16,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.baseline.native_double import NativeDoubleNormalization, build_library
-from tools.baseline.native_vbx_matrix import compile_native_vbx, native_vbx_matrix_products
+from tools.baseline.native_vbx_matrix import compile_native_vbx, native_vbx_matrix_products, prior_update
 
 
 @unittest.skipUnless(platform.system() == "Darwin" and torch.backends.mps.is_available(), "Apple Metal required")
@@ -276,6 +276,65 @@ class NativeVBXMatrixTests(unittest.TestCase):
                 actual = executor.submit(vbx.VBx, features, phi, pi=3, gamma=gamma.copy(), maxIters=1).result()
             self.compare(expected, actual)
             self.assertEqual((calls, scores), ([], []))
+
+    def test_native_prior_complete_results_flag_combinations_and_layouts(self):
+        features, phi, gamma = self.fixture()
+        with self.context() as context:
+            for mask in range(8):
+                options = {"precompute": bool(mask & 1), "precompute_records": [], "statistics": bool(mask & 2), "statistics_records": [], "scores": bool(mask & 4), "score_records": []}
+                with native_vbx_matrix_products(context, [], [], **options):
+                    expected = vbx.VBx(features, phi, Fa=.07, Fb=.8, pi=3, gamma=gamma.copy(), maxIters=5, return_model=True)
+                records, calls, products = [], [], []
+                with native_vbx_matrix_products(context, products, calls, prior=True, prior_records=records, **options):
+                    actual = vbx.VBx(features, phi, Fa=.07, Fb=.8, pi=3, gamma=gamma.copy(), maxIters=5, return_model=True)
+                self.compare(expected, actual)
+                self.assertEqual(calls[0]["native_prior_calls"], len(actual[2]))
+                self.assertEqual(len(products), 3 * len(actual[2]))
+                self.assertTrue(all(record["computation_gpu_seconds"] > 0 for record in records))
+                self.assertTrue(all("posterior_and_prior_updates" not in record["cpu_residuals"] for record in records + products))
+            for values in (gamma, np.asfortranarray(gamma), gamma[:, :1].copy()):
+                masses = values.sum(axis=0)
+                records = []
+                actual = prior_update(context, records, values, 0, 0)
+                np.testing.assert_array_equal(actual.view(np.uint64), (masses / masses.sum()).view(np.uint64))
+                self.assertEqual(records[0]["frame_reduction_order"], "pairwise" if values.flags.f_contiguous else "sequential")
+            records, calls = [], []
+            with native_vbx_matrix_products(context, [], calls, prior=True, prior_records=records):
+                vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=1, alpha=np.zeros((3, 8)), invL=np.ones((3, 8)))
+                vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=0)
+            self.assertEqual([call["native_prior_calls"] for call in calls], [1, 0])
+
+    def test_prior_failure_capability_assignment_contract_and_thread_restore(self):
+        features, phi, gamma = self.fixture()
+        original = vbx.VBx
+        with self.context() as context:
+            with self.assertRaisesRegex(ValueError, "prior_records_required"):
+                with native_vbx_matrix_products(context, [], [], prior=True):
+                    pass
+            with patch.object(context, "library", SimpleNamespace(wxdouble_matmul=object())), self.assertRaisesRegex(ValueError, "prior_abi_unavailable"):
+                with native_vbx_matrix_products(context, [], [], prior=True, prior_records=[]):
+                    pass
+            records, calls = [], []
+            with self.assertRaisesRegex(ValueError, "injected_prior_failure"):
+                with native_vbx_matrix_products(context, [], calls, prior=True, prior_records=records), patch.object(context, "prior_vbx", side_effect=ValueError("injected_prior_failure")):
+                    vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=1)
+            self.assertEqual(calls[0]["status"], "failed")
+            self.assertEqual(calls[0]["native_prior_calls"], 0)
+            self.assertIs(vbx.VBx, original)
+            for before, after in (("np.sum(gamma, axis=0)", "gamma.sum(axis=0)"), ("pi = pi / pi.sum()", "pi /= pi.sum()")):
+                changed = textwrap.dedent(inspect.getsource(original)).replace(before, after)
+                with patch("tools.baseline.native_vbx_matrix.inspect.getsource", return_value=changed), patch("tools.baseline.native_vbx_matrix.VBX_SHA256", hashlib.sha256(changed.encode()).hexdigest()), self.assertRaisesRegex(ValueError, "prior_expression_contract_changed"):
+                    compile_native_vbx(original, object(), prior=object())
+            with self.assertRaisesRegex(ValueError, "operand_format_not_supported"):
+                prior_update(context, [], gamma[:, ::2], 0, 0)
+            with patch("tools.baseline.native_vbx_matrix.np.ascontiguousarray", side_effect=AssertionError("oversized staging attempted")), self.assertRaisesRegex(ValueError, "shape_not_supported"):
+                prior_update(context, [], np.ones((4097, 1)), 0, 0)
+            expected = original(features, phi, pi=3, gamma=gamma.copy(), maxIters=1)
+            records, calls = [], []
+            with native_vbx_matrix_products(context, [], calls, prior=True, prior_records=records), ThreadPoolExecutor(max_workers=1) as executor:
+                actual = executor.submit(vbx.VBx, features, phi, pi=3, gamma=gamma.copy(), maxIters=1).result()
+            self.compare(expected, actual)
+            self.assertEqual((records, calls), ([], []))
 
     def test_unrelated_threads_and_multiple_calls_keep_separate_metadata(self):
         features, phi, gamma = self.fixture()

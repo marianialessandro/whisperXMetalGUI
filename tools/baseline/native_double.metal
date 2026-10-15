@@ -199,3 +199,10 @@ kernel void double_vbx_scores(device const ulong* input [[buffer(0)]], constant 
         output[index] = multiply_positive_binary64(value & (sign - 1), d.fa) | (value & sign);
     }
 }
+
+// VBx prior normalization keeps the speaker sum pairwise and divides each mass only after the total is complete.
+kernel void double_vbx_prior(device const ulong* masses [[buffer(0)]], constant StatisticsDimensions& d [[buffer(1)]], device ulong* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    if (index != 0) return;
+    ulong total = double_sum(masses, d.rows, 0, false);
+    for (uint speaker = 0; speaker < d.rows; ++speaker) output[speaker] = divide_positive_binary64(masses[speaker], total);
+}

@@ -14,6 +14,7 @@ extern "C" int wxdouble_elementwise(void*, const double*, const double*, uint32_
 extern "C" int wxdouble_vbx_precompute(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, double*, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_statistics(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, double, double, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_scores(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_vbx_prior(void*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -121,6 +122,25 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_scores(context, inv_l, alpha, 1, 2, 0, 1., output, &metrics, error, sizeof(error)) != 0);
     inv_l[0] = .5;
     assert(output[0] == 91. && output[1] == 92.);
+    double prior_gamma[] = {.25, .75, .5, .5};
+    assert(wxdouble_vbx_prior(context, prior_gamma, 2, 2, 1, output, &metrics, error, sizeof(error)) == 0);
+    assert(output[0] == .5 && output[1] == .5 && metrics.kernels == 2);
+    assert(wxdouble_vbx_prior(context, prior_gamma, 2, 2, 0, prior_gamma, &metrics, error, sizeof(error)) == 0 && prior_gamma[0] == .5 && prior_gamma[1] == .5);
+    output[0] = 91.; output[1] = 92.;
+    assert(wxdouble_vbx_prior(context, prior_gamma, 0, 2, 1, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_prior(context, prior_gamma, 1025, 2, 1, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_prior(context, prior_gamma, 2, 4097, 1, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_prior(context, prior_gamma, 2, 2, 2, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_prior(nullptr, prior_gamma, 2, 2, 1, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_prior(context, nullptr, 2, 2, 1, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_prior(context, prior_gamma, 2, 2, 1, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_prior(context, prior_gamma, 2, 2, 1, output, nullptr, error, sizeof(error)) != 0);
+    for (double& value : prior_gamma) value = 0.;
+    assert(wxdouble_vbx_prior(context, prior_gamma, 2, 2, 1, output, &metrics, error, sizeof(error)) != 0);
+    prior_gamma[0] = -1.;
+    assert(wxdouble_vbx_prior(context, prior_gamma, 2, 2, 1, output, &metrics, error, sizeof(error)) != 0);
+    prior_gamma[0] = 1.;
+    assert(output[0] == 91. && output[1] == 92.);
     wxdouble_destroy(context);
     wxdouble_destroy(nullptr);
     std::string legacy_shader = shader.substr(0, shader.find("\nstruct MatrixDimensions"));
@@ -142,6 +162,12 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_statistics(context, gamma, phi, 1, 2, 2, 0, 1, 1., 1., output, &metrics, error, sizeof(error)) == 0);
     output[0] = 91.;
     assert(wxdouble_vbx_scores(context, inv_l, alpha, 1, 2, 0, 1., output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
+    wxdouble_destroy(context);
+    std::string scores_shader = shader.substr(0, shader.find("\nkernel void double_vbx_prior"));
+    assert(wxdouble_create(scores_shader.data(), scores_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_vbx_scores(context, inv_l, alpha, 1, 2, 0, 1., output, &metrics, error, sizeof(error)) == 0);
+    output[0] = 91.;
+    assert(wxdouble_vbx_prior(context, prior_gamma, 2, 2, 1, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
     wxdouble_destroy(context);
     std::string matrix_shader = shader.substr(0, shader.find("\nstruct ElementDimensions"));
     context = nullptr;

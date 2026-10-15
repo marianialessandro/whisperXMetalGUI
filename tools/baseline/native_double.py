@@ -256,6 +256,30 @@ class NativeDoubleNormalization:
         return output, {"scope": "experimental_native_binary64_vbx_scores", "operation": "penalty_terms" if mode == 0 else "frame_scores", "rows": rows, "columns": columns, "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": ["double_vbx_scores"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes + right.nbytes + 8, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
 
+    def prior_vbx(self, gamma_transposed, reduction_order="sequential"):
+        if type(gamma_transposed) is not np.ndarray or gamma_transposed.dtype != np.float64 or gamma_transposed.ndim != 2 or not gamma_transposed.flags.c_contiguous:
+            raise ValueError("double_vbx_prior_input_format_invalid")
+        speakers, frames = gamma_transposed.shape
+        if not 0 < speakers <= 1024 or not 0 < frames <= 4096 or reduction_order not in ("pairwise", "sequential"):
+            raise ValueError("double_vbx_prior_shape_or_reduction_invalid")
+        output, metrics, error = np.empty(speakers), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                operation = self.library.wxdouble_vbx_prior
+            except AttributeError as failure:
+                raise ValueError("double_vbx_prior_abi_unavailable") from failure
+            operation.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            operation.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if operation(self.context, gamma_transposed.ctypes.data, speakers, frames, int(reduction_order == "sequential"), output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 2 or not np.isfinite(output).all():
+            raise ValueError("double_vbx_prior_native_result_invalid")
+        return output, {"scope": "experimental_native_binary64_vbx_prior", "speakers": speakers, "frames": frames, "frame_reduction_order": reduction_order, "speaker_reduction_order": "pairwise", "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": ["double_vbx_gamma_sum", "double_vbx_prior"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": gamma_transposed.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build", type=Path, required=True, help="Compile a new local dylib at this path; existing paths are never overwritten.")
