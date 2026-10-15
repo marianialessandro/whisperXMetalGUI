@@ -182,3 +182,20 @@ kernel void double_vbx_statistics(device const ulong* input [[buffer(0)]], const
         output[index] = multiply_positive_binary64(multiply_positive_binary64(ratio, input[index]), value & (sign - 1)) | (value & sign);
     }
 }
+
+struct ScoreDimensions { uint rows, columns, operation, reserved; ulong fa; };
+
+// The original square, sum, penalty scaling, subtraction, addition and Fa scaling each round separately.
+kernel void double_vbx_scores(device const ulong* input [[buffer(0)]], constant ScoreDimensions& d [[buffer(1)]], device const ulong* right [[buffer(2)]], device ulong* output [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index >= d.rows * d.columns) return;
+    ulong sign = 1ul << 63;
+    if (d.operation == 0) {
+        ulong alpha = right[index] & (sign - 1);
+        output[index] = matrix_add(input[index], multiply_positive_binary64(alpha, alpha));
+    } else {
+        ulong penalty = right[index % d.columns];
+        ulong scaled = multiply_positive_binary64(penalty & (sign - 1), 0x3fe0000000000000ul) | (penalty & sign);
+        ulong value = matrix_add(matrix_add(input[index], scaled ^ sign), right[d.columns + index / d.columns]);
+        output[index] = multiply_positive_binary64(value & (sign - 1), d.fa) | (value & sign);
+    }
+}

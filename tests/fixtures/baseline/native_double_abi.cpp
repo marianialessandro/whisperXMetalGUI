@@ -13,6 +13,7 @@ extern "C" int wxdouble_matmul(void*, const double*, const double*, uint32_t, ui
 extern "C" int wxdouble_elementwise(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_precompute(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, double*, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_statistics(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, double, double, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_vbx_scores(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -98,6 +99,28 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_statistics(nullptr, gamma, phi, 1, 2, 2, 0, 1, 1., 1., output, &metrics, error, sizeof(error)) != 0);
     assert(wxdouble_vbx_statistics(context, gamma, phi, 1, 2, 2, 0, 1, 1., 1., output, nullptr, error, sizeof(error)) != 0);
     assert(output[0] == 91. && output[1] == 92.);
+    double inv_l[] = {.5, 1.}, alpha[] = {2., -0.}, packed[] = {2., 4., -.5};
+    assert(wxdouble_vbx_scores(context, inv_l, alpha, 1, 2, 0, 1., output, &metrics, error, sizeof(error)) == 0);
+    assert(output[0] == 4.5 && output[1] == 1. && metrics.kernels == 1);
+    assert(wxdouble_vbx_scores(context, output, packed, 1, 2, 1, .5, output, &metrics, error, sizeof(error)) == 0);
+    assert(output[0] == 1.5 && output[1] == -.75);
+    output[0] = 91.; output[1] = 92.;
+    assert(wxdouble_vbx_scores(context, inv_l, alpha, 0, 2, 0, 1., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_scores(context, inv_l, alpha, 1025, 2, 0, 1., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_scores(context, inv_l, packed, 4097, 2, 1, 1., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_scores(context, inv_l, alpha, 1, 1025, 0, 1., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_scores(context, inv_l, alpha, 1, 2, 2, 1., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_scores(context, inv_l, alpha, 1, 2, 0, .5, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_scores(context, inv_l, packed, 1, 2, 1, 0., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_scores(nullptr, inv_l, alpha, 1, 2, 0, 1., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_scores(context, nullptr, alpha, 1, 2, 0, 1., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_scores(context, inv_l, nullptr, 1, 2, 0, 1., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_scores(context, inv_l, alpha, 1, 2, 0, 1., nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_scores(context, inv_l, alpha, 1, 2, 0, 1., output, nullptr, error, sizeof(error)) != 0);
+    inv_l[0] = -1.;
+    assert(wxdouble_vbx_scores(context, inv_l, alpha, 1, 2, 0, 1., output, &metrics, error, sizeof(error)) != 0);
+    inv_l[0] = .5;
+    assert(output[0] == 91. && output[1] == 92.);
     wxdouble_destroy(context);
     wxdouble_destroy(nullptr);
     std::string legacy_shader = shader.substr(0, shader.find("\nstruct MatrixDimensions"));
@@ -114,6 +137,12 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_statistics(context, gamma, phi, 1, 2, 2, 0, 1, 1., 1., output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
     wxdouble_destroy(context);
     g[0] = 91.;
+    std::string statistics_shader = shader.substr(0, shader.find("\nstruct ScoreDimensions"));
+    assert(wxdouble_create(statistics_shader.data(), statistics_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_vbx_statistics(context, gamma, phi, 1, 2, 2, 0, 1, 1., 1., output, &metrics, error, sizeof(error)) == 0);
+    output[0] = 91.;
+    assert(wxdouble_vbx_scores(context, inv_l, alpha, 1, 2, 0, 1., output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
+    wxdouble_destroy(context);
     std::string matrix_shader = shader.substr(0, shader.find("\nstruct ElementDimensions"));
     context = nullptr;
     assert(wxdouble_create(matrix_shader.data(), matrix_shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);

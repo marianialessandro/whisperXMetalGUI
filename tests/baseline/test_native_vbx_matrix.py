@@ -222,6 +222,61 @@ class NativeVBXMatrixTests(unittest.TestCase):
             with patch("tools.baseline.native_vbx_matrix.inspect.getsource", return_value=changed), patch("tools.baseline.native_vbx_matrix.VBX_SHA256", hashlib.sha256(changed.encode()).hexdigest()), self.assertRaisesRegex(ValueError, "statistics_expression_contract_changed"):
                 compile_native_vbx(original, object(), statistics=object())
 
+    def test_native_scores_complete_results_options_layout_and_initial_model(self):
+        features, phi, gamma = self.fixture()
+        with self.context() as context:
+            for precompute, statistics in ((False, False), (True, False), (False, True), (True, True)):
+                for layout in ("C", "F"):
+                    with native_vbx_matrix_products(context, [], [], precompute=precompute, precompute_records=[], statistics=statistics, statistics_records=[]):
+                        expected = vbx.VBx(np.array(features, order=layout), phi, Fa=.07, Fb=.8, pi=3, gamma=gamma.copy(), maxIters=5, return_model=True)
+                    products, calls, scores = [], [], []
+                    with native_vbx_matrix_products(context, products, calls, precompute=precompute, precompute_records=[], statistics=statistics, statistics_records=[], scores=True, score_records=scores):
+                        actual = vbx.VBx(np.array(features, order=layout), phi, Fa=.07, Fb=.8, pi=3, gamma=gamma.copy(), maxIters=5, return_model=True)
+                    self.compare(expected, actual)
+                    self.assertEqual(calls[0]["native_score_calls"], 2 * len(actual[2]))
+                    self.assertEqual(len(products), 3 * len(actual[2]))
+                    self.assertEqual({r["operation"] for r in scores}, {"penalty_terms", "frame_scores"})
+                    self.assertTrue(all(r["computation_gpu_seconds"] > 0 for r in scores))
+                    self.assertTrue(all("score_elementwise_updates" not in r["cpu_residuals"] for r in scores))
+            model = {"alpha": np.zeros((3, 8)), "invL": np.ones((3, 8))}
+            with native_vbx_matrix_products(context, [], []):
+                expected = vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=1, return_model=True, **model)
+            scores, calls, products = [], [], []
+            with native_vbx_matrix_products(context, products, calls, scores=True, score_records=scores):
+                actual = vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=1, return_model=True, **model)
+                vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=0)
+            self.compare(expected, actual)
+            self.assertEqual(len(products), 2)
+            self.assertEqual([call["native_score_calls"] for call in calls], [2, 0])
+
+    def test_scores_failure_capability_ast_and_unrelated_thread_restore(self):
+        features, phi, gamma = self.fixture()
+        original = vbx.VBx
+        with self.context() as context:
+            with self.assertRaisesRegex(ValueError, "score_records_required"):
+                with native_vbx_matrix_products(context, [], [], scores=True):
+                    pass
+            with patch.object(context, "library", SimpleNamespace(wxdouble_matmul=object())), self.assertRaisesRegex(ValueError, "scores_abi_unavailable"):
+                with native_vbx_matrix_products(context, [], [], scores=True, score_records=[]):
+                    pass
+            for method, completed in (("penalty_terms_vbx", 0), ("frame_scores_vbx", 1)):
+                calls, scores = [], []
+                with self.assertRaisesRegex(ValueError, "injected_scores_failure"):
+                    with native_vbx_matrix_products(context, [], calls, scores=True, score_records=scores), patch.object(context, method, side_effect=ValueError("injected_scores_failure")):
+                        vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=1)
+                self.assertEqual(calls[0]["status"], "failed")
+                self.assertEqual(calls[0]["native_score_calls"], completed)
+                self.assertIs(vbx.VBx, original)
+            changed = textwrap.dedent(inspect.getsource(original)).replace("+ G", "+ (G + 0)")
+            with patch("tools.baseline.native_vbx_matrix.inspect.getsource", return_value=changed), patch("tools.baseline.native_vbx_matrix.VBX_SHA256", hashlib.sha256(changed.encode()).hexdigest()), self.assertRaisesRegex(ValueError, "score_expression_contract_changed"):
+                compile_native_vbx(original, object(), score=object())
+            expected = original(features, phi, pi=3, gamma=gamma.copy(), maxIters=1)
+            calls, scores = [], []
+            with native_vbx_matrix_products(context, [], calls, scores=True, score_records=scores), ThreadPoolExecutor(max_workers=1) as executor:
+                actual = executor.submit(vbx.VBx, features, phi, pi=3, gamma=gamma.copy(), maxIters=1).result()
+            self.compare(expected, actual)
+            self.assertEqual((calls, scores), ([], []))
+
     def test_unrelated_threads_and_multiple_calls_keep_separate_metadata(self):
         features, phi, gamma = self.fixture()
         expected = vbx.VBx(features, phi, Fa=.07, Fb=.8, pi=3, gamma=gamma.copy(), maxIters=3)

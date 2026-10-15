@@ -212,6 +212,50 @@ class NativeDoubleNormalization:
         return output, {"scope": "experimental_native_binary64_vbx_statistics", "operation": "invL" if mode == 0 else "alpha", "rows": rows, "columns": columns, "features": features, "reduction_order": reduction_order if mode == 0 else None, "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": (["double_vbx_gamma_sum"] if mode == 0 else []) + ["double_vbx_statistics"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes + right.nbytes + 16, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
 
+    def penalty_terms_vbx(self, inv_l, alpha):
+        return self._scores_vbx(inv_l, alpha, 0, 1.)
+
+    def frame_scores_vbx(self, frames, penalty, g, fa):
+        if type(frames) is not np.ndarray or frames.dtype != np.float64 or frames.ndim != 2 or not frames.flags.c_contiguous:
+            raise ValueError("double_vbx_scores_input_format_invalid")
+        if not 0 < frames.shape[0] <= 4096 or not 0 < frames.shape[1] <= 1024:
+            raise ValueError("double_vbx_scores_shape_invalid")
+        for values in (penalty, g):
+            if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim != 1 or not values.flags.c_contiguous:
+                raise ValueError("double_vbx_scores_vector_format_invalid")
+        if penalty.shape != (frames.shape[1],) or g.shape != (frames.shape[0],):
+            raise ValueError("double_vbx_scores_vector_shape_invalid")
+        packed = np.concatenate((penalty, g))
+        output, record = self._scores_vbx(frames, packed, 1, fa)
+        record["host_vector_packing_copy_bytes"] = packed.nbytes
+        return output, record
+
+    def _scores_vbx(self, values, right, mode, fa):
+        if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim != 2 or not values.flags.c_contiguous or type(right) is not np.ndarray or right.dtype != np.float64 or not right.flags.c_contiguous:
+            raise ValueError("double_vbx_scores_input_format_invalid")
+        rows, columns = values.shape
+        if not 0 < rows <= (1024 if mode == 0 else 4096) or not 0 < columns <= 1024 or right.shape != (values.shape if mode == 0 else (rows + columns,)):
+            raise ValueError("double_vbx_scores_shape_invalid")
+        if type(fa) not in (float, int):
+            raise ValueError("double_vbx_scores_scalar_format_invalid")
+        output, metrics, error = np.empty_like(values), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                operation = self.library.wxdouble_vbx_scores
+            except AttributeError as failure:
+                raise ValueError("double_vbx_scores_abi_unavailable") from failure
+            operation.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_double, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            operation.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if operation(self.context, values.ctypes.data, right.ctypes.data, rows, columns, mode, fa, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 1 or not np.isfinite(output).all():
+            raise ValueError("double_vbx_scores_native_result_invalid")
+        return output, {"scope": "experimental_native_binary64_vbx_scores", "operation": "penalty_terms" if mode == 0 else "frame_scores", "rows": rows, "columns": columns, "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": ["double_vbx_scores"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes + right.nbytes + 8, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build", type=Path, required=True, help="Compile a new local dylib at this path; existing paths are never overwritten.")
