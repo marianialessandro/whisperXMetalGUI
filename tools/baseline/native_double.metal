@@ -452,3 +452,13 @@ kernel void double_vbx_initialize(device const ulong* input [[buffer(0)]], const
         output[start + column] = divide_positive_binary64(value & (sign - 1), mass) | (value & sign);
     }
 }
+
+struct QinitDimensions { uint rows, columns; ulong smoothing; };
+
+// Source-pinned cluster initialization is one-hot, so the shifted maximum is exactly the nonnegative smoothing value.
+kernel void double_vbx_qinit_exp(device const ulong* input [[buffer(0)]], constant QinitDimensions& d [[buffer(1)]], device ulong* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    if (index >= d.rows * d.columns) return;
+    ulong scaled = df_mul(input[index], d.smoothing);
+    ulong shifted = matrix_add(scaled, d.smoothing ^ (1ul << 63));
+    output[index] = bounded_binary64_exp(shifted);
+}

@@ -391,6 +391,29 @@ class NativeDoubleNormalization:
         return output, {"scope": "experimental_native_binary64_finite_logsumexp", "rows": rows, "columns": columns, "reduction_order": reduction_order, "shift_domain": [-60, 0], "approximation_policy": "scipy_1_15_3_separated_maxima_openlibm_math", "scipy_bitwise_certified": False, "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": ["double_vbx_lse_terms", "double_vbx_lse_final"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
 
+    def qinit_softmax_vbx(self, values, smoothing):
+        if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim != 2 or not values.flags.c_contiguous:
+            raise ValueError("double_vbx_qinit_input_format_invalid")
+        rows, columns = values.shape
+        if not 0 < rows <= 4096 or not 0 < columns <= 1024 or values.size > 65536 or type(smoothing) not in (float, int, np.float64):
+            raise ValueError("double_vbx_qinit_shape_or_scalar_invalid")
+        output, metrics, error = np.empty_like(values), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_vbx_qinit
+            except AttributeError as failure:
+                raise ValueError("double_vbx_qinit_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_double, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, values.ctypes.data, rows, columns, smoothing, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 2 or not np.isfinite(output).all():
+            raise ValueError("double_vbx_qinit_native_result_invalid")
+        return output, {"scope": "experimental_native_binary64_vbx_qinit", "operation": "initial_softmax", "rows": rows, "columns": columns, "smoothing": float(smoothing), "math_policy": "one_hot_shifted_softmax_openlibm_exp", "scipy_bitwise_certified": False, "gpu_kernels": ["double_vbx_qinit_exp", "double_vbx_initialize"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
     def uniform_prior_vbx(self, speakers):
         if type(speakers) is not int or not 0 < speakers <= 1024:
             raise ValueError("double_vbx_uniform_prior_shape_invalid")

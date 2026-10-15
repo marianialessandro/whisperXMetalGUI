@@ -1,0 +1,180 @@
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import inspect
+from pathlib import Path
+import platform
+import sys
+import tempfile
+import textwrap
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+import numpy as np
+import torch
+from scipy.special import softmax
+import pyannote.audio.utils.vbx as vbx
+import pyannote.audio.pipelines.clustering as clustering
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tools.baseline.native_double import NativeDoubleNormalization, build_library
+from tools.baseline.native_vbx_matrix import native_vbx_matrix_products
+from tools.baseline.native_vbx_qinit import compile_native_cluster, initial_softmax, native_vbx_qinit
+
+
+@unittest.skipUnless(platform.system() == "Darwin" and torch.backends.mps.is_available(), "Apple Metal required")
+class NativeVBXQinitTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory()
+        cls.library = Path(cls.directory.name) / "double.dylib"
+        cls.identity = build_library(cls.library)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.directory.cleanup()
+
+    def context(self):
+        return NativeDoubleNormalization(self.library, self.identity["library_sha256"])
+
+    def one_hot(self, rows, columns):
+        values = np.zeros((rows, columns))
+        values[np.arange(rows), np.arange(rows) % columns] = 1.
+        return values
+
+    def test_softmax_scipy_boundaries_and_numpy_inputs_preserved(self):
+        with self.context() as context:
+            for rows, columns in ((1, 1), (19, 3), (19, 7), (19, 8), (19, 127), (19, 128), (19, 129), (64, 1024), (4096, 1)):
+                values = self.one_hot(rows, columns)
+                values.flags.writeable = False
+                for smoothing in (0., -0., 2. ** -200, .1, 7., 60.):
+                    actual, record = context.qinit_softmax_vbx(values, smoothing)
+                    signed_values = values.copy()
+                    signed_values[signed_values == 0] = -0.
+                    signed_actual, _ = context.qinit_softmax_vbx(signed_values, smoothing)
+                    np.testing.assert_array_equal(actual.view(np.uint64), signed_actual.view(np.uint64))
+                    np.testing.assert_allclose(actual, softmax(values * smoothing, axis=1), rtol=3e-15, atol=0.)
+                    self.assertEqual(record["gpu_kernels"], ["double_vbx_qinit_exp", "double_vbx_initialize"])
+                    self.assertEqual(record["logical_input_upload_bytes"], values.nbytes)
+                    self.assertEqual(record["logical_result_readback_bytes"], values.nbytes)
+                    self.assertGreater(record["computation_gpu_seconds"], 0)
+                    self.assertFalse(record["scipy_bitwise_certified"])
+                np.testing.assert_array_equal(values, self.one_hot(rows, columns))
+
+    def test_softmax_domains_shapes_and_one_hot_invariant(self):
+        with self.context() as context:
+            values = self.one_hot(3, 8)
+            for smoothing in (-1., np.inf, np.nan, 60.01, 2. ** -201, True, "7"):
+                with self.assertRaises(ValueError):
+                    context.qinit_softmax_vbx(values, smoothing)
+            for invalid in (np.zeros_like(values), np.ones_like(values), np.full_like(values, .5), np.full_like(values, np.nan), np.full_like(values, -1.)):
+                with self.assertRaisesRegex(ValueError, "one_hot_required"):
+                    context.qinit_softmax_vbx(invalid, 7.)
+            for invalid in (values.astype(np.float32), values[:, ::2], np.ones((4097, 1)), np.ones((65, 1024)), np.ones((1, 1025)), np.ones(3)):
+                with self.assertRaises(ValueError):
+                    context.qinit_softmax_vbx(invalid, 7.)
+            with self.assertRaisesRegex(ValueError, "shape_not_supported"):
+                initial_softmax(context, [], np.ones((4097, 2)), 7.)
+
+    def test_softmax_context_lifetime_capability_and_thread_serialization(self):
+        values = self.one_hot(3, 8)
+        with self.context() as context:
+            with patch.object(context, "library", SimpleNamespace()), self.assertRaisesRegex(ValueError, "abi_unavailable"):
+                context.qinit_softmax_vbx(values, 7.)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(lambda _: context.qinit_softmax_vbx(values, 7.)[0], range(4)))
+            for result in results:
+                np.testing.assert_array_equal(result.view(np.uint64), results[0].view(np.uint64))
+        with self.assertRaisesRegex(ValueError, "closed"):
+            context.qinit_softmax_vbx(values, 7.)
+
+    def test_scope_aliases_bypass_and_dynamic_vbx_lookup(self):
+        labels = np.arange(19) % 3
+        original = vbx.cluster_vbx
+        observed = []
+
+        def capture(*args, **kwargs):
+            observed.append(kwargs["gamma"].copy())
+            return kwargs["gamma"], np.ones(3) / 3, [], None, None
+
+        with self.context() as context:
+            for smoothing in (-1., 0., 7., 60.):
+                records = []
+                with native_vbx_qinit(context, records), patch.object(vbx, "VBx", side_effect=capture):
+                    self.assertIs(vbx.cluster_vbx, clustering.cluster_vbx)
+                    actual = clustering.cluster_vbx(labels, None, None, 1., 1., init_smoothing=smoothing)
+                expected = self.one_hot(19, 3)
+                expected = expected if smoothing < 0 else softmax(expected * smoothing, axis=1)
+                np.testing.assert_allclose(actual[0], expected, rtol=3e-15, atol=0.)
+                self.assertEqual(len(records), int(smoothing >= 0))
+            self.assertEqual(len(observed), 4)
+        self.assertIs(vbx.cluster_vbx, original)
+        self.assertIs(clustering.cluster_vbx, original)
+
+    def test_complete_cluster_with_all_native_vbx_options_and_determinism(self):
+        rng = np.random.default_rng(991)
+        features, phi, labels = rng.normal(scale=.3, size=(19, 8)), rng.uniform(.4, 2., 8), np.arange(19) % 3
+        options = {"precompute": True, "precompute_records": [], "statistics": True, "statistics_records": [], "scores": True, "score_records": [], "prior": True, "prior_records": [], "posterior": True, "posterior_records": [], "elbo": True, "elbo_records": [], "transcendentals": True, "transcendental_records": [], "logsumexp": True, "logsumexp_records": [], "scalars": True, "scalar_records": [], "initialization": True, "initialization_records": []}
+        with self.context() as context, native_vbx_matrix_products(context, [], [], **options):
+            expected = vbx.cluster_vbx(labels, features, phi, .07, .8, maxIters=3)
+            for repeat in range(3):
+                records = []
+                with native_vbx_qinit(context, records):
+                    actual = vbx.cluster_vbx(labels, features, phi, .07, .8, maxIters=3)
+                self.assertEqual(len(records), 1)
+                for left, right in zip(expected, actual):
+                    np.testing.assert_allclose(left, right, rtol=1e-12, atol=1e-12)
+                if repeat == 0:
+                    previous = actual
+                else:
+                    for left, right in zip(previous, actual):
+                        np.testing.assert_array_equal(left.view(np.uint64), right.view(np.uint64))
+
+    def test_unrelated_thread_remains_original_and_nested_scope_rejected(self):
+        labels = np.arange(19) % 3
+        values = np.ones((19, 8)) * .1
+        phi = np.ones(8)
+        expected = vbx.cluster_vbx(labels, values, phi, .07, .8, maxIters=0)
+        with self.context() as context, native_vbx_qinit(context, records := []):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                actual = executor.submit(clustering.cluster_vbx, labels, values, phi, .07, .8, maxIters=0).result()
+            self.assertEqual(records, [])
+            for left, right in zip(expected, actual):
+                np.testing.assert_array_equal(left.view(np.uint64), right.view(np.uint64))
+            with self.assertRaisesRegex(ValueError, "already_active"):
+                with native_vbx_qinit(context, []):
+                    pass
+
+    def test_failures_restore_both_aliases_without_fallback(self):
+        original = vbx.cluster_vbx
+        with self.context() as context:
+            with self.assertRaisesRegex(ValueError, "records_required"):
+                with native_vbx_qinit(context, None):
+                    pass
+            with patch.object(context, "library", SimpleNamespace()), self.assertRaisesRegex(ValueError, "abi_unavailable"):
+                with native_vbx_qinit(context, []):
+                    pass
+            with self.assertRaisesRegex(ValueError, "injected_qinit_failure"):
+                with native_vbx_qinit(context, records := []), patch.object(context, "qinit_softmax_vbx", side_effect=ValueError("injected_qinit_failure")):
+                    vbx.cluster_vbx(np.arange(19) % 3, None, None, 1., 1.)
+            self.assertEqual(records, [])
+            self.assertIs(vbx.cluster_vbx, original)
+            self.assertIs(clustering.cluster_vbx, original)
+            with patch.object(clustering, "cluster_vbx", object()), self.assertRaisesRegex(ValueError, "reference_not_supported"):
+                with native_vbx_qinit(context, []):
+                    pass
+
+    def test_source_and_expression_pins_and_runtime(self):
+        source = textwrap.dedent(inspect.getsource(vbx.cluster_vbx))
+        with patch("tools.baseline.native_vbx_qinit.inspect.getsource", return_value=source + "\n"), self.assertRaisesRegex(ValueError, "source_not_supported"):
+            compile_native_cluster(vbx.cluster_vbx, object(), object())
+        changed = source.replace("qinit * init_smoothing", "init_smoothing * qinit")
+        with patch("tools.baseline.native_vbx_qinit.inspect.getsource", return_value=changed), patch("tools.baseline.native_vbx_qinit.CLUSTER_SHA256", hashlib.sha256(changed.encode()).hexdigest()), self.assertRaisesRegex(ValueError, "expression_contract_changed"):
+            compile_native_cluster(vbx.cluster_vbx, object(), object())
+        with self.context() as context, patch("tools.baseline.native_vbx_qinit.importlib.metadata.version", return_value="unsupported"), self.assertRaisesRegex(ValueError, "runtime_not_supported"):
+            with native_vbx_qinit(context, []):
+                pass
+
+
+if __name__ == "__main__":
+    unittest.main()

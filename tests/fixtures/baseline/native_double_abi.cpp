@@ -20,6 +20,7 @@ extern "C" int wxdouble_vbx_elbo(void*, const double*, uint32_t, uint32_t, uint3
 extern "C" int wxdouble_vbx_transcendental(void*, const double*, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_logsumexp(void*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_initialize(void*, const double*, uint32_t, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_vbx_qinit(void*, const double*, uint32_t, uint32_t, double, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -223,6 +224,21 @@ int main(int argc, char** argv) {
     double zeros[] = {0., -0.};
     assert(wxdouble_vbx_initialize(context, zeros, 1, 2, 1, 0, output, &metrics, error, sizeof(error)) != 0);
     assert(output[0] == 91. && output[1] == 92.);
+    double one_hot[] = {1., 0.};
+    assert(wxdouble_vbx_qinit(context, one_hot, 1, 2, 0., output, &metrics, error, sizeof(error)) == 0 && output[0] == .5 && output[1] == .5 && metrics.kernels == 2);
+    double qinit_alias[] = {1., 0.};
+    assert(wxdouble_vbx_qinit(context, qinit_alias, 1, 2, 0., qinit_alias, &metrics, error, sizeof(error)) == 0 && qinit_alias[0] == .5 && qinit_alias[1] == .5);
+    output[0] = 91.; output[1] = 92.;
+    assert(wxdouble_vbx_qinit(context, nullptr, 1, 2, 7., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_qinit(context, one_hot, 1, 2, 7., nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_qinit(context, one_hot, 1, 2, 7., output, nullptr, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_qinit(context, one_hot, 4097, 2, 7., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_qinit(context, one_hot, 65, 1024, 7., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_qinit(context, one_hot, 1, 1025, 7., output, &metrics, error, sizeof(error)) != 0);
+    for (double smoothing : {-1., 61., 0x1p-201, std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) assert(wxdouble_vbx_qinit(context, one_hot, 1, 2, smoothing, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_qinit(context, zeros, 1, 2, 7., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_qinit(context, input, 1, 2, 7., output, &metrics, error, sizeof(error)) != 0);
+    assert(output[0] == 91. && output[1] == 92.);
     wxdouble_destroy(context);
     wxdouble_destroy(nullptr);
     std::string legacy_shader = shader.substr(0, shader.find("\nstruct MatrixDimensions"));
@@ -281,6 +297,12 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_logsumexp(context, input, 1, 2, 0, output, &metrics, error, sizeof(error)) == 0);
     output[0] = 91.;
     assert(wxdouble_vbx_initialize(context, nullptr, 1, 2, 0, 0, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
+    wxdouble_destroy(context);
+    std::string initialization_shader = shader.substr(0, shader.find("\nstruct QinitDimensions"));
+    assert(wxdouble_create(initialization_shader.data(), initialization_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_vbx_initialize(context, nullptr, 1, 2, 0, 0, output, &metrics, error, sizeof(error)) == 0);
+    output[0] = 91.;
+    assert(wxdouble_vbx_qinit(context, one_hot, 1, 2, 7., output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
     wxdouble_destroy(context);
     std::string matrix_shader = shader.substr(0, shader.find("\nstruct ElementDimensions"));
     context = nullptr;

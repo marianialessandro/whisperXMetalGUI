@@ -18,6 +18,7 @@ struct ElboDimensions { uint32_t rows, columns, operation, column_order; uint64_
 static_assert(sizeof(ElboDimensions) == 32);
 struct TranscendentalDimensions { uint32_t count, operation; };
 struct LogSumExpDimensions { uint32_t rows, columns, sequential; };
+struct QinitDimensions { uint32_t rows, columns; uint64_t smoothing; };
 struct InitializationDimensions { uint32_t rows, columns, operation, sequential; };
 struct DoubleMetrics { uint32_t version, kernels; uint64_t wall_ns; double gpu_seconds; uint64_t allocated_bytes; };
 static_assert(sizeof(DoubleMetrics) == 32);
@@ -25,7 +26,7 @@ static_assert(sizeof(DoubleMetrics) == 32);
 class DoubleContext {
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
-    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_;
+    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
     void reserve(id<MTLBuffer> __strong& buffer, uint64_t bytes) {
@@ -68,6 +69,8 @@ public:
         id<MTLFunction> lse_terms_function = [library newFunctionWithName:@"double_vbx_lse_terms"], lse_final_function = [library newFunctionWithName:@"double_vbx_lse_final"];
         if (lse_terms_function != nil) lse_terms_pipeline_ = [device_ newComputePipelineStateWithFunction:lse_terms_function error:&error];
         if (lse_final_function != nil) lse_final_pipeline_ = [device_ newComputePipelineStateWithFunction:lse_final_function error:&error];
+        id<MTLFunction> qinit_function = [library newFunctionWithName:@"double_vbx_qinit_exp"];
+        if (qinit_function != nil) qinit_pipeline_ = [device_ newComputePipelineStateWithFunction:qinit_function error:&error];
         id<MTLFunction> initialization_function = [library newFunctionWithName:@"double_vbx_initialize"];
         if (initialization_function != nil) initialization_pipeline_ = [device_ newComputePipelineStateWithFunction:initialization_function error:&error];
         queue_ = [device_ newCommandQueue]; require(queue_ != nil, "double_queue_creation_failed");
@@ -330,6 +333,38 @@ public:
         return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
+    DoubleMetrics qinit_vbx(const double* input, uint32_t rows, uint32_t columns, double smoothing, double* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(qinit_pipeline_ != nil && initialization_pipeline_ != nil, "double_vbx_qinit_kernel_unavailable");
+        uint64_t count = uint64_t(rows) * columns, bytes = count * sizeof(double);
+        require(rows > 0 && rows <= 4096 && columns > 0 && columns <= 1024 && count <= 65536 && input != nullptr && output != nullptr, "double_vbx_qinit_shape_or_pointer_invalid");
+        require(std::isfinite(smoothing) && smoothing >= 0 && smoothing <= 60 && (smoothing == 0 || smoothing >= 0x1p-200), "double_vbx_qinit_smoothing_domain_invalid");
+        for (uint32_t row = 0; row < rows; ++row) {
+            uint32_t ones = 0;
+            for (uint32_t column = 0; column < columns; ++column) {
+                double value = input[uint64_t(row) * columns + column];
+                require(value == 0. || value == 1., "double_vbx_qinit_one_hot_required");
+                ones += value == 1.;
+            }
+            require(ones == 1, "double_vbx_qinit_one_hot_required");
+        }
+        auto started = std::chrono::steady_clock::now();
+        reserve(input_, bytes); reserve(output_, bytes); std::memcpy(input_.contents, input, bytes);
+        QinitDimensions d = {rows, columns, 0}; std::memcpy(&d.smoothing, &smoothing, sizeof(double));
+        InitializationDimensions normalization = {rows, columns, 1, 0};
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental VBx initial softmax";
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:qinit_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:output_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, qinit_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:initialization_pipeline_]; [encoder setBuffer:output_ offset:0 atIndex:0]; [encoder setBytes:&normalization length:sizeof(normalization) atIndex:1]; [encoder setBuffer:input_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, initialization_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        std::memcpy(output, input_.contents, bytes);
+        return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
     DoubleMetrics initialize_vbx(const double* input, InitializationDimensions d, double* output) {
         std::lock_guard<std::mutex> guard(mutex_);
         require(initialization_pipeline_ != nil, "double_vbx_initialization_kernel_unavailable");
@@ -451,6 +486,13 @@ extern "C" int wxdouble_vbx_initialize(void* context, const double* input, uint3
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->initialize_vbx(input, {rows, columns, operation, sequential}, output); return 0; }
         catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_vbx_initialization_failed"); return 1; }
+    }
+}
+extern "C" int wxdouble_vbx_qinit(void* context, const double* input, uint32_t rows, uint32_t columns, double smoothing, double* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->qinit_vbx(input, rows, columns, smoothing, output); return 0; }
+        catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_vbx_qinit_failed"); return 1; }
     }
 }
 extern "C" void wxdouble_destroy(void* context) { @autoreleasepool { delete static_cast<DoubleContext*>(context); } }
