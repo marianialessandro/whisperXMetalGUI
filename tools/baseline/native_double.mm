@@ -18,6 +18,7 @@ struct ElboDimensions { uint32_t rows, columns, operation, column_order; uint64_
 static_assert(sizeof(ElboDimensions) == 32);
 struct TranscendentalDimensions { uint32_t count, operation; };
 struct LogSumExpDimensions { uint32_t rows, columns, sequential; };
+struct OneHotDimensions { uint32_t rows, columns; };
 struct CentroidDimensions { uint32_t speakers, frames, features, sequential; };
 struct QinitDimensions { uint32_t rows, columns; uint64_t smoothing; };
 struct InitializationDimensions { uint32_t rows, columns, operation, sequential; };
@@ -27,7 +28,7 @@ static_assert(sizeof(DoubleMetrics) == 32);
 class DoubleContext {
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
-    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_;
+    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
     void reserve(id<MTLBuffer> __strong& buffer, uint64_t bytes) {
@@ -70,6 +71,8 @@ public:
         id<MTLFunction> lse_terms_function = [library newFunctionWithName:@"double_vbx_lse_terms"], lse_final_function = [library newFunctionWithName:@"double_vbx_lse_final"];
         if (lse_terms_function != nil) lse_terms_pipeline_ = [device_ newComputePipelineStateWithFunction:lse_terms_function error:&error];
         if (lse_final_function != nil) lse_final_pipeline_ = [device_ newComputePipelineStateWithFunction:lse_final_function error:&error];
+        id<MTLFunction> one_hot_function = [library newFunctionWithName:@"double_vbx_one_hot"];
+        if (one_hot_function != nil) one_hot_pipeline_ = [device_ newComputePipelineStateWithFunction:one_hot_function error:&error];
         id<MTLFunction> centroid_function = [library newFunctionWithName:@"double_vbx_centroids"];
         if (centroid_function != nil) centroid_pipeline_ = [device_ newComputePipelineStateWithFunction:centroid_function error:&error];
         id<MTLFunction> qinit_function = [library newFunctionWithName:@"double_vbx_qinit_exp"];
@@ -336,6 +339,24 @@ public:
         return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
+    DoubleMetrics one_hot_vbx(const int64_t* labels, OneHotDimensions d, double* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(one_hot_pipeline_ != nil, "double_vbx_one_hot_kernel_unavailable");
+        require(d.rows > 0 && d.rows <= 4096 && d.columns > 0 && d.columns <= 1024 && labels != nullptr && output != nullptr, "double_vbx_one_hot_shape_or_pointer_invalid");
+        for (uint32_t row = 0; row < d.rows; ++row) require(labels[row] >= 0 && labels[row] < d.columns, "double_vbx_one_hot_label_invalid");
+        auto started = std::chrono::steady_clock::now();
+        uint64_t label_bytes = uint64_t(d.rows) * sizeof(int64_t), count = uint64_t(d.rows) * d.columns, bytes = count * sizeof(double);
+        reserve(input_, label_bytes); reserve(output_, bytes); std::memcpy(input_.contents, labels, label_bytes);
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental VBx one-hot initialization";
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:one_hot_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:output_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, one_hot_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        std::memcpy(output, output_.contents, bytes);
+        return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
     DoubleMetrics centroids_vbx(const double* weights, const double* features, CentroidDimensions d, double* output) {
         std::lock_guard<std::mutex> guard(mutex_);
         require(centroid_pipeline_ != nil, "double_vbx_centroid_kernel_unavailable");
@@ -532,6 +553,13 @@ extern "C" int wxdouble_vbx_centroids(void* context, const double* weights, cons
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->centroids_vbx(weights, features, {speakers, frames, dimensions, sequential}, output); return 0; }
         catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_vbx_centroid_failed"); return 1; }
+    }
+}
+extern "C" int wxdouble_vbx_one_hot(void* context, const int64_t* labels, uint32_t rows, uint32_t columns, double* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->one_hot_vbx(labels, {rows, columns}, output); return 0; }
+        catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_vbx_one_hot_failed"); return 1; }
     }
 }
 extern "C" void wxdouble_destroy(void* context) { @autoreleasepool { delete static_cast<DoubleContext*>(context); } }

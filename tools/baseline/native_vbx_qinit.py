@@ -18,7 +18,7 @@ _HOOK_LOCK = threading.RLock()
 _ACTIVE = False
 
 
-def compile_native_cluster(original, initialize, run_vbx):
+def compile_native_cluster(original, initialize, run_vbx, one_hot=None):
     source = textwrap.dedent(inspect.getsource(original))
     if hashlib.sha256(source.encode()).hexdigest() != CLUSTER_SHA256 or original.__closure__ or inspect.unwrap(original) is not original:
         raise ValueError("vbx_qinit_source_not_supported")
@@ -27,20 +27,35 @@ def compile_native_cluster(original, initialize, run_vbx):
         raise ValueError("vbx_qinit_function_contract_changed")
     expected = ast.dump(ast.parse("softmax(qinit * init_smoothing, axis=1)").body[0].value)
     counts = []
+    one_hot_expressions = {ast.dump(ast.parse(expression).body[0]): label for expression, label in [("qinit = np.zeros((len(ahc_init), ahc_init.max() + 1))", "allocate"), ("qinit[range(len(ahc_init)), ahc_init.astype(int)] = 1.0", "scatter")]}
+    one_hot_counts = {"allocate": 0, "scatter": 0}
 
     class Substitute(ast.NodeTransformer):
+        def visit_Assign(self, node):
+            label = one_hot_expressions.get(ast.dump(node)) if one_hot is not None else None
+            if label is None:
+                return self.generic_visit(node)
+            one_hot_counts[label] += 1
+            if label == "scatter":
+                return None
+            node.value = ast.Call(func=ast.Name(id="__wx_vbx_one_hot", ctx=ast.Load()), args=[ast.Name(id="ahc_init", ctx=ast.Load())], keywords=[])
+            return node
+
         def visit_Call(self, node):
-            if ast.dump(node) != expected:
+            if initialize is None or ast.dump(node) != expected:
                 return self.generic_visit(node)
             counts.append(1)
             return ast.copy_location(ast.Call(func=ast.Name(id="__wx_vbx_qinit", ctx=ast.Load()), args=[ast.Name(id=name, ctx=ast.Load()) for name in ("qinit", "init_smoothing")], keywords=[]), node)
 
     tree = Substitute().visit(tree)
-    if len(counts) != 1:
+    if one_hot is not None and any(count != 1 for count in one_hot_counts.values()):
+        raise ValueError("vbx_one_hot_expression_contract_changed")
+    if initialize is not None and len(counts) != 1:
         raise ValueError("vbx_qinit_expression_contract_changed")
     ast.fix_missing_locations(tree)
     namespace = dict(original.__globals__)
     namespace["__wx_vbx_qinit"] = initialize
+    namespace["__wx_vbx_one_hot"] = one_hot
     namespace["VBx"] = run_vbx
     exec(compile(tree, "<WhisperX scoped native cluster initial softmax>", "exec"), namespace)
     candidate = namespace[tree.body[0].name]
@@ -49,7 +64,7 @@ def compile_native_cluster(original, initialize, run_vbx):
     return candidate
 
 
-def initial_softmax(context, records, values, smoothing):
+def initial_softmax(context, records, values, smoothing, one_hot=False):
     if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim != 2 or not values.flags.c_contiguous:
         raise ValueError("vbx_qinit_operand_format_not_supported")
     if not 0 < values.shape[0] <= 4096 or not 0 < values.shape[1] <= 1024 or values.size > 65536:
@@ -57,13 +72,29 @@ def initial_softmax(context, records, values, smoothing):
     staged = np.ascontiguousarray(values)
     output, record = context.qinit_softmax_vbx(staged, smoothing)
     record = dict(record)
-    record.update({"adapter_scope": "vbx_initial_cluster_softmax", "original_cluster_sha256": CLUSTER_SHA256, "scipy_softmax_sha256": SOFTMAX_SHA256, "host_input_staging_copy_bytes": 0 if staged is values else staged.nbytes, "host_output_layout_copy_bytes": 0 if output.flags.c_contiguous else output.nbytes, "cpu_residuals": ["ahc", "initial_one_hot_and_label_metadata", "host_staging_and_control"]})
+    record.update({"adapter_scope": "vbx_initial_cluster_softmax", "original_cluster_sha256": CLUSTER_SHA256, "scipy_softmax_sha256": SOFTMAX_SHA256, "host_input_staging_copy_bytes": 0 if staged is values else staged.nbytes, "host_output_layout_copy_bytes": 0 if output.flags.c_contiguous else output.nbytes, "cpu_residuals": ["ahc", "label_shape_metadata" if one_hot else "initial_one_hot_and_label_metadata", "host_staging_and_control"]})
+    records.append(record)
+    return output
+
+
+def initial_one_hot(context, records, labels):
+    if type(labels) is not np.ndarray or labels.ndim != 1 or labels.dtype not in (np.dtype(np.int32), np.dtype(np.int64)):
+        raise ValueError("vbx_one_hot_labels_format_not_supported")
+    if not 0 < labels.size <= 4096:
+        raise ValueError("vbx_one_hot_shape_not_supported")
+    columns = int(labels.max()) + 1
+    if not 0 < columns <= 1024:
+        raise ValueError("vbx_one_hot_shape_not_supported")
+    staged = np.ascontiguousarray(labels, dtype=np.int64)
+    output, record = context.one_hot_vbx(staged, columns)
+    record = dict(record)
+    record.update({"adapter_scope": "vbx_initial_one_hot", "original_cluster_sha256": CLUSTER_SHA256, "label_dtype_conversion": str(labels.dtype) != "int64", "host_label_staging_copy_bytes": 0 if staged is labels else staged.nbytes, "cpu_residuals": ["ahc", "label_shape_metadata", "host_staging_and_control"]})
     records.append(record)
     return output
 
 
 @contextlib.contextmanager
-def native_vbx_qinit(context, records):
+def native_vbx_qinit(context, records, one_hot=False, one_hot_records=None, softmax=True):
     global _ACTIVE
     import pyannote.audio.utils.vbx as vbx
     import pyannote.audio.pipelines.clustering as clustering
@@ -76,7 +107,13 @@ def native_vbx_qinit(context, records):
             raise ValueError("vbx_qinit_runtime_not_supported")
         if not isinstance(records, list):
             raise ValueError("vbx_qinit_records_required")
-        if getattr(context.library, "wxdouble_vbx_qinit", None) is None:
+        if type(one_hot) is not bool or type(softmax) is not bool or (one_hot and not isinstance(one_hot_records, list)):
+            raise ValueError("vbx_one_hot_records_required")
+        if not one_hot and not softmax:
+            raise ValueError("vbx_qinit_stage_required")
+        if one_hot and getattr(context.library, "wxdouble_vbx_one_hot", None) is None:
+            raise ValueError("double_vbx_one_hot_abi_unavailable")
+        if softmax and getattr(context.library, "wxdouble_vbx_qinit", None) is None:
             raise ValueError("double_vbx_qinit_abi_unavailable")
         original = vbx.cluster_vbx
         if clustering.cluster_vbx is not original or vbx.softmax is not special.softmax or hashlib.sha256(textwrap.dedent(inspect.getsource(special.softmax)).encode()).hexdigest() != SOFTMAX_SHA256:
@@ -84,12 +121,15 @@ def native_vbx_qinit(context, records):
         owner_thread = threading.get_ident()
 
         def initialize(values, smoothing):
-            return initial_softmax(context, records, values, smoothing)
+            return initial_softmax(context, records, values, smoothing, one_hot)
 
         def run_vbx(*args, **kwargs):
             return vbx.VBx(*args, **kwargs)
 
-        candidate = compile_native_cluster(original, initialize, run_vbx)
+        def construct(labels):
+            return initial_one_hot(context, one_hot_records, labels)
+
+        candidate = compile_native_cluster(original, initialize if softmax else None, run_vbx, construct if one_hot else None)
 
         @functools.wraps(original)
         def wrapped(*args, **kwargs):

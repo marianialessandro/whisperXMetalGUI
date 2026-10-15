@@ -19,7 +19,7 @@ import pyannote.audio.pipelines.clustering as clustering
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.baseline.native_double import NativeDoubleNormalization, build_library
 from tools.baseline.native_vbx_matrix import native_vbx_matrix_products
-from tools.baseline.native_vbx_qinit import compile_native_cluster, initial_softmax, native_vbx_qinit
+from tools.baseline.native_vbx_qinit import compile_native_cluster, initial_softmax, initial_one_hot, native_vbx_qinit
 
 
 @unittest.skipUnless(platform.system() == "Darwin" and torch.backends.mps.is_available(), "Apple Metal required")
@@ -163,6 +163,72 @@ class NativeVBXQinitTests(unittest.TestCase):
             with patch.object(clustering, "cluster_vbx", object()), self.assertRaisesRegex(ValueError, "reference_not_supported"):
                 with native_vbx_qinit(context, []):
                     pass
+
+    def test_one_hot_adapter_exact_labels_dtypes_strides_and_shape_before_staging(self):
+        with self.context() as context:
+            for labels in (np.array([0, 3], dtype=np.int32), np.array([0, 3], dtype=np.int64), np.arange(8, dtype=np.int64)[::2]):
+                records = []
+                actual = initial_one_hot(context, records, labels)
+                expected = np.zeros((len(labels), int(labels.max()) + 1))
+                expected[np.arange(len(labels)), labels] = 1.
+                np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]["label_dtype_conversion"], labels.dtype == np.int32)
+            for labels in (np.array([], dtype=np.int64), np.zeros(4097, dtype=np.int64), np.array([1024], dtype=np.int64)):
+                with patch("tools.baseline.native_vbx_qinit.np.ascontiguousarray", side_effect=AssertionError("staging before validation")), self.assertRaisesRegex(ValueError, "shape_not_supported"):
+                    initial_one_hot(context, [], labels)
+            for labels in (np.ones(2), np.ones((2, 1), dtype=np.int64), np.ones(2, dtype=bool)):
+                with self.assertRaisesRegex(ValueError, "format_not_supported"):
+                    initial_one_hot(context, [], labels)
+
+    def test_one_hot_complete_cluster_composes_with_softmax_and_negative_bypass(self):
+        rng = np.random.default_rng(991)
+        features, phi, labels = rng.normal(scale=.3, size=(19, 8)), rng.uniform(.4, 2., 8), np.arange(19) % 3
+        with self.context() as context:
+            for native_softmax in (False, True):
+                for smoothing in (-1., 0., 7.):
+                    for iterations in (0, 3):
+                        if native_softmax:
+                            with native_vbx_qinit(context, []):
+                                expected = vbx.cluster_vbx(labels, features, phi, .07, .8, maxIters=iterations, init_smoothing=smoothing)
+                        else:
+                            expected = vbx.cluster_vbx(labels, features, phi, .07, .8, maxIters=iterations, init_smoothing=smoothing)
+                        records, softmax_records = [], []
+                        with native_vbx_qinit(context, softmax_records, one_hot=True, one_hot_records=records, softmax=native_softmax):
+                            actual = clustering.cluster_vbx(labels, features, phi, .07, .8, maxIters=iterations, init_smoothing=smoothing)
+                        for left, right in zip(expected, actual):
+                            np.testing.assert_array_equal(left.view(np.uint64), right.view(np.uint64))
+                        self.assertEqual(len(records), 1)
+                        self.assertEqual(len(softmax_records), int(native_softmax and smoothing >= 0))
+
+    def test_one_hot_scope_capability_fault_and_thread_isolation(self):
+        original = vbx.cluster_vbx
+        with self.context() as context:
+            with self.assertRaisesRegex(ValueError, "one_hot_records_required"):
+                with native_vbx_qinit(context, [], one_hot=True):
+                    pass
+            with patch.object(context, "library", SimpleNamespace(wxdouble_vbx_qinit=object())), self.assertRaisesRegex(ValueError, "one_hot_abi_unavailable"):
+                with native_vbx_qinit(context, [], one_hot=True, one_hot_records=[]):
+                    pass
+            with self.assertRaisesRegex(ValueError, "stage_required"):
+                with native_vbx_qinit(context, [], softmax=False):
+                    pass
+            with native_vbx_qinit(context, [], one_hot=True, one_hot_records=(records := []), softmax=False):
+                with patch.object(vbx, "VBx", return_value=(None, None, None, None, None)), ThreadPoolExecutor(max_workers=1) as executor:
+                    executor.submit(vbx.cluster_vbx, np.array([0, 2]), None, None, 1., 1.).result()
+                self.assertEqual(records, [])
+            with self.assertRaisesRegex(ValueError, "injected_one_hot_failure"):
+                with native_vbx_qinit(context, [], one_hot=True, one_hot_records=(records := [])), patch.object(context, "one_hot_vbx", side_effect=ValueError("injected_one_hot_failure")):
+                    vbx.cluster_vbx(np.array([0, 2]), None, None, 1., 1.)
+            self.assertEqual(records, [])
+        self.assertIs(vbx.cluster_vbx, original)
+        self.assertIs(clustering.cluster_vbx, original)
+
+    def test_one_hot_ast_pin_rejects_changed_scatter(self):
+        source = textwrap.dedent(inspect.getsource(vbx.cluster_vbx))
+        changed = source.replace("ahc_init.astype(int)", "ahc_init.astype(np.int64)")
+        with patch("tools.baseline.native_vbx_qinit.inspect.getsource", return_value=changed), patch("tools.baseline.native_vbx_qinit.CLUSTER_SHA256", hashlib.sha256(changed.encode()).hexdigest()), self.assertRaisesRegex(ValueError, "one_hot_expression_contract_changed"):
+            compile_native_cluster(vbx.cluster_vbx, None, object(), one_hot=object())
 
     def test_source_and_expression_pins_and_runtime(self):
         source = textwrap.dedent(inspect.getsource(vbx.cluster_vbx))

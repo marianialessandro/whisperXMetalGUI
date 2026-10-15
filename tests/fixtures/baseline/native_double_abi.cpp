@@ -22,6 +22,7 @@ extern "C" int wxdouble_vbx_logsumexp(void*, const double*, uint32_t, uint32_t, 
 extern "C" int wxdouble_vbx_initialize(void*, const double*, uint32_t, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_qinit(void*, const double*, uint32_t, uint32_t, double, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_centroids(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_vbx_one_hot(void*, const int64_t*, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -255,6 +256,21 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_centroids(context, one_hot, input, 1, 2, 1, 2, output, &metrics, error, sizeof(error)) != 0);
     assert(wxdouble_vbx_centroids(context, zeros, input, 1, 2, 1, 0, output, &metrics, error, sizeof(error)) != 0);
     assert(output[0] == 91. && output[1] == 92.);
+    int64_t label[] = {1};
+    assert(wxdouble_vbx_one_hot(context, label, 1, 2, output, &metrics, error, sizeof(error)) == 0 && output[0] == 0. && output[1] == 1. && metrics.kernels == 1);
+    alignas(double) int64_t aliased_labels[] = {1, 0};
+    assert(wxdouble_vbx_one_hot(context, aliased_labels, 1, 2, reinterpret_cast<double*>(aliased_labels), &metrics, error, sizeof(error)) == 0);
+    output[0] = 91.; output[1] = 92.;
+    assert(wxdouble_vbx_one_hot(context, nullptr, 1, 2, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_one_hot(context, label, 1, 2, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_one_hot(context, label, 1, 2, output, nullptr, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_one_hot(context, label, 4097, 2, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_one_hot(context, label, 1, 1025, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_one_hot(context, label, 1, 0, output, &metrics, error, sizeof(error)) != 0);
+    int64_t negative_label[] = {-1}, high_label[] = {2};
+    assert(wxdouble_vbx_one_hot(context, negative_label, 1, 2, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_one_hot(context, high_label, 1, 2, output, &metrics, error, sizeof(error)) != 0);
+    assert(output[0] == 91. && output[1] == 92.);
     wxdouble_destroy(context);
     wxdouble_destroy(nullptr);
     std::string legacy_shader = shader.substr(0, shader.find("\nstruct MatrixDimensions"));
@@ -325,6 +341,12 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_qinit(context, one_hot, 1, 2, 0., output, &metrics, error, sizeof(error)) == 0);
     output[0] = 91.;
     assert(wxdouble_vbx_centroids(context, one_hot, input, 1, 2, 1, 0, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
+    wxdouble_destroy(context);
+    std::string centroid_shader = shader.substr(0, shader.find("\nstruct OneHotDimensions"));
+    assert(wxdouble_create(centroid_shader.data(), centroid_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_vbx_centroids(context, one_hot, input, 1, 2, 1, 0, output, &metrics, error, sizeof(error)) == 0);
+    output[0] = 91.;
+    assert(wxdouble_vbx_one_hot(context, label, 1, 2, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
     wxdouble_destroy(context);
     std::string matrix_shader = shader.substr(0, shader.find("\nstruct ElementDimensions"));
     context = nullptr;

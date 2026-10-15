@@ -665,6 +665,42 @@ class NativeDoubleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "closed"):
             context.uniform_prior_vbx(3)
 
+    def test_one_hot_exact_numpy_bits_boundaries_and_readonly(self):
+        with self.context() as context:
+            for rows, columns in ((1, 1), (19, 3), (4096, 1), (1, 1024), (4096, 1024)):
+                labels = np.arange(rows, dtype=np.int64) % columns
+                labels.flags.writeable = False
+                actual, record = context.one_hot_vbx(labels, columns)
+                expected = np.zeros((rows, columns))
+                expected[np.arange(rows), labels] = 1.
+                np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+                self.assertGreater(record["computation_gpu_seconds"], 0)
+                self.assertEqual(record["logical_input_upload_bytes"], rows * 8)
+                self.assertEqual(record["logical_result_readback_bytes"], rows * columns * 8)
+                self.assertLessEqual(record["allocated_shared_buffer_bytes"], 72 * 1024 * 1024 + 40 * 1024)
+
+    def test_one_hot_domain_lifetime_capability_and_threads(self):
+        labels = np.array([0, 2], dtype=np.int64)
+        with self.context() as context:
+            for invalid in (np.array([-1, 0], dtype=np.int64), np.array([0, 3], dtype=np.int64)):
+                with self.assertRaisesRegex(ValueError, "label_invalid"):
+                    context.one_hot_vbx(invalid, 3)
+            for invalid in (labels.astype(np.int32), labels.astype(float), np.ones((2, 1), np.int64), np.arange(4, dtype=np.int64)[::2]):
+                with self.assertRaisesRegex(ValueError, "format_invalid"):
+                    context.one_hot_vbx(invalid, 3)
+            for columns in (0, 1025, True, 3., np.int64(3)):
+                with self.assertRaises(ValueError):
+                    context.one_hot_vbx(labels, columns)
+            with self.assertRaises(ValueError):
+                context.one_hot_vbx(np.zeros(4097, dtype=np.int64), 1)
+            with patch.object(context, "library", SimpleNamespace()), self.assertRaisesRegex(ValueError, "abi_unavailable"):
+                context.one_hot_vbx(labels, 3)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                for result in executor.map(lambda _: context.one_hot_vbx(labels, 3)[0], range(4)):
+                    np.testing.assert_array_equal(result, [[1., 0., 0.], [0., 0., 1.]])
+        with self.assertRaisesRegex(ValueError, "closed"):
+            context.one_hot_vbx(labels, 3)
+
     def test_native_abi_under_address_and_undefined_sanitizers(self):
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory:

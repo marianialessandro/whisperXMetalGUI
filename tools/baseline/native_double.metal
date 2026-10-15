@@ -474,3 +474,10 @@ kernel void double_vbx_centroids(device const ulong* weights [[buffer(0)]], cons
     ulong mass = double_sum(weights + speaker * d.frames, d.frames, d.sequential, false);
     output[index] = divide_positive_binary64(sum & (sign - 1), mass) | (sum & sign);
 }
+
+struct OneHotDimensions { uint rows, columns; };
+
+// Integer cluster labels generate an exact binary64 one-hot matrix without a host matrix fill or scatter.
+kernel void double_vbx_one_hot(device const long* labels [[buffer(0)]], constant OneHotDimensions& d [[buffer(1)]], device ulong* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    if (index < d.rows * d.columns) output[index] = labels[index / d.columns] == long(index % d.columns) ? 0x3ff0000000000000ul : 0;
+}
