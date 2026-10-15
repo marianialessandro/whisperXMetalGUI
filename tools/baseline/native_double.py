@@ -345,7 +345,7 @@ class NativeDoubleNormalization:
 
 
     def transcendental_vbx(self, values, operation):
-        if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim not in (1, 2) or not values.flags.c_contiguous or not 0 < values.size <= 65536 or operation not in ("log", "exp"):
+        if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim not in (1, 2) or not values.flags.c_contiguous or not 0 < values.size <= 65536 or operation not in ("log", "exp", "log1p"):
             raise ValueError("double_vbx_transcendental_input_format_invalid")
         output, metrics, error = np.empty_like(values), Metrics(), ct.create_string_buffer(128)
         with self.lock:
@@ -358,11 +358,37 @@ class NativeDoubleNormalization:
             native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
             native.restype = ct.c_int
             started = time.perf_counter_ns()
-            if native(self.context, values.ctypes.data, values.size, int(operation == "exp"), output.ctypes.data, ct.byref(metrics), error, len(error)):
+            if native(self.context, values.ctypes.data, values.size, {"log": 0, "exp": 1, "log1p": 2}[operation], output.ctypes.data, ct.byref(metrics), error, len(error)):
                 raise ValueError(error.value.decode("ascii"))
         if metrics.version != 1 or metrics.kernels != 1 or not np.isfinite(output).all():
             raise ValueError("double_vbx_transcendental_native_result_invalid")
-        return output, {"scope": "experimental_native_binary64_log_exp", "operation": operation, "count": values.size, "arithmetic": "bounded_binary64_integer_emulation", "approximation_policy": "openlibm_fdlibm_separately_rounded", "numpy_bitwise_certified": False, "gpu_kernels": ["double_vbx_transcendental"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+        return output, {"scope": "experimental_native_binary64_log_exp", "operation": operation, "count": values.size, "arithmetic": "bounded_binary64_integer_emulation", "approximation_policy": "openlibm_fdlibm_separately_rounded", "numpy_bitwise_certified": False, "gpu_kernels": ["double_vbx_log1p" if operation == "log1p" else "double_vbx_transcendental"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
+
+    def logsumexp_vbx(self, values, reduction_order="pairwise"):
+        if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim != 2 or not values.flags.c_contiguous:
+            raise ValueError("double_vbx_logsumexp_input_format_invalid")
+        rows, columns = values.shape
+        if not 0 < rows <= 4096 or not 0 < columns <= 1024 or values.size > 65536 or reduction_order not in ("pairwise", "sequential"):
+            raise ValueError("double_vbx_logsumexp_shape_or_reduction_invalid")
+        if np.__version__ != "2.2.6" or np.getbufsize() != 8192:
+            raise ValueError("double_vbx_logsumexp_runtime_not_supported")
+        output, metrics, error = np.empty(rows), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_vbx_logsumexp
+            except AttributeError as failure:
+                raise ValueError("double_vbx_logsumexp_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, values.ctypes.data, rows, columns, int(reduction_order == "sequential"), output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 2 or not np.isfinite(output).all():
+            raise ValueError("double_vbx_logsumexp_native_result_invalid")
+        return output, {"scope": "experimental_native_binary64_finite_logsumexp", "rows": rows, "columns": columns, "reduction_order": reduction_order, "shift_domain": [-60, 0], "approximation_policy": "scipy_1_15_3_separated_maxima_openlibm_math", "scipy_bitwise_certified": False, "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": ["double_vbx_lse_terms", "double_vbx_lse_final"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
 
 def main():

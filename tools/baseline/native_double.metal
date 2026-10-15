@@ -362,3 +362,76 @@ struct TranscendentalDimensions { uint count, operation; };
 kernel void double_vbx_transcendental(device const ulong* input [[buffer(0)]], constant TranscendentalDimensions& d [[buffer(1)]], device ulong* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
     if (index < d.count) output[index] = d.operation == 0 ? bounded_binary64_log(input[index]) : bounded_binary64_exp(input[index]);
 }
+
+// The finite nonnegative log1p specialization follows OpenLibm s_log1p.c, developed at SunPro under the Sun notice above.
+ulong bounded_binary64_log1p(ulong value) {
+    ulong one = 0x3ff0000000000000ul, half_value = 0x3fe0000000000000ul, ln_hi = 0x3fe62e42fee00000ul, ln_lo = 0x3dea39ef35793c76ul;
+    uint hx = uint((value & ((1ul << 63) - 1)) >> 32), hu = 0;
+    int k = 1;
+    ulong f = 0, correction = 0;
+    if (hx < 0x3fda827au) {
+        if (hx < 0x3e200000u) return hx < 0x3c900000u ? value : df_sub(value, df_mul(df_mul(value, value), half_value));
+        k = 0; f = value; hu = 1;
+    }
+    if (k != 0) {
+        ulong u = matrix_add(one, value);
+        hu = uint(u >> 32); k = int(hu >> 20) - 1023;
+        correction = df_div(k > 0 ? df_sub(one, df_sub(u, value)) : df_sub(value, df_sub(u, one)), u);
+        hu &= 0x000fffffu;
+        if (hu < 0x6a09eu) u = (ulong(hu | 0x3ff00000u) << 32) | uint(u);
+        else { ++k; u = (ulong(hu | 0x3fe00000u) << 32) | uint(u); hu = (0x00100000u - hu) >> 2; }
+        f = df_sub(u, one);
+    }
+    ulong square_half = df_mul(df_mul(half_value, f), f), dk = df_integer(k);
+    if (hu == 0) {
+        if ((f & ((1ul << 63) - 1)) == 0) return k == 0 ? 0 : matrix_add(df_mul(dk, ln_hi), matrix_add(correction, df_mul(dk, ln_lo)));
+        ulong reduced = df_mul(square_half, df_sub(one, df_mul(0x3fe5555555555555ul, f)));
+        return k == 0 ? df_sub(f, reduced) : df_sub(df_mul(dk, ln_hi), df_sub(df_sub(reduced, matrix_add(df_mul(dk, ln_lo), correction)), f));
+    }
+    ulong ratio = df_div(f, matrix_add(0x4000000000000000ul, f)), z = df_mul(ratio, ratio);
+    ulong coefficients[7] = {0x3fe5555555555593ul, 0x3fd999999997fa04ul, 0x3fd2492494229359ul, 0x3fcc71c51d8e78aful, 0x3fc7466496cb03deul, 0x3fc39a09d078c69ful, 0x3fc2f112df3e5244ul};
+    ulong polynomial = coefficients[6];
+    for (int i = 5; i >= 0; --i) polynomial = matrix_add(coefficients[i], df_mul(z, polynomial));
+    ulong reduced = df_mul(ratio, matrix_add(square_half, df_mul(z, polynomial)));
+    return k == 0 ? df_sub(f, df_sub(square_half, reduced)) : df_sub(df_mul(dk, ln_hi), df_sub(df_sub(square_half, matrix_add(reduced, matrix_add(df_mul(dk, ln_lo), correction))), f));
+}
+
+kernel void double_vbx_log1p(device const ulong* input [[buffer(0)]], constant TranscendentalDimensions& d [[buffer(1)]], device ulong* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    if (index < d.count) output[index] = bounded_binary64_log1p(input[index]);
+}
+
+struct LogSumExpDimensions { uint rows, columns, sequential; };
+
+bool binary64_equal(ulong a, ulong b) { return a == b || (((a | b) & ((1ul << 63) - 1)) == 0); }
+bool binary64_greater_equal(ulong a, ulong b) {
+    ulong sign = 1ul << 63;
+    if (binary64_equal(a, b)) return true;
+    if ((a ^ b) & sign) return (a & sign) == 0;
+    return (a & sign) ? a <= b : a >= b;
+}
+
+// All repeated maxima are separated before exponentiation, as in the pinned finite unweighted SciPy path.
+kernel void double_vbx_lse_terms(device const ulong* input [[buffer(0)]], constant LogSumExpDimensions& d [[buffer(1)]], device ulong* exponentials [[buffer(2)]], device ulong* metadata [[buffer(3)]], uint row [[thread_position_in_grid]]) {
+    if (row >= d.rows) return;
+    uint start = row * d.columns, count = 0;
+    ulong maximum = input[start], invalid = 0;
+    for (uint column = 1; column < d.columns; ++column) if (binary64_greater_equal(input[start + column], maximum)) maximum = input[start + column];
+    for (uint column = 0; column < d.columns; ++column) {
+        ulong value = input[start + column];
+        if (binary64_equal(value, maximum)) { ++count; exponentials[start + column] = 0; }
+        else {
+            ulong delta = df_sub(value, maximum);
+            if ((delta & ((1ul << 63) - 1)) > 0x404e000000000000ul) { invalid = 1; exponentials[start + column] = 0; }
+            else exponentials[start + column] = bounded_binary64_exp(delta);
+        }
+    }
+    metadata[row * 3] = maximum; metadata[row * 3 + 1] = dimension_binary64(count); metadata[row * 3 + 2] = invalid;
+}
+
+kernel void double_vbx_lse_final(device const ulong* exponentials [[buffer(0)]], constant LogSumExpDimensions& d [[buffer(1)]], device const ulong* metadata [[buffer(2)]], device ulong* output [[buffer(3)]], uint row [[thread_position_in_grid]]) {
+    if (row >= d.rows) return;
+    if (metadata[row * 3 + 2]) { output[row] = 0x7ff8000000000000ul; return; }
+    ulong sum = double_sum(exponentials + row * d.columns, d.columns, d.sequential, false), mass = metadata[row * 3 + 1];
+    ulong scaled = divide_positive_binary64(sum, mass);
+    output[row] = matrix_add(matrix_add(bounded_binary64_log1p(scaled), bounded_binary64_log(mass)), metadata[row * 3]);
+}

@@ -553,6 +553,77 @@ class NativeDoubleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "closed"):
             context.transcendental_vbx(values, "log")
 
+    def test_vbx_log1p_bounded_accuracy_and_decimal_small_inputs(self):
+        from decimal import Decimal, localcontext
+        rng = np.random.default_rng(932)
+        values = np.concatenate((rng.uniform(0., 1024., 20000), np.ldexp(np.ones(201), np.arange(-200, 1)), np.array([0., -0., 1024., np.nextafter(.414213562373095, 1.)])))
+        with self.context() as context:
+            actual, _ = context.transcendental_vbx(values, "log1p")
+            expected = np.log1p(values)
+            a, b = actual.view(np.uint64), expected.view(np.uint64)
+            self.assertLessEqual(int(np.max(np.maximum(a, b) - np.minimum(a, b))), 1)
+            with localcontext() as precision:
+                precision.prec = 90
+                for index in np.linspace(0, values.size - 1, 90, dtype=int):
+                    reference = np.float64(float((Decimal(1) + Decimal.from_float(float(values[index]))).ln()))
+                    self.assertLessEqual(abs(int(actual[index].view(np.uint64)) - int(reference.view(np.uint64))), 1)
+            for invalid in (-1., np.nan, np.inf, 1025., 2. ** -201):
+                with self.assertRaisesRegex(ValueError, "domain_invalid"):
+                    context.transcendental_vbx(np.array([invalid]), "log1p")
+
+    def test_vbx_logsumexp_scipy_decimal_repeated_maxima_and_layouts(self):
+        from decimal import Decimal, localcontext
+        from scipy.special import logsumexp
+        rng = np.random.default_rng(933)
+        with self.context() as context:
+            for rows, columns in ((1, 1), (19, 3), (19, 7), (19, 8), (19, 127), (19, 128), (19, 129), (64, 1024), (4096, 1)):
+                values = rng.uniform(-20., 20., (rows, columns))
+                if columns >= 3:
+                    values[:, :2] = 20.
+                for order in ("C", "F"):
+                    source = np.array(values, order=order)
+                    actual, record = context.logsumexp_vbx(np.ascontiguousarray(source), "pairwise" if order == "C" else "sequential")
+                    np.testing.assert_allclose(actual, logsumexp(source, axis=-1), rtol=2e-15, atol=2e-14)
+                    self.assertFalse(record["scipy_bitwise_certified"])
+                    self.assertGreater(record["computation_gpu_seconds"], 0)
+            values = np.array([[0., -60., -60.], [0., 0., -60.], [20., 20., 20.], [-0., 0., -0.]])
+            actual, _ = context.logsumexp_vbx(values)
+            self.assertGreater(actual[0], 0.)
+            with localcontext() as precision:
+                precision.prec = 90
+                for row, result in zip(values, actual):
+                    total = sum((Decimal.from_float(float(value)).exp() for value in row), Decimal(0))
+                    reference = float(total.ln())
+                    self.assertLessEqual(abs(float(result) - reference), max(2e-14, abs(reference) * 2e-15))
+            for value in (2. ** 200, -(2. ** 200), 2. ** -200, -0.):
+                actual, _ = context.logsumexp_vbx(np.full((3, 1), value))
+                np.testing.assert_array_equal(actual.view(np.uint64), logsumexp(np.full((3, 1), value), axis=-1).view(np.uint64))
+
+    def test_vbx_logsumexp_domain_validation_lifetime_and_capability(self):
+        values = np.zeros((3, 8))
+        values.flags.writeable = False
+        with self.context() as context:
+            for invalid in (np.nan, np.inf, 2. ** 201, 2. ** -201):
+                with self.assertRaisesRegex(ValueError, "input_domain_invalid"):
+                    context.logsumexp_vbx(np.full_like(values, invalid))
+            with self.assertRaisesRegex(ValueError, "shift_domain_invalid"):
+                context.logsumexp_vbx(np.array([[1., 2.], [0., -61.]]))
+            for invalid in (values.astype(np.float32), values[:, ::2], np.ones((65, 1024)), np.ones((4097, 1))):
+                with self.assertRaises(ValueError):
+                    context.logsumexp_vbx(invalid)
+            with self.assertRaises(ValueError):
+                context.logsumexp_vbx(values, "invalid")
+            with patch.object(context, "library", SimpleNamespace()), self.assertRaisesRegex(ValueError, "abi_unavailable"):
+                context.logsumexp_vbx(values)
+            with patch("tools.baseline.native_double.np.getbufsize", return_value=4096), self.assertRaisesRegex(ValueError, "runtime_not_supported"):
+                context.logsumexp_vbx(values)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(context.logsumexp_vbx, values) for _ in range(4)]
+                for future in futures:
+                    np.testing.assert_allclose(future.result()[0], np.full(3, np.log(8)), rtol=2e-15)
+        with self.assertRaisesRegex(ValueError, "closed"):
+            context.logsumexp_vbx(values)
+
     def test_native_abi_under_address_and_undefined_sanitizers(self):
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory:

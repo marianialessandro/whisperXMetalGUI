@@ -16,7 +16,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.baseline.native_double import NativeDoubleNormalization, build_library
-from tools.baseline.native_vbx_matrix import compile_native_vbx, native_vbx_matrix_products, prior_update, elbo_arithmetic, transcendental_update
+from tools.baseline.native_vbx_matrix import compile_native_vbx, native_vbx_matrix_products, prior_update, elbo_arithmetic, transcendental_update, logsumexp_update
 
 
 @unittest.skipUnless(platform.system() == "Darwin" and torch.backends.mps.is_available(), "Apple Metal required")
@@ -472,6 +472,59 @@ class NativeVBXMatrixTests(unittest.TestCase):
             changed = textwrap.dedent(inspect.getsource(original)).replace("np.log(invL)", "np.log1p(invL - 1)")
             with patch("tools.baseline.native_vbx_matrix.inspect.getsource", return_value=changed), patch("tools.baseline.native_vbx_matrix.VBX_SHA256", hashlib.sha256(changed.encode()).hexdigest()), self.assertRaisesRegex(ValueError, "transcendental_expression_contract_changed"):
                 compile_native_vbx(original, object(), transcendental=object())
+
+    def test_native_logsumexp_full_results_all_flag_combinations(self):
+        features, phi, gamma = self.fixture()
+        with self.context() as context:
+            for mask in range(128):
+                options = {"precompute": bool(mask & 1), "precompute_records": [], "statistics": bool(mask & 2), "statistics_records": [], "scores": bool(mask & 4), "score_records": [], "prior": bool(mask & 8), "prior_records": [], "posterior": bool(mask & 16), "posterior_records": [], "elbo": bool(mask & 32), "elbo_records": [], "transcendentals": bool(mask & 64), "transcendental_records": []}
+                with native_vbx_matrix_products(context, [], [], **options):
+                    expected = vbx.VBx(features, phi, Fa=.07, Fb=.8, pi=3, gamma=gamma.copy(), maxIters=3, return_model=True)
+                records, calls = [], []
+                with native_vbx_matrix_products(context, [], calls, logsumexp=True, logsumexp_records=records, **options):
+                    actual = vbx.VBx(features, phi, Fa=.07, Fb=.8, pi=3, gamma=gamma.copy(), maxIters=3, return_model=True)
+                for left, right in zip(expected, actual):
+                    np.testing.assert_allclose(left, right, rtol=1e-12, atol=1e-10)
+                self.assertEqual(len(actual[2]), len(expected[2]))
+                np.testing.assert_array_equal(actual[0].argmax(axis=1), expected[0].argmax(axis=1))
+                self.assertEqual(calls[0]["native_logsumexp_calls"], len(actual[2]))
+                self.assertTrue(all(r["computation_gpu_seconds"] > 0 and not r["scipy_bitwise_certified"] for r in records))
+            values = np.asfortranarray(features)
+            records = []
+            actual = logsumexp_update(context, records, values, 0, 0)
+            np.testing.assert_allclose(actual, vbx.logsumexp(values, axis=-1), rtol=2e-15, atol=2e-14)
+            self.assertEqual(records[0]["reduction_order"], "sequential")
+            calls = []
+            with native_vbx_matrix_products(context, [], calls, logsumexp=True, logsumexp_records=[]):
+                vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=0)
+            self.assertEqual(calls[0]["native_logsumexp_calls"], 0)
+
+    def test_logsumexp_failure_source_runtime_and_capability_restore(self):
+        features, phi, gamma = self.fixture()
+        original = vbx.VBx
+        with self.context() as context:
+            with self.assertRaisesRegex(ValueError, "logsumexp_records_required"):
+                with native_vbx_matrix_products(context, [], [], logsumexp=True):
+                    pass
+            with patch.object(context, "library", SimpleNamespace(wxdouble_matmul=object())), self.assertRaisesRegex(ValueError, "logsumexp_abi_unavailable"):
+                with native_vbx_matrix_products(context, [], [], logsumexp=True, logsumexp_records=[]):
+                    pass
+            with patch("tools.baseline.native_vbx_matrix.LSE_SOURCE_SHA256", {"_logsumexp": "0" * 64}), self.assertRaisesRegex(ValueError, "logsumexp_source_not_supported"):
+                with native_vbx_matrix_products(context, [], [], logsumexp=True, logsumexp_records=[]):
+                    pass
+            with patch("tools.baseline.native_vbx_matrix.np.getbufsize", return_value=4096), self.assertRaisesRegex(ValueError, "logsumexp_runtime_not_supported"):
+                with native_vbx_matrix_products(context, [], [], logsumexp=True, logsumexp_records=[]):
+                    pass
+            calls, records = [], []
+            with self.assertRaisesRegex(ValueError, "injected_lse_failure"):
+                with native_vbx_matrix_products(context, [], calls, logsumexp=True, logsumexp_records=records), patch.object(context, "logsumexp_vbx", side_effect=ValueError("injected_lse_failure")):
+                    vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=1)
+            self.assertEqual(calls[0]["status"], "failed")
+            self.assertEqual(records, [])
+            self.assertIs(vbx.VBx, original)
+            changed = textwrap.dedent(inspect.getsource(original)).replace("logsumexp(log_p_ + lpi, axis=-1)", "logsumexp(log_p_ + lpi, axis=1)")
+            with patch("tools.baseline.native_vbx_matrix.inspect.getsource", return_value=changed), patch("tools.baseline.native_vbx_matrix.VBX_SHA256", hashlib.sha256(changed.encode()).hexdigest()), self.assertRaisesRegex(ValueError, "logsumexp_expression_contract_changed"):
+                compile_native_vbx(original, object(), logsumexp_callback=object())
 
     def test_unrelated_threads_and_multiple_calls_keep_separate_metadata(self):
         features, phi, gamma = self.fixture()
