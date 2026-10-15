@@ -14,13 +14,15 @@ struct StatisticsDimensions { uint32_t rows, columns, features, operation, seque
 static_assert(sizeof(StatisticsDimensions) == 40);
 struct ScoreDimensions { uint32_t rows, columns, operation, reserved; uint64_t fa; };
 static_assert(sizeof(ScoreDimensions) == 24);
+struct ElboDimensions { uint32_t rows, columns, operation, column_order; uint64_t fb, likelihood; };
+static_assert(sizeof(ElboDimensions) == 32);
 struct DoubleMetrics { uint32_t version, kernels; uint64_t wall_ns; double gpu_seconds; uint64_t allocated_bytes; };
 static_assert(sizeof(DoubleMetrics) == 32);
 
 class DoubleContext {
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
-    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_;
+    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
     void reserve(id<MTLBuffer> __strong& buffer, uint64_t bytes) {
@@ -52,6 +54,10 @@ public:
         if (prior_function != nil) prior_pipeline_ = [device_ newComputePipelineStateWithFunction:prior_function error:&error];
         id<MTLFunction> posterior_function = [library newFunctionWithName:@"double_vbx_posterior"];
         if (posterior_function != nil) posterior_pipeline_ = [device_ newComputePipelineStateWithFunction:posterior_function error:&error];
+        id<MTLFunction> likelihood_function = [library newFunctionWithName:@"double_vbx_likelihood"], elbo_terms_function = [library newFunctionWithName:@"double_vbx_elbo_terms"], elbo_final_function = [library newFunctionWithName:@"double_vbx_elbo_final"];
+        if (likelihood_function != nil) likelihood_pipeline_ = [device_ newComputePipelineStateWithFunction:likelihood_function error:&error];
+        if (elbo_terms_function != nil) elbo_terms_pipeline_ = [device_ newComputePipelineStateWithFunction:elbo_terms_function error:&error];
+        if (elbo_final_function != nil) elbo_final_pipeline_ = [device_ newComputePipelineStateWithFunction:elbo_final_function error:&error];
         queue_ = [device_ newCommandQueue]; require(queue_ != nil, "double_queue_creation_failed");
     }
     DoubleMetrics normalize(const double* input, DoubleDimensions d, double* output) {
@@ -241,6 +247,35 @@ public:
         return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
+    DoubleMetrics elbo_vbx(const double* input, ElboDimensions d, double fb, double likelihood, double* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(d.operation <= 1, "double_vbx_elbo_operation_invalid");
+        require(d.operation == 0 ? likelihood_pipeline_ != nil : elbo_terms_pipeline_ != nil && elbo_final_pipeline_ != nil, "double_vbx_elbo_kernels_unavailable");
+        require(d.operation == 0 ? d.rows == 1 && d.columns > 0 && d.columns <= 4096 && d.column_order == 0 : d.rows > 0 && d.rows <= 1024 && d.columns > 0 && d.columns <= 1024 && d.column_order <= 1, "double_vbx_elbo_shape_invalid");
+        require(input != nullptr && output != nullptr, "double_vbx_elbo_pointer_invalid");
+        require(std::isfinite(fb) && fb >= 0x1p-20 && fb <= 0x1p20 && std::isfinite(likelihood) && std::abs(likelihood) <= 0x1p450 && (likelihood == 0 || std::abs(likelihood) >= 0x1p-450), "double_vbx_elbo_scalar_domain_invalid");
+        std::memcpy(&d.fb, &fb, sizeof(fb)); std::memcpy(&d.likelihood, &likelihood, sizeof(likelihood));
+        uint64_t count = uint64_t(d.rows) * d.columns, input_count = count * (d.operation == 0 ? 1 : 3);
+        for (uint64_t i = 0; i < input_count; ++i) require(std::isfinite(input[i]) && std::abs(input[i]) <= 0x1p200 && (input[i] == 0 || std::abs(input[i]) >= 0x1p-200) && (d.operation == 0 || i < count || i >= 2 * count || input[i] > 0), "double_vbx_elbo_input_domain_invalid");
+        auto started = std::chrono::steady_clock::now();
+        reserve(input_, input_count * sizeof(double)); reserve(output_, count * sizeof(double)); reserve(terms_, sizeof(double));
+        std::memcpy(input_.contents, input, input_count * sizeof(double));
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental VBx ELBO arithmetic";
+        id<MTLComputePipelineState> pipeline = d.operation == 0 ? likelihood_pipeline_ : elbo_terms_pipeline_;
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:pipeline]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:d.operation == 0 ? terms_ : output_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(d.operation == 0 ? 1 : count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, pipeline.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        if (d.operation == 1) {
+            encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+            [encoder setComputePipelineState:elbo_final_pipeline_]; [encoder setBuffer:output_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:terms_ offset:0 atIndex:2];
+            [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)]; [encoder endEncoding];
+        }
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        std::memcpy(output, terms_.contents, sizeof(double));
+        return {1, d.operation == 0 ? 1u : 2u, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
 };
 static void double_error(char* output, uint32_t capacity, const char* code) { if (output != nullptr && capacity) { std::strncpy(output, code, capacity - 1); output[capacity - 1] = 0; } }
 extern "C" int wxdouble_create(const char* source, uint64_t size, void** output, char* error, uint32_t capacity) {
@@ -304,6 +339,13 @@ extern "C" int wxdouble_vbx_posterior(void* context, const double* input, const 
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->posterior_vbx(input, right, {rows, columns, operation, 0, 0}, output); return 0; }
         catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_vbx_posterior_failed"); return 1; }
+    }
+}
+extern "C" int wxdouble_vbx_elbo(void* context, const double* input, uint32_t rows, uint32_t columns, uint32_t operation, uint32_t column_order, double fb, double likelihood, double* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->elbo_vbx(input, {rows, columns, operation, column_order, 0, 0}, fb, likelihood, output); return 0; }
+        catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_vbx_elbo_failed"); return 1; }
     }
 }
 extern "C" void wxdouble_destroy(void* context) { @autoreleasepool { delete static_cast<DoubleContext*>(context); } }

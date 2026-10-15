@@ -16,6 +16,7 @@ extern "C" int wxdouble_vbx_statistics(void*, const double*, const double*, uint
 extern "C" int wxdouble_vbx_scores(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_prior(void*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_posterior(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_vbx_elbo(void*, const double*, uint32_t, uint32_t, uint32_t, uint32_t, double, double, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -154,6 +155,24 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_posterior(nullptr, input, mean, 1, 2, 0, output, &metrics, error, sizeof(error)) != 0);
     assert(wxdouble_vbx_posterior(context, input, mean, 1, 2, 0, output, nullptr, error, sizeof(error)) != 0);
     assert(output[0] == 91. && output[1] == 92.);
+    double elbo_packed[] = {0., 0., 1., 1., 0., 0.};
+    assert(wxdouble_vbx_elbo(context, input, 1, 2, 0, 0, 1., 0., output, &metrics, error, sizeof(error)) == 0 && output[0] == 7. && metrics.kernels == 1);
+    assert(wxdouble_vbx_elbo(context, elbo_packed, 1, 2, 1, 0, .8, -3., elbo_packed, &metrics, error, sizeof(error)) == 0 && elbo_packed[0] == -3. && metrics.kernels == 2);
+    elbo_packed[0] = 0.; output[0] = 91.;
+    assert(wxdouble_vbx_elbo(context, input, 1, 4097, 0, 0, 1., 0., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_elbo(context, elbo_packed, 1025, 2, 1, 0, .8, -3., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_elbo(context, elbo_packed, 1, 1025, 1, 0, .8, -3., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_elbo(context, elbo_packed, 1, 2, 1, 2, .8, -3., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_elbo(context, elbo_packed, 1, 2, 2, 0, .8, -3., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_elbo(context, elbo_packed, 1, 2, 1, 0, 0., -3., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_elbo(nullptr, input, 1, 2, 0, 0, 1., 0., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_elbo(context, nullptr, 1, 2, 0, 0, 1., 0., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_elbo(context, input, 1, 2, 0, 0, 1., 0., nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_elbo(context, input, 1, 2, 0, 0, 1., 0., output, nullptr, error, sizeof(error)) != 0);
+    elbo_packed[2] = 0.;
+    assert(wxdouble_vbx_elbo(context, elbo_packed, 1, 2, 1, 0, .8, -3., output, &metrics, error, sizeof(error)) != 0);
+    elbo_packed[2] = 1.;
+    assert(output[0] == 91.);
     wxdouble_destroy(context);
     wxdouble_destroy(nullptr);
     std::string legacy_shader = shader.substr(0, shader.find("\nstruct MatrixDimensions"));
@@ -187,6 +206,12 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_prior(context, prior_gamma, 2, 2, 1, output, &metrics, error, sizeof(error)) == 0);
     output[0] = 91.;
     assert(wxdouble_vbx_posterior(context, input, mean, 1, 2, 0, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
+    wxdouble_destroy(context);
+    std::string posterior_shader = shader.substr(0, shader.find("\n// Signed reductions reproduce"));
+    assert(wxdouble_create(posterior_shader.data(), posterior_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_vbx_posterior(context, input, mean, 1, 2, 0, output, &metrics, error, sizeof(error)) == 0);
+    output[0] = 91.;
+    assert(wxdouble_vbx_elbo(context, input, 1, 2, 0, 0, 1., 0., output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
     wxdouble_destroy(context);
     std::string matrix_shader = shader.substr(0, shader.find("\nstruct ElementDimensions"));
     context = nullptr;

@@ -304,6 +304,46 @@ class NativeDoubleNormalization:
         return output, {"scope": "experimental_native_binary64_vbx_posterior", "operation": operation, "rows": rows, "columns": columns, "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": ["double_vbx_posterior"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes + vector.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
 
+    def likelihood_sum_vbx(self, values):
+        if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim != 1 or not values.flags.c_contiguous or not 0 < values.size <= 4096:
+            raise ValueError("double_vbx_likelihood_input_invalid")
+        return self._elbo_vbx(values, 1, values.size, 0, False, 1., 0.)
+
+    def elbo_vbx(self, log_inv_l, inv_l, alpha, likelihood, fb, column_order=False):
+        for values in (log_inv_l, inv_l, alpha):
+            if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim != 2 or not values.flags.c_contiguous:
+                raise ValueError("double_vbx_elbo_input_format_invalid")
+        rows, columns = inv_l.shape
+        if not 0 < rows <= 1024 or not 0 < columns <= 1024 or log_inv_l.shape != inv_l.shape or alpha.shape != inv_l.shape or type(column_order) is not bool:
+            raise ValueError("double_vbx_elbo_shape_invalid")
+        if type(likelihood) not in (float, int, np.float64) or type(fb) not in (float, int, np.float64):
+            raise ValueError("double_vbx_elbo_scalar_format_invalid")
+        packed = np.concatenate((log_inv_l.ravel(), inv_l.ravel(), alpha.ravel()))
+        output, record = self._elbo_vbx(packed, rows, columns, 1, column_order, fb, likelihood)
+        record["host_matrix_packing_copy_bytes"] = packed.nbytes
+        return output, record
+
+    def _elbo_vbx(self, packed, rows, columns, mode, column_order, fb, likelihood):
+        if np.__version__ != "2.2.6" or np.getbufsize() != 8192:
+            raise ValueError("double_vbx_elbo_reduction_runtime_not_supported")
+        output, metrics, error = np.empty(1), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_vbx_elbo
+            except AttributeError as failure:
+                raise ValueError("double_vbx_elbo_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_double, ct.c_double, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, packed.ctypes.data, rows, columns, mode, int(column_order), fb, likelihood, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != (1 if mode == 0 else 2) or not np.isfinite(output).all():
+            raise ValueError("double_vbx_elbo_native_result_invalid")
+        return output[0], {"scope": "experimental_native_binary64_vbx_elbo", "operation": "likelihood_sum" if mode == 0 else "elbo", "rows": rows, "columns": columns, "reduction_layout": "F" if column_order else "C", "reduction_order": "buffered_pairwise", "numpy_reduce_buffer_elements": 8192, "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": ["double_vbx_likelihood"] if mode == 0 else ["double_vbx_elbo_terms", "double_vbx_elbo_final"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": packed.nbytes + 16, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build", type=Path, required=True, help="Compile a new local dylib at this path; existing paths are never overwritten.")

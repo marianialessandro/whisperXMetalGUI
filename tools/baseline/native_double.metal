@@ -213,3 +213,75 @@ kernel void double_vbx_posterior(device const ulong* input [[buffer(0)]], consta
     ulong value = right[d.operation == 0 ? index % d.columns : index / d.columns];
     output[index] = matrix_add(input[index], d.operation == 0 ? value : value ^ (1ul << 63));
 }
+
+// Signed reductions reproduce NumPy pairwise leaf order and the outer positive-zero accumulator.
+ulong signed_leaf(device const ulong* values, uint start, uint count) {
+    ulong result = 1ul << 63;
+    if (count < 8) {
+        for (uint i = 0; i < count; ++i) result = matrix_add(result, values[start + i]);
+        return result;
+    }
+    ulong sums[8];
+    for (uint lane = 0; lane < 8; ++lane) sums[lane] = values[start + lane];
+    uint i = 8;
+    for (; i < count - count % 8; i += 8) for (uint lane = 0; lane < 8; ++lane) sums[lane] = matrix_add(sums[lane], values[start + i + lane]);
+    result = matrix_add(matrix_add(matrix_add(sums[0], sums[1]), matrix_add(sums[2], sums[3])), matrix_add(matrix_add(sums[4], sums[5]), matrix_add(sums[6], sums[7])));
+    for (; i < count; ++i) result = matrix_add(result, values[start + i]);
+    return result;
+}
+
+ulong signed_sum(device const ulong* values, uint count, uint sequential) {
+    if (sequential) {
+        ulong result = 0;
+        for (uint i = 0; i < count; ++i) result = matrix_add(result, values[i]);
+        return result;
+    }
+    uint starts[16], lengths[16], states[16], depth = 0;
+    ulong left[16], result = 0;
+    starts[0] = 0; lengths[0] = count; states[0] = 0;
+    while (true) {
+        uint length = lengths[depth], start = starts[depth];
+        if (length <= 128) result = signed_leaf(values, start, length);
+        else {
+            uint split = (length / 2) & ~7u;
+            if (states[depth] == 0) { states[depth] = 1; ++depth; starts[depth] = start; lengths[depth] = split; states[depth] = 0; continue; }
+            if (states[depth] == 1) { left[depth] = result; states[depth] = 2; ++depth; starts[depth] = start + split; lengths[depth] = length - split; states[depth] = 0; continue; }
+            result = matrix_add(left[depth], result);
+        }
+        if (depth == 0) return matrix_add(0, result);
+        --depth;
+    }
+}
+
+
+// NumPy 2.2.6 reduces long contiguous vectors in buffered chunks of 8192 elements before the outer signed accumulation.
+ulong numpy_signed_sum(device const ulong* values, uint count) {
+    ulong total = 0;
+    for (uint start = 0; start < count; start += 8192) total = matrix_add(total, signed_sum(values + start, min(8192u, count - start), 0));
+    return total;
+}
+
+struct ElboDimensions { uint rows, columns, operation, column_order; ulong fb, likelihood; };
+
+kernel void double_vbx_likelihood(device const ulong* input [[buffer(0)]], constant ElboDimensions& d [[buffer(1)]], device ulong* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    if (index == 0) output[0] = numpy_signed_sum(input, d.columns);
+}
+
+// Each ELBO subtraction, square and final addition is separately rounded before reduction in physical C/F order.
+kernel void double_vbx_elbo_terms(device const ulong* input [[buffer(0)]], constant ElboDimensions& d [[buffer(1)]], device ulong* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    uint count = d.rows * d.columns;
+    if (index >= count) return;
+    ulong sign = 1ul << 63, alpha = input[2 * count + index] & (sign - 1);
+    ulong term = matrix_add(input[index], input[count + index] ^ sign);
+    term = matrix_add(term, multiply_positive_binary64(alpha, alpha) ^ sign);
+    uint destination = d.column_order ? (index % d.columns) * d.rows + index / d.columns : index;
+    output[destination] = matrix_add(term, 0x3ff0000000000000ul);
+}
+
+kernel void double_vbx_elbo_final(device const ulong* input [[buffer(0)]], constant ElboDimensions& d [[buffer(1)]], device ulong* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    if (index != 0) return;
+    ulong sign = 1ul << 63, sum = numpy_signed_sum(input, d.rows * d.columns);
+    ulong scale = multiply_positive_binary64(d.fb, 0x3fe0000000000000ul);
+    ulong penalty = multiply_positive_binary64(scale, sum & (sign - 1)) | (sum & sign);
+    output[0] = matrix_add(d.likelihood, penalty);
+}

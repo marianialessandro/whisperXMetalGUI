@@ -447,6 +447,64 @@ class NativeDoubleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "closed"):
             context.posterior_vbx(values, vector)
 
+    def test_vbx_signed_likelihood_and_elbo_bitwise_numpy_layouts(self):
+        rng = np.random.default_rng(928)
+        with self.context() as context:
+            for count in (1, 7, 8, 127, 128, 129, 1024, 4096):
+                values = rng.normal(size=count)
+                actual, record = context.likelihood_sum_vbx(values)
+                np.testing.assert_array_equal(actual.view(np.uint64), values.sum().view(np.uint64))
+                self.assertEqual(record["gpu_kernels"], ["double_vbx_likelihood"])
+                self.assertGreater(record["computation_gpu_seconds"], 0)
+            for values in (np.array([-0.]), np.full(129, -0.), np.array([2. ** 200, -(2. ** 200), 2. ** -200, -(2. ** -200)])):
+                actual, _ = context.likelihood_sum_vbx(values)
+                self.assertEqual(actual.view(np.uint64), values.sum().view(np.uint64))
+            for rows, columns in ((1, 1), (3, 8), (17, 129), (129, 17), (65, 129), (257, 129), (128, 128), (1024, 1024)):
+                inv_l, alpha = rng.uniform(.1, 1., (rows, columns)), rng.normal(size=(rows, columns))
+                for order in ("C", "F"):
+                    source, model = np.array(inv_l, order=order), np.array(alpha, order=order)
+                    log = np.log(source)
+                    expected = np.float64(-32.) + .8 * .5 * np.sum(log - source - model**2 + 1)
+                    actual, record = context.elbo_vbx(np.ascontiguousarray(log), np.ascontiguousarray(source), np.ascontiguousarray(model), np.float64(-32.), .8, order == "F")
+                    self.assertEqual(actual.view(np.uint64), expected.view(np.uint64))
+                    self.assertEqual(record["reduction_layout"], order)
+                    self.assertEqual(record["logical_result_readback_bytes"], 8)
+            inv_l = np.array([[2. ** -200, 1., 2. ** 200]])
+            alpha = np.array([[2. ** -200, -0., -(2. ** 200)]])
+            for fb in (2. ** -20, 2. ** 20):
+                actual, _ = context.elbo_vbx(np.log(inv_l), inv_l, alpha, 0., fb)
+                expected = np.float64(0.) + fb * .5 * np.sum(np.log(inv_l) - inv_l - alpha**2 + 1)
+                self.assertEqual(actual.view(np.uint64), expected.view(np.uint64))
+
+    def test_vbx_elbo_validation_lifetime_threads_and_capability(self):
+        inv_l, alpha = np.ones((3, 8)), np.zeros((3, 8))
+        log = np.log(inv_l)
+        log.flags.writeable = inv_l.flags.writeable = alpha.flags.writeable = False
+        with self.context() as context:
+            for invalid in (np.nan, np.inf, 2. ** 201, 2. ** -201):
+                with self.assertRaisesRegex(ValueError, "input_domain_invalid"):
+                    context.likelihood_sum_vbx(np.full(8, invalid))
+            for invalid in (np.zeros_like(inv_l), -inv_l):
+                with self.assertRaisesRegex(ValueError, "input_domain_invalid"):
+                    context.elbo_vbx(log, invalid, alpha, -1., .8)
+            for invalid in (0., -1., np.inf, 2. ** -21, 2. ** 21):
+                with self.assertRaisesRegex(ValueError, "scalar_domain_invalid"):
+                    context.elbo_vbx(log, inv_l, alpha, -1., invalid)
+            with self.assertRaises(ValueError):
+                context.elbo_vbx(log, inv_l, alpha[:, :-1], -1., .8)
+            with self.assertRaises(ValueError):
+                context.likelihood_sum_vbx(np.ones(4097))
+            with patch("tools.baseline.native_double.np.getbufsize", return_value=4096), self.assertRaisesRegex(ValueError, "runtime_not_supported"):
+                context.likelihood_sum_vbx(np.ones(8))
+            with patch.object(context, "library", SimpleNamespace()), self.assertRaisesRegex(ValueError, "abi_unavailable"):
+                context.likelihood_sum_vbx(np.ones(8))
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(context.elbo_vbx, log, inv_l, alpha, -1., .8) for _ in range(4)]
+                for future in futures:
+                    self.assertEqual(future.result()[0], -1.)
+        with self.assertRaisesRegex(ValueError, "closed"):
+            context.elbo_vbx(log, inv_l, alpha, -1., .8)
+
     def test_native_abi_under_address_and_undefined_sanitizers(self):
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory:

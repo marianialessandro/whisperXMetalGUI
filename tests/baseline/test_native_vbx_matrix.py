@@ -16,7 +16,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.baseline.native_double import NativeDoubleNormalization, build_library
-from tools.baseline.native_vbx_matrix import compile_native_vbx, native_vbx_matrix_products, prior_update
+from tools.baseline.native_vbx_matrix import compile_native_vbx, native_vbx_matrix_products, prior_update, elbo_arithmetic
 
 
 @unittest.skipUnless(platform.system() == "Darwin" and torch.backends.mps.is_available(), "Apple Metal required")
@@ -376,6 +376,54 @@ class NativeVBXMatrixTests(unittest.TestCase):
             changed = textwrap.dedent(inspect.getsource(original)).replace("log_p_ + lpi - log_p_x[:, None]", "log_p_ - log_p_x[:, None] + lpi")
             with patch("tools.baseline.native_vbx_matrix.inspect.getsource", return_value=changed), patch("tools.baseline.native_vbx_matrix.VBX_SHA256", hashlib.sha256(changed.encode()).hexdigest()), self.assertRaisesRegex(ValueError, "posterior_expression_contract_changed"):
                 compile_native_vbx(original, object(), posterior=object())
+
+    def test_native_elbo_complete_results_all_flags_and_fortran_model(self):
+        features, phi, gamma = self.fixture()
+        with self.context() as context:
+            for mask in range(32):
+                options = {"precompute": bool(mask & 1), "precompute_records": [], "statistics": bool(mask & 2), "statistics_records": [], "scores": bool(mask & 4), "score_records": [], "prior": bool(mask & 8), "prior_records": [], "posterior": bool(mask & 16), "posterior_records": []}
+                with native_vbx_matrix_products(context, [], [], **options):
+                    expected = vbx.VBx(features, phi, Fa=.07, Fb=.8, pi=3, gamma=gamma.copy(), maxIters=3, return_model=True)
+                records, calls = [], []
+                with native_vbx_matrix_products(context, [], calls, elbo=True, elbo_records=records, **options):
+                    actual = vbx.VBx(features, phi, Fa=.07, Fb=.8, pi=3, gamma=gamma.copy(), maxIters=3, return_model=True)
+                self.compare(expected, actual)
+                self.assertEqual(calls[0]["native_elbo_calls"], 2 * len(actual[2]))
+                self.assertEqual({r["operation"] for r in records}, {"likelihood_sum", "elbo"})
+            rng = np.random.default_rng(929)
+            for alpha_layout in ("C", "F"):
+                inv_l = np.asfortranarray(rng.uniform(.1, 1., (3, 8)))
+                alpha = np.array(rng.normal(size=(3, 8)), order=alpha_layout)
+                records = []
+                actual = elbo_arithmetic(context, records, np.log(inv_l), inv_l, alpha, np.float64(-2.), .8, 0, "elbo", 0)
+                expected = np.float64(-2.) + .8 * .5 * np.sum(np.log(inv_l) - inv_l - alpha**2 + 1)
+                self.assertEqual(actual.view(np.uint64), expected.view(np.uint64))
+                self.assertEqual(records[0]["reduction_layout"], alpha_layout)
+            calls = []
+            with native_vbx_matrix_products(context, [], calls, elbo=True, elbo_records=[]):
+                vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=0)
+            self.assertEqual(calls[0]["native_elbo_calls"], 0)
+
+    def test_elbo_failure_capability_and_source_contract_restore(self):
+        features, phi, gamma = self.fixture()
+        original = vbx.VBx
+        with self.context() as context:
+            with self.assertRaisesRegex(ValueError, "elbo_records_required"):
+                with native_vbx_matrix_products(context, [], [], elbo=True):
+                    pass
+            with patch.object(context, "library", SimpleNamespace(wxdouble_matmul=object())), self.assertRaisesRegex(ValueError, "elbo_abi_unavailable"):
+                with native_vbx_matrix_products(context, [], [], elbo=True, elbo_records=[]):
+                    pass
+            records, calls = [], []
+            with self.assertRaisesRegex(ValueError, "injected_elbo_failure"):
+                with native_vbx_matrix_products(context, [], calls, elbo=True, elbo_records=records), patch.object(context, "elbo_vbx", side_effect=ValueError("injected_elbo_failure")):
+                    vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=1)
+            self.assertEqual(calls[0]["status"], "failed")
+            self.assertEqual(calls[0]["native_elbo_calls"], 1)
+            self.assertIs(vbx.VBx, original)
+            changed = textwrap.dedent(inspect.getsource(original)).replace("Fb * 0.5 * np.sum", "(0.5 * Fb) * np.sum")
+            with patch("tools.baseline.native_vbx_matrix.inspect.getsource", return_value=changed), patch("tools.baseline.native_vbx_matrix.VBX_SHA256", hashlib.sha256(changed.encode()).hexdigest()), self.assertRaisesRegex(ValueError, "elbo_expression_contract_changed"):
+                compile_native_vbx(original, object(), elbo=object())
 
     def test_unrelated_threads_and_multiple_calls_keep_separate_metadata(self):
         features, phi, gamma = self.fixture()
