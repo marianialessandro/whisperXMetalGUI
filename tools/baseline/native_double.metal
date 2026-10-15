@@ -127,3 +127,18 @@ kernel void double_matmul(device const ulong* left [[buffer(0)]], constant Matri
     }
     output[index] = sum;
 }
+
+struct ElementDimensions { uint rows, columns, operation, scale_dimension; };
+
+ulong dimension_binary64(uint value) {
+    uint highest = 31u - clz(value);
+    return (ulong(highest + 1023) << 52) | ((ulong(value) << (52u - highest)) & ((1ul << 52) - 1));
+}
+
+// Centering and scaling keep separate binary64 rounding steps; scalar square root is computed from integer dimension metadata on the GPU.
+kernel void double_center_scale(device const ulong* input [[buffer(0)]], constant ElementDimensions& d [[buffer(1)]], device const ulong* mean [[buffer(2)]], device ulong* output [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index >= d.rows * d.columns) return;
+    ulong value = input[index], sign = 1ul << 63;
+    if (d.operation == 0) output[index] = matrix_add(value, mean[index % d.columns] ^ sign);
+    else output[index] = multiply_positive_binary64(value & (sign - 1), sqrt_positive_binary64(dimension_binary64(d.scale_dimension))) | (value & sign);
+}

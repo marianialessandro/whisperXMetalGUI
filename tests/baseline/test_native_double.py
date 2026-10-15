@@ -137,6 +137,61 @@ class NativeDoubleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "closed"):
             context.matmul(left, right)
 
+    def test_centering_and_dimension_scaling_are_bitwise_numpy(self):
+        rng = np.random.default_rng(811)
+        with self.context() as context:
+            values = rng.normal(size=(37, 257))
+            mean = rng.normal(size=257)
+            actual, record = context.center(values, mean)
+            np.testing.assert_array_equal(actual.view(np.uint64), (values - mean).view(np.uint64))
+            self.assertEqual(record["logical_input_upload_bytes"], values.nbytes + mean.nbytes)
+            self.assertGreater(record["computation_gpu_seconds"], 0)
+            for dimension in (1, 2, 3, 7, 16, 31, 128, 256, 1023, 1024):
+                actual, record = context.scale_dimension(values, dimension)
+                np.testing.assert_array_equal(actual.view(np.uint64), (np.sqrt(dimension) * values).view(np.uint64))
+                self.assertEqual(record["scale_dimension"], dimension)
+                self.assertGreater(record["computation_gpu_seconds"], 0)
+            wide = np.ldexp(rng.uniform(.5, 1., (41, 257)), rng.integers(-449, 450, (41, 257)))
+            offsets = np.ldexp(rng.uniform(.5, 1., 257), rng.integers(-449, 450, 257))
+            wide[:, ::2] *= -1
+            actual, _ = context.center(wide, offsets)
+            np.testing.assert_array_equal(actual.view(np.uint64), (wide - offsets).view(np.uint64))
+            zeros = np.array([[0., -0., 0., -0.], [1., -1., np.nextafter(1., 2.), np.nextafter(-1., -2.)]])
+            offsets = np.array([0., 0., -0., -0.])
+            actual, _ = context.center(zeros, offsets)
+            np.testing.assert_array_equal(actual.view(np.uint64), (zeros - offsets).view(np.uint64))
+            actual, _ = context.scale_dimension(zeros, 3)
+            np.testing.assert_array_equal(actual.view(np.uint64), (np.sqrt(3) * zeros).view(np.uint64))
+
+    def test_elementwise_validation_readonly_threads_close_and_missing_abi(self):
+        values, mean = np.ones((3, 8)), np.ones(8)
+        values.flags.writeable = mean.flags.writeable = False
+        with self.context() as context:
+            actual, _ = context.center(values, mean)
+            np.testing.assert_array_equal(actual, np.zeros_like(values))
+            for invalid in (0, 1025, True, np.int64(2), 2.):
+                with self.assertRaisesRegex(ValueError, "dimension_invalid"):
+                    context.scale_dimension(values, invalid)
+            for invalid in (np.ones(7), np.ones(8, dtype=np.float32), np.ones((1, 8)), np.ones(16)[::2]):
+                with self.assertRaises(ValueError):
+                    context.center(values, invalid)
+            for invalid in (np.ones((3, 8), dtype=np.float32), np.ones((3, 16))[:, ::2], np.ones((0, 8))):
+                with self.assertRaises(ValueError):
+                    context.center(invalid, mean)
+            for invalid in (np.nan, np.inf, 2. ** 451, 2. ** -451):
+                with self.assertRaisesRegex(ValueError, "domain_invalid"):
+                    context.center(np.full((3, 8), invalid), mean)
+                with self.assertRaisesRegex(ValueError, "domain_invalid"):
+                    context.center(values, np.full(8, invalid))
+            with patch.object(context, "library", SimpleNamespace()), self.assertRaisesRegex(ValueError, "abi_unavailable"):
+                context.center(values, mean)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(context.scale_dimension, values, 3) for _ in range(4)]
+                for future in futures:
+                    np.testing.assert_array_equal(future.result()[0], np.sqrt(3) * values)
+        with self.assertRaisesRegex(ValueError, "closed"):
+            context.center(values, mean)
+
     def test_native_abi_under_address_and_undefined_sanitizers(self):
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory:

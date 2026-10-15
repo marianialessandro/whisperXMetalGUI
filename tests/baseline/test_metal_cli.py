@@ -49,6 +49,14 @@ class MetalCLITests(unittest.TestCase):
             self.assertEqual(caught.exception.code, 2)
             self.assertFalse(report.exists())
 
+    def test_plda_center_scale_flag_requires_matrix_products(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "audio.wav", "--diarize", "--plda-centering-scaling"])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertFalse(report.exists())
+
     def test_experimental_scope_rejects_cpu_and_unsupported_language_before_original(self):
         calls = []
         def original(transcript, model, align_model_metadata, audio, device, interpolate_method="nearest"):

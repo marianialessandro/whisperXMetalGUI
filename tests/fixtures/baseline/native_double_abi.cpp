@@ -1,4 +1,5 @@
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <iterator>
@@ -9,6 +10,7 @@ struct DoubleMetrics { uint32_t version, kernels; uint64_t wall_ns; double gpu_s
 extern "C" int wxdouble_create(const char*, uint64_t, void**, char*, uint32_t);
 extern "C" int wxdouble_normalize(void*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_matmul(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_elementwise(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -49,6 +51,18 @@ int main(int argc, char** argv) {
     assert(wxdouble_matmul(context, input, nullptr, 1, 2, 1, output, &metrics, error, sizeof(error)) != 0);
     assert(wxdouble_matmul(context, input, right, 1, 2, 1, nullptr, &metrics, error, sizeof(error)) != 0);
     assert(output[0] == 91.);
+    double mean[] = {1., 2.};
+    assert(wxdouble_elementwise(context, input, mean, 1, 2, 0, 0, output, &metrics, error, sizeof(error)) == 0 && output[0] == 2. && output[1] == 2.);
+    assert(wxdouble_elementwise(context, input, nullptr, 1, 2, 1, 2, output, &metrics, error, sizeof(error)) == 0 && output[0] == 3. * std::sqrt(2.));
+    output[0] = 91.;
+    assert(wxdouble_elementwise(context, input, nullptr, 1, 2, 0, 0, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_elementwise(context, input, mean, 1, 2, 2, 0, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_elementwise(context, input, nullptr, 1, 2, 1, 0, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_elementwise(context, input, nullptr, 1, 2, 1, 1025, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_elementwise(context, input, mean, 1, 2, 1, 2, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_elementwise(context, nullptr, mean, 1, 2, 0, 0, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_elementwise(context, input, mean, 1, 1025, 0, 0, output, &metrics, error, sizeof(error)) != 0);
+    assert(output[0] == 91.);
     wxdouble_destroy(context);
     wxdouble_destroy(nullptr);
     std::string legacy_shader = shader.substr(0, shader.find("\nstruct MatrixDimensions"));
@@ -57,5 +71,13 @@ int main(int argc, char** argv) {
     assert(wxdouble_normalize(context, input, 1, 2, 0, output, &metrics, error, sizeof(error)) == 0 && output[0] == .6 && output[1] == .8);
     output[0] = 91.;
     assert(wxdouble_matmul(context, input, right, 1, 2, 1, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
+    assert(wxdouble_elementwise(context, input, nullptr, 1, 2, 1, 2, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
+    wxdouble_destroy(context);
+    std::string matrix_shader = shader.substr(0, shader.find("\nstruct ElementDimensions"));
+    context = nullptr;
+    assert(wxdouble_create(matrix_shader.data(), matrix_shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    assert(wxdouble_matmul(context, input, right, 1, 2, 1, output, &metrics, error, sizeof(error)) == 0 && output[0] == 2.);
+    output[0] = 91.;
+    assert(wxdouble_elementwise(context, input, nullptr, 1, 2, 1, 2, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
     wxdouble_destroy(context);
 }

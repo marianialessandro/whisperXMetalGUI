@@ -119,6 +119,39 @@ class NativeDoubleNormalization:
             raise ValueError("double_matrix_native_result_invalid")
         return output, {"scope": "experimental_native_binary64_matrix_product", "rows": rows, "inner": inner, "columns": columns, "accumulation_policy": "sequential_separately_rounded_binary64_multiply_add", "reference_blas_bitwise_certified": False, "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": ["double_matmul"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": left.nbytes + right.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
+    def center(self, values, mean):
+        if not isinstance(mean, np.ndarray) or mean.dtype != np.float64 or mean.ndim != 1 or not mean.flags.c_contiguous:
+            raise ValueError("double_element_mean_format_invalid")
+        return self._elementwise(values, mean, 0)
+
+    def scale_dimension(self, values, dimension):
+        if type(dimension) is not int or not 0 < dimension <= 1024:
+            raise ValueError("double_element_dimension_invalid")
+        return self._elementwise(values, None, dimension)
+
+    def _elementwise(self, values, mean, dimension):
+        if not isinstance(values, np.ndarray) or values.dtype != np.float64 or values.ndim != 2 or not values.flags.c_contiguous:
+            raise ValueError("double_element_input_format_invalid")
+        rows, columns = values.shape
+        if not 0 < rows <= 4096 or not 0 < columns <= 1024 or (mean is not None and mean.shape != (columns,)):
+            raise ValueError("double_element_shape_invalid")
+        output, metrics, error = np.empty_like(values), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                operation = self.library.wxdouble_elementwise
+            except AttributeError as failure:
+                raise ValueError("double_element_abi_unavailable") from failure
+            operation.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            operation.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if operation(self.context, values.ctypes.data, mean.ctypes.data if mean is not None else None, rows, columns, int(mean is None), dimension, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 1 or not np.isfinite(output).all():
+            raise ValueError("double_element_native_result_invalid")
+        return output, {"scope": "experimental_native_binary64_center_scale", "operation": "center" if mean is not None else "scale_sqrt_dimension", "rows": rows, "columns": columns, "scale_dimension": dimension, "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": ["double_center_scale"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes + (mean.nbytes if mean is not None else 0), "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

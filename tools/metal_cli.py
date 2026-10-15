@@ -60,6 +60,7 @@ def main(argv=None):
     parser.add_argument("--plda-normalization-library", type=Path, help="Optional native binary64 L2 normalization inside PLDA preprocessing; requires --diarize and its paired SHA256 flag. Matrix products remain original unless --plda-matrix-products is selected; model setup remains original.")
     parser.add_argument("--plda-normalization-library-sha256", help="Expected SHA256 of the binary64-normalization dylib; requires pyannote 4.0.4 and NumPy 2.2.6.")
     parser.add_argument("--plda-matrix-products", action="store_true", help="Additionally run LDA/PLDA products on Metal with sequential binary64 multiply/add; requires --plda-normalization-library with matrix ABI. This policy is not bitwise BLAS equivalence.")
+    parser.add_argument("--plda-centering-scaling", action="store_true", help="Additionally run all three PLDA centering and both dimension-scaling steps on Metal, including scalar square roots; requires --plda-matrix-products and elementwise ABI.")
     args, forwarded = parser.parse_known_args(argv)
     if not forwarded:
         parser.error("WhisperX audio paths and pipeline options are required.")
@@ -79,8 +80,10 @@ def main(argv=None):
         parser.error("--plda-normalization-library requires --diarize.")
     if args.plda_matrix_products and not args.plda_normalization_library:
         parser.error("--plda-matrix-products requires --plda-normalization-library and its SHA256.")
-    report = {"schema_version": 1, "scope": "source_checkout_native_mps_ctc", "status": "failed", "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False, "resident_statistics": args.resident_statistics, "embedding_normalization_requested": bool(args.embedding_library), "plda_normalization_requested": bool(args.plda_normalization_library), "plda_matrix_products_requested": args.plda_matrix_products}
-    records = {key: [] for key in ("ctc", "bounds", "means", "rounding", "interpolation", "speaker_assignment", "embedding_normalization", "plda_normalization", "plda_matrix_products")}
+    if args.plda_centering_scaling and not args.plda_matrix_products:
+        parser.error("--plda-centering-scaling requires --plda-matrix-products.")
+    report = {"schema_version": 1, "scope": "source_checkout_native_mps_ctc", "status": "failed", "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False, "resident_statistics": args.resident_statistics, "embedding_normalization_requested": bool(args.embedding_library), "plda_normalization_requested": bool(args.plda_normalization_library), "plda_matrix_products_requested": args.plda_matrix_products, "plda_centering_scaling_requested": args.plda_centering_scaling}
+    records = {key: [] for key in ("ctc", "bounds", "means", "rounding", "interpolation", "speaker_assignment", "embedding_normalization", "plda_normalization", "plda_matrix_products", "plda_centering_scaling")}
     with args.native_report.open("x", encoding="utf-8") as output:
         try:
             import whisperx.transcribe as task
@@ -109,7 +112,7 @@ def main(argv=None):
                             scopes.enter_context(native_plda_normalization(plda_context, records["plda_normalization"]))
                             if args.plda_matrix_products:
                                 from tools.baseline.native_plda_matrix import native_plda_matrix_products
-                                scopes.enter_context(native_plda_matrix_products(plda_context, records["plda_matrix_products"]))
+                                scopes.enter_context(native_plda_matrix_products(plda_context, records["plda_matrix_products"], centering_scaling=args.plda_centering_scaling, elementwise_records=records["plda_centering_scaling"]))
                         if args.embedding_library:
                             from tools.baseline.native_embedding import NativeEmbeddingNormalization
                             from tools.baseline.native_embedding_adapter import native_embedding_normalization
@@ -132,6 +135,8 @@ def main(argv=None):
         finally:
             report["operations"] = records
             report["native_ctc_calls"] = len(records["ctc"])
+            report["native_plda_centering_scaling_calls"] = len(records["plda_centering_scaling"])
+            report["plda_centering_scaling_observed"] = bool(records["plda_centering_scaling"])
             report["native_plda_matrix_product_calls"] = len(records["plda_matrix_products"])
             report["plda_matrix_products_observed"] = bool(records["plda_matrix_products"])
             report["native_plda_normalization_calls"] = len(records["plda_normalization"])
