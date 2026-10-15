@@ -462,3 +462,15 @@ kernel void double_vbx_qinit_exp(device const ulong* input [[buffer(0)]], consta
     ulong shifted = matrix_add(scaled, d.smoothing ^ (1ul << 63));
     output[index] = bounded_binary64_exp(shifted);
 }
+
+struct CentroidDimensions { uint speakers, frames, features, sequential; };
+
+// Weighted centroid products accumulate in increasing frame order before separately rounded division by the NumPy-order speaker mass.
+kernel void double_vbx_centroids(device const ulong* weights [[buffer(0)]], constant CentroidDimensions& d [[buffer(1)]], device const ulong* features [[buffer(2)]], device ulong* output [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index >= d.speakers * d.features) return;
+    uint speaker = index / d.features, feature = index % d.features;
+    ulong sum = 0, sign = 1ul << 63;
+    for (uint frame = 0; frame < d.frames; ++frame) sum = matrix_add(sum, df_mul(weights[speaker * d.frames + frame], features[frame * d.features + feature]));
+    ulong mass = double_sum(weights + speaker * d.frames, d.frames, d.sequential, false);
+    output[index] = divide_positive_binary64(sum & (sign - 1), mass) | (sum & sign);
+}

@@ -18,6 +18,7 @@ struct ElboDimensions { uint32_t rows, columns, operation, column_order; uint64_
 static_assert(sizeof(ElboDimensions) == 32);
 struct TranscendentalDimensions { uint32_t count, operation; };
 struct LogSumExpDimensions { uint32_t rows, columns, sequential; };
+struct CentroidDimensions { uint32_t speakers, frames, features, sequential; };
 struct QinitDimensions { uint32_t rows, columns; uint64_t smoothing; };
 struct InitializationDimensions { uint32_t rows, columns, operation, sequential; };
 struct DoubleMetrics { uint32_t version, kernels; uint64_t wall_ns; double gpu_seconds; uint64_t allocated_bytes; };
@@ -26,7 +27,7 @@ static_assert(sizeof(DoubleMetrics) == 32);
 class DoubleContext {
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
-    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_;
+    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
     void reserve(id<MTLBuffer> __strong& buffer, uint64_t bytes) {
@@ -69,6 +70,8 @@ public:
         id<MTLFunction> lse_terms_function = [library newFunctionWithName:@"double_vbx_lse_terms"], lse_final_function = [library newFunctionWithName:@"double_vbx_lse_final"];
         if (lse_terms_function != nil) lse_terms_pipeline_ = [device_ newComputePipelineStateWithFunction:lse_terms_function error:&error];
         if (lse_final_function != nil) lse_final_pipeline_ = [device_ newComputePipelineStateWithFunction:lse_final_function error:&error];
+        id<MTLFunction> centroid_function = [library newFunctionWithName:@"double_vbx_centroids"];
+        if (centroid_function != nil) centroid_pipeline_ = [device_ newComputePipelineStateWithFunction:centroid_function error:&error];
         id<MTLFunction> qinit_function = [library newFunctionWithName:@"double_vbx_qinit_exp"];
         if (qinit_function != nil) qinit_pipeline_ = [device_ newComputePipelineStateWithFunction:qinit_function error:&error];
         id<MTLFunction> initialization_function = [library newFunctionWithName:@"double_vbx_initialize"];
@@ -333,6 +336,35 @@ public:
         return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
+    DoubleMetrics centroids_vbx(const double* weights, const double* features, CentroidDimensions d, double* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(centroid_pipeline_ != nil, "double_vbx_centroid_kernel_unavailable");
+        require(d.speakers > 0 && d.speakers <= 1024 && d.frames > 0 && d.frames <= 4096 && d.features > 0 && d.features <= 1024 && d.sequential <= 1, "double_vbx_centroid_shape_invalid");
+        uint64_t weight_count = uint64_t(d.speakers) * d.frames, feature_count = uint64_t(d.frames) * d.features, output_count = uint64_t(d.speakers) * d.features;
+        require(weight_count * d.features <= 32 * 1024 * 1024 && feature_count <= 1024 * 1024 && weights != nullptr && features != nullptr && output != nullptr, "double_vbx_centroid_work_or_pointer_invalid");
+        for (uint32_t speaker = 0; speaker < d.speakers; ++speaker) {
+            bool nonzero = false;
+            for (uint32_t frame = 0; frame < d.frames; ++frame) {
+                double value = weights[uint64_t(speaker) * d.frames + frame];
+                require(std::isfinite(value) && value >= 0 && value <= 0x1p200 && (value == 0 || value >= 0x1p-200), "double_vbx_centroid_weight_domain_invalid");
+                nonzero |= value != 0;
+            }
+            require(nonzero, "double_vbx_centroid_zero_mass_not_supported");
+        }
+        for (uint64_t i = 0; i < feature_count; ++i) require(std::isfinite(features[i]) && std::abs(features[i]) <= 0x1p100 && (features[i] == 0 || std::abs(features[i]) >= 0x1p-100), "double_vbx_centroid_feature_domain_invalid");
+        auto started = std::chrono::steady_clock::now();
+        reserve(input_, weight_count * sizeof(double)); reserve(right_, feature_count * sizeof(double)); reserve(output_, output_count * sizeof(double));
+        std::memcpy(input_.contents, weights, weight_count * sizeof(double)); std::memcpy(right_.contents, features, feature_count * sizeof(double));
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental VBx weighted centroids";
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:centroid_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:right_ offset:0 atIndex:2]; [encoder setBuffer:output_ offset:0 atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(output_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, centroid_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        std::memcpy(output, output_.contents, output_count * sizeof(double));
+        return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
     DoubleMetrics qinit_vbx(const double* input, uint32_t rows, uint32_t columns, double smoothing, double* output) {
         std::lock_guard<std::mutex> guard(mutex_);
         require(qinit_pipeline_ != nil && initialization_pipeline_ != nil, "double_vbx_qinit_kernel_unavailable");
@@ -493,6 +525,13 @@ extern "C" int wxdouble_vbx_qinit(void* context, const double* input, uint32_t r
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->qinit_vbx(input, rows, columns, smoothing, output); return 0; }
         catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_vbx_qinit_failed"); return 1; }
+    }
+}
+extern "C" int wxdouble_vbx_centroids(void* context, const double* weights, const double* features, uint32_t speakers, uint32_t frames, uint32_t dimensions, uint32_t sequential, double* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->centroids_vbx(weights, features, {speakers, frames, dimensions, sequential}, output); return 0; }
+        catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_vbx_centroid_failed"); return 1; }
     }
 }
 extern "C" void wxdouble_destroy(void* context) { @autoreleasepool { delete static_cast<DoubleContext*>(context); } }

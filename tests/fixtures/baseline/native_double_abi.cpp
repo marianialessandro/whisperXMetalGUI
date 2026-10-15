@@ -21,6 +21,7 @@ extern "C" int wxdouble_vbx_transcendental(void*, const double*, uint32_t, uint3
 extern "C" int wxdouble_vbx_logsumexp(void*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_initialize(void*, const double*, uint32_t, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_qinit(void*, const double*, uint32_t, uint32_t, double, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_vbx_centroids(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -239,6 +240,21 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_qinit(context, zeros, 1, 2, 7., output, &metrics, error, sizeof(error)) != 0);
     assert(wxdouble_vbx_qinit(context, input, 1, 2, 7., output, &metrics, error, sizeof(error)) != 0);
     assert(output[0] == 91. && output[1] == 92.);
+    double centroid_weights[] = {1., 3.};
+    assert(wxdouble_vbx_centroids(context, centroid_weights, input, 1, 2, 1, 0, output, &metrics, error, sizeof(error)) == 0 && output[0] == 3.75 && metrics.kernels == 1);
+    assert(wxdouble_vbx_centroids(context, centroid_weights, input, 1, 2, 1, 1, centroid_weights, &metrics, error, sizeof(error)) == 0 && centroid_weights[0] == 3.75);
+    output[0] = 91.; output[1] = 92.;
+    assert(wxdouble_vbx_centroids(context, nullptr, input, 1, 2, 1, 0, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_centroids(context, one_hot, nullptr, 1, 2, 1, 0, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_centroids(context, one_hot, input, 1, 2, 1, 0, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_centroids(context, one_hot, input, 1, 2, 1, 0, output, nullptr, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_centroids(context, one_hot, input, 1, 4097, 1, 0, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_centroids(context, one_hot, input, 1025, 2, 1, 0, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_centroids(context, one_hot, input, 1, 2, 1025, 0, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_centroids(context, one_hot, input, 9, 4096, 1024, 0, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_centroids(context, one_hot, input, 1, 2, 1, 2, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_centroids(context, zeros, input, 1, 2, 1, 0, output, &metrics, error, sizeof(error)) != 0);
+    assert(output[0] == 91. && output[1] == 92.);
     wxdouble_destroy(context);
     wxdouble_destroy(nullptr);
     std::string legacy_shader = shader.substr(0, shader.find("\nstruct MatrixDimensions"));
@@ -303,6 +319,12 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_initialize(context, nullptr, 1, 2, 0, 0, output, &metrics, error, sizeof(error)) == 0);
     output[0] = 91.;
     assert(wxdouble_vbx_qinit(context, one_hot, 1, 2, 7., output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
+    wxdouble_destroy(context);
+    std::string qinit_shader = shader.substr(0, shader.find("\nstruct CentroidDimensions"));
+    assert(wxdouble_create(qinit_shader.data(), qinit_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_vbx_qinit(context, one_hot, 1, 2, 0., output, &metrics, error, sizeof(error)) == 0);
+    output[0] = 91.;
+    assert(wxdouble_vbx_centroids(context, one_hot, input, 1, 2, 1, 0, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
     wxdouble_destroy(context);
     std::string matrix_shader = shader.substr(0, shader.find("\nstruct ElementDimensions"));
     context = nullptr;
