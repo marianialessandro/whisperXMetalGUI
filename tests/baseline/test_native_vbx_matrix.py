@@ -1,4 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
+import contextlib
+import io
 import hashlib
 import inspect
 from pathlib import Path
@@ -16,7 +18,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.baseline.native_double import NativeDoubleNormalization, build_library
-from tools.baseline.native_vbx_matrix import compile_native_vbx, native_vbx_matrix_products, prior_update, elbo_arithmetic, transcendental_update, logsumexp_update
+from tools.baseline.native_vbx_matrix import compile_native_vbx, native_vbx_matrix_products, prior_update, elbo_arithmetic, transcendental_update, logsumexp_update, scalar_arithmetic
 
 
 @unittest.skipUnless(platform.system() == "Darwin" and torch.backends.mps.is_available(), "Apple Metal required")
@@ -525,6 +527,71 @@ class NativeVBXMatrixTests(unittest.TestCase):
             changed = textwrap.dedent(inspect.getsource(original)).replace("logsumexp(log_p_ + lpi, axis=-1)", "logsumexp(log_p_ + lpi, axis=1)")
             with patch("tools.baseline.native_vbx_matrix.inspect.getsource", return_value=changed), patch("tools.baseline.native_vbx_matrix.VBX_SHA256", hashlib.sha256(changed.encode()).hexdigest()), self.assertRaisesRegex(ValueError, "logsumexp_expression_contract_changed"):
                 compile_native_vbx(original, object(), logsumexp_callback=object())
+
+    def test_native_scalar_operations_bitwise_boundaries_and_readonly_inputs(self):
+        with self.context() as context:
+            values = np.array([-0., 0., 2. ** -200, 2. ** 200])[::-1]
+            values.flags.writeable = False
+            before = values.copy()
+            records = []
+            actual = scalar_arithmetic(context, records, values, 1e-8, 0, "prior_epsilon_addition", 0)
+            np.testing.assert_array_equal(actual.view(np.uint64), (values + 1e-8).view(np.uint64))
+            np.testing.assert_array_equal(values.view(np.uint64), before.view(np.uint64))
+            self.assertEqual(records[0]["host_input_staging_copy_bytes"], values.nbytes)
+            for left, right in ((1., 1.), (0., -0.), (-0., 0.), (2. ** 200, np.nextafter(2. ** 200, 0.)), (-(2. ** -200), 2. ** -200)):
+                actual = scalar_arithmetic(context, [], left, right, 1, "elbo_difference", 0)
+                expected = np.float64(left) - np.float64(right)
+                self.assertEqual(actual.view(np.uint64), expected.view(np.uint64))
+            for left, right, operation in ((np.ones(1025), 1e-8, "prior_epsilon_addition"), (np.ones(3, dtype=np.float32), 1e-8, "prior_epsilon_addition"), (values, np.float32(1e-8), "prior_epsilon_addition"), (np.float32(1.), 0., "elbo_difference"), (1., 0., "invalid")):
+                with self.assertRaises(ValueError):
+                    scalar_arithmetic(context, [], left, right, 0, operation, 0)
+
+    def test_native_scalars_full_results_all_flag_combinations(self):
+        features, phi, gamma = self.fixture()
+        with self.context() as context:
+            for mask in range(256):
+                options = {"precompute": bool(mask & 1), "precompute_records": [], "statistics": bool(mask & 2), "statistics_records": [], "scores": bool(mask & 4), "score_records": [], "prior": bool(mask & 8), "prior_records": [], "posterior": bool(mask & 16), "posterior_records": [], "elbo": bool(mask & 32), "elbo_records": [], "transcendentals": bool(mask & 64), "transcendental_records": [], "logsumexp": bool(mask & 128), "logsumexp_records": []}
+                with native_vbx_matrix_products(context, [], [], **options):
+                    expected = vbx.VBx(features, phi, Fa=.07, Fb=.8, pi=3, gamma=gamma.copy(), maxIters=3, return_model=True, epsilon=-np.inf)
+                records, calls = [], []
+                with native_vbx_matrix_products(context, [], calls, scalars=True, scalar_records=records, **options):
+                    actual = vbx.VBx(features, phi, Fa=.07, Fb=.8, pi=3, gamma=gamma.copy(), maxIters=3, return_model=True, epsilon=-np.inf)
+                self.compare(expected, actual)
+                self.assertEqual(calls[0]["native_scalar_calls"], 5)
+                self.assertEqual([r["operation"] for r in records].count("prior_epsilon_addition"), 3)
+                self.assertEqual([r["operation"] for r in records].count("elbo_difference"), 2)
+                self.assertTrue(all(r["computation_gpu_seconds"] > 0 for r in records))
+
+    def test_scalars_short_circuit_fault_capability_and_source_restore(self):
+        features, phi, gamma = self.fixture()
+        original = vbx.VBx
+        with self.context() as context:
+            for iterations, epsilon, expected_calls in ((0, np.inf, 0), (1, np.inf, 1), (3, -np.inf, 5), (3, np.inf, 4)):
+                baseline_output, candidate_output = io.StringIO(), io.StringIO()
+                with native_vbx_matrix_products(context, [], []), contextlib.redirect_stdout(baseline_output):
+                    expected = vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=iterations, epsilon=epsilon)
+                calls = []
+                with native_vbx_matrix_products(context, [], calls, scalars=True, scalar_records=[]), contextlib.redirect_stdout(candidate_output):
+                    actual = vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=iterations, epsilon=epsilon)
+                self.compare(expected, actual)
+                self.assertEqual(candidate_output.getvalue(), baseline_output.getvalue())
+                self.assertEqual(calls[0]["native_scalar_calls"], expected_calls)
+            with self.assertRaisesRegex(ValueError, "scalar_records_required"):
+                with native_vbx_matrix_products(context, [], [], scalars=True):
+                    pass
+            with patch.object(context, "library", SimpleNamespace(wxdouble_matmul=object())), self.assertRaisesRegex(ValueError, "scalar_abi_unavailable"):
+                with native_vbx_matrix_products(context, [], [], scalars=True, scalar_records=[]):
+                    pass
+            calls, records = [], []
+            with self.assertRaisesRegex(ValueError, "injected_scalar_failure"):
+                with native_vbx_matrix_products(context, [], calls, scalars=True, scalar_records=records), patch.object(context, "posterior_vbx", side_effect=ValueError("injected_scalar_failure")):
+                    vbx.VBx(features, phi, pi=3, gamma=gamma.copy(), maxIters=1)
+            self.assertEqual(calls[0]["status"], "failed")
+            self.assertEqual(records, [])
+            self.assertIs(vbx.VBx, original)
+            changed = textwrap.dedent(inspect.getsource(original)).replace("pi + eps", "eps + pi")
+            with patch("tools.baseline.native_vbx_matrix.inspect.getsource", return_value=changed), patch("tools.baseline.native_vbx_matrix.VBX_SHA256", hashlib.sha256(changed.encode()).hexdigest()), self.assertRaisesRegex(ValueError, "scalar_expression_contract_changed"):
+                compile_native_vbx(original, object(), scalar=object())
 
     def test_unrelated_threads_and_multiple_calls_keep_separate_metadata(self):
         features, phi, gamma = self.fixture()
