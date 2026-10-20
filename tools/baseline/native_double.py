@@ -391,6 +391,29 @@ class NativeDoubleNormalization:
         return output, {"scope": "experimental_native_binary64_finite_logsumexp", "rows": rows, "columns": columns, "reduction_order": reduction_order, "shift_domain": [-60, 0], "approximation_policy": "scipy_1_15_3_separated_maxima_openlibm_math", "scipy_bitwise_certified": False, "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": ["double_vbx_lse_terms", "double_vbx_lse_final"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
 
+    def nan_cleanup_vbx(self, scores):
+        if type(scores) is not np.ndarray or scores.dtype != np.float64 or scores.ndim != 2 or not scores.flags.c_contiguous:
+            raise ValueError("double_vbx_nan_cleanup_input_format_invalid")
+        rows, columns = scores.shape
+        if not 0 < rows <= 4096 or not 0 < columns <= 1024:
+            raise ValueError("double_vbx_nan_cleanup_shape_invalid")
+        output, all_nan, metrics, error = np.empty_like(scores), ct.c_uint32(), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_vbx_nan_cleanup
+            except AttributeError as failure:
+                raise ValueError("double_vbx_nan_cleanup_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(ct.c_uint32), ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, scores.ctypes.data, rows, columns, output.ctypes.data, ct.byref(all_nan), ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 2 or all_nan.value > 1 or np.isinf(output).any():
+            raise ValueError("double_vbx_nan_cleanup_native_result_invalid")
+        return output, {"scope": "experimental_native_binary64_vbx_constrained_nan_cleanup", "rows": rows, "columns": columns, "all_nan_input": bool(all_nan.value), "replacement_zero_sign": "positive", "gpu_kernels": ["double_vbx_nan_min_partials", "double_vbx_nan_cleanup"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": scores.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "nan_payload_certified": False, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
     def inactive_mask_vbx(self, scores, segments):
         if any(type(value) is not np.ndarray or value.dtype != np.float64 or value.ndim != 2 or not value.flags.c_contiguous for value in (scores, segments)):
             raise ValueError("double_vbx_inactive_input_format_invalid")

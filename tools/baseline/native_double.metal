@@ -576,3 +576,28 @@ kernel void double_vbx_inactive_mask(device const ulong* scores [[buffer(0)]], c
     }
     for (uint column = 0; column < d.columns; ++column) output[row * d.columns + column] = active ? scores[row * d.columns + column] : replacement;
 }
+
+struct CleanupDimensions { uint rows, columns, blocks; };
+
+// NaNs are ignored for the minimum; zero ties are canonicalized only for replacement values.
+kernel void double_vbx_nan_min_partials(device const ulong* scores [[buffer(0)]], constant CleanupDimensions& d [[buffer(1)]], device ulong* partials [[buffer(2)]], uint block [[thread_position_in_grid]]) {
+    if (block >= d.blocks) return;
+    ulong minimum = 0x7ff0000000000000ul, mask = (1ul << 63) - 1;
+    uint end = min((block + 1) * 1024, d.rows * d.columns);
+    for (uint index = block * 1024; index < end; ++index) {
+        ulong value = scores[index];
+        if ((value & mask) <= 0x7ff0000000000000ul && binary64_argmax_greater(minimum, value)) minimum = value;
+    }
+    partials[block] = (minimum & mask) == 0 ? 0 : minimum;
+}
+
+kernel void double_vbx_nan_cleanup(device const ulong* scores [[buffer(0)]], constant CleanupDimensions& d [[buffer(1)]], device const ulong* partials [[buffer(2)]], device ulong* output [[buffer(3)]], uint row [[thread_position_in_grid]]) {
+    if (row >= d.rows) return;
+    ulong minimum = 0x7ff0000000000000ul, mask = (1ul << 63) - 1;
+    for (uint block = 0; block < d.blocks; ++block) if (binary64_argmax_greater(minimum, partials[block])) minimum = partials[block];
+    ulong replacement = minimum == 0x7ff0000000000000ul ? 0x7ff8000000000000ul : minimum;
+    for (uint column = 0; column < d.columns; ++column) {
+        ulong value = scores[row * d.columns + column];
+        output[row * d.columns + column] = (value & mask) > 0x7ff0000000000000ul ? replacement : value;
+    }
+}

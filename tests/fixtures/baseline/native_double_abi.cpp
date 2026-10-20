@@ -29,6 +29,7 @@ extern "C" int wxdouble_vbx_argmax(void*, const double*, uint32_t, uint32_t, int
 extern "C" int wxdouble_vbx_cosine_scores_argmax(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_qinit_from_labels(void*, const int64_t*, uint32_t, uint32_t, double, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_inactive_mask(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_vbx_nan_cleanup(void*, const double*, uint32_t, uint32_t, double*, uint32_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -338,6 +339,17 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_inactive_mask(context, input, inactive_segments, 4097, 2, 1, output, &metrics, error, sizeof(error)) != 0);
     assert(wxdouble_vbx_inactive_mask(context, input, inactive_segments, 4096, 2, 4096, output, &metrics, error, sizeof(error)) != 0);
     assert(wxdouble_vbx_inactive_mask(context, input, inactive_segments, 1, 2, 1, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91. && output[1] == 92.);
+    double cleanup_scores[] = {std::numeric_limits<double>::quiet_NaN(), -1.};
+    uint32_t all_nan = 91;
+    assert(wxdouble_vbx_nan_cleanup(context, cleanup_scores, 1, 2, output, &all_nan, &metrics, error, sizeof(error)) == 0 && output[0] == -1. && output[1] == -1. && all_nan == 0 && metrics.kernels == 2);
+    assert(wxdouble_vbx_nan_cleanup(context, cleanup_scores, 1, 2, cleanup_scores, &all_nan, &metrics, error, sizeof(error)) == 0);
+    output[0] = 91.; all_nan = 92;
+    assert(wxdouble_vbx_nan_cleanup(context, nullptr, 1, 2, output, &all_nan, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_nan_cleanup(context, input, 1, 2, nullptr, &all_nan, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_nan_cleanup(context, input, 1, 2, output, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_nan_cleanup(context, input, 4097, 2, output, &all_nan, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_nan_cleanup(context, cleanup_scores, 1, 2, output, reinterpret_cast<uint32_t*>(output), &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_nan_cleanup(context, input, 1, 2, output, &all_nan, &metrics, error, sizeof(error)) != 0 && output[0] == 91. && all_nan == 92);
     wxdouble_destroy(context);
     wxdouble_destroy(nullptr);
     std::string legacy_shader = shader.substr(0, shader.find("\nstruct MatrixDimensions"));
@@ -440,6 +452,12 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_qinit_from_labels(context, label, 1, 2, 0., output, &metrics, error, sizeof(error)) == 0);
     output[0] = 91.;
     assert(wxdouble_vbx_inactive_mask(context, mask_scores, inactive_segments, 1, 2, 1, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
+    wxdouble_destroy(context);
+    std::string pre_cleanup_shader = shader.substr(0, shader.find("\nstruct CleanupDimensions"));
+    assert(wxdouble_create(pre_cleanup_shader.data(), pre_cleanup_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_vbx_inactive_mask(context, mask_scores, inactive_segments, 1, 2, 1, output, &metrics, error, sizeof(error)) == 0);
+    output[0] = 91.; all_nan = 92;
+    assert(wxdouble_vbx_nan_cleanup(context, cleanup_scores, 1, 2, output, &all_nan, &metrics, error, sizeof(error)) != 0 && output[0] == 91. && all_nan == 92);
     wxdouble_destroy(context);
     std::string matrix_shader = shader.substr(0, shader.find("\nstruct ElementDimensions"));
     context = nullptr;

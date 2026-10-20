@@ -19,6 +19,7 @@ struct ElboDimensions { uint32_t rows, columns, operation, column_order; uint64_
 static_assert(sizeof(ElboDimensions) == 32);
 struct TranscendentalDimensions { uint32_t count, operation; };
 struct LogSumExpDimensions { uint32_t rows, columns, sequential; };
+struct CleanupDimensions { uint32_t rows, columns, blocks; };
 struct InactiveDimensions { uint32_t rows, columns, frames, blocks; };
 struct ArgmaxDimensions { uint32_t rows, columns; };
 struct CosineDimensions { uint32_t rows, centroids, features; };
@@ -32,7 +33,7 @@ static_assert(sizeof(DoubleMetrics) == 32);
 class DoubleContext {
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
-    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_, cosine_norm_pipeline_, cosine_distance_pipeline_, cosine_score_pipeline_, argmax_pipeline_, minimum_pipeline_, inactive_pipeline_;
+    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_, cosine_norm_pipeline_, cosine_distance_pipeline_, cosine_score_pipeline_, argmax_pipeline_, minimum_pipeline_, inactive_pipeline_, nan_minimum_pipeline_, nan_cleanup_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
     void reserve(id<MTLBuffer> __strong& buffer, uint64_t bytes) {
@@ -75,6 +76,9 @@ public:
         id<MTLFunction> lse_terms_function = [library newFunctionWithName:@"double_vbx_lse_terms"], lse_final_function = [library newFunctionWithName:@"double_vbx_lse_final"];
         if (lse_terms_function != nil) lse_terms_pipeline_ = [device_ newComputePipelineStateWithFunction:lse_terms_function error:&error];
         if (lse_final_function != nil) lse_final_pipeline_ = [device_ newComputePipelineStateWithFunction:lse_final_function error:&error];
+        id<MTLFunction> nan_minimum_function = [library newFunctionWithName:@"double_vbx_nan_min_partials"], nan_cleanup_function = [library newFunctionWithName:@"double_vbx_nan_cleanup"];
+        if (nan_minimum_function != nil) nan_minimum_pipeline_ = [device_ newComputePipelineStateWithFunction:nan_minimum_function error:&error];
+        if (nan_cleanup_function != nil) nan_cleanup_pipeline_ = [device_ newComputePipelineStateWithFunction:nan_cleanup_function error:&error];
         id<MTLFunction> minimum_function = [library newFunctionWithName:@"double_vbx_score_min_partials"], inactive_function = [library newFunctionWithName:@"double_vbx_inactive_mask"];
         if (minimum_function != nil) minimum_pipeline_ = [device_ newComputePipelineStateWithFunction:minimum_function error:&error];
         if (inactive_function != nil) inactive_pipeline_ = [device_ newComputePipelineStateWithFunction:inactive_function error:&error];
@@ -350,6 +354,36 @@ public:
         [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
         for (uint32_t row = 0; row < d.rows; ++row) require(std::isfinite(static_cast<const double*>(terms_.contents)[row]), "double_vbx_logsumexp_shift_domain_invalid");
         std::memcpy(output, terms_.contents, uint64_t(d.rows) * sizeof(double));
+        return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
+    DoubleMetrics nan_cleanup_vbx(const double* scores, uint32_t rows, uint32_t columns, double* output, uint32_t* all_nan) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(nan_minimum_pipeline_ != nil && nan_cleanup_pipeline_ != nil, "double_vbx_nan_cleanup_kernel_unavailable");
+        require(rows > 0 && rows <= 4096 && columns > 0 && columns <= 1024 && scores != nullptr && output != nullptr && all_nan != nullptr, "double_vbx_nan_cleanup_shape_or_pointer_invalid");
+        uint64_t count = uint64_t(rows) * columns;
+        uintptr_t a = reinterpret_cast<uintptr_t>(output), b = reinterpret_cast<uintptr_t>(all_nan);
+        require(a <= b ? b - a >= count * sizeof(double) : a - b >= sizeof(uint32_t), "double_vbx_nan_cleanup_outputs_overlap");
+        bool any_finite = false;
+        for (uint64_t index = 0; index < count; ++index) {
+            require(std::isnan(scores[index]) || (std::isfinite(scores[index]) && scores[index] >= -1 && scores[index] <= 2), "double_vbx_nan_cleanup_value_domain_invalid");
+            any_finite |= std::isfinite(scores[index]);
+        }
+        CleanupDimensions d = {rows, columns, uint32_t((count + 1023) / 1024)};
+        auto started = std::chrono::steady_clock::now();
+        reserve(input_, count * sizeof(double)); reserve(output_, count * sizeof(double)); reserve(terms_, uint64_t(d.blocks) * sizeof(double)); std::memcpy(input_.contents, scores, count * sizeof(double));
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental constrained NaN cleanup";
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:nan_minimum_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:terms_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(d.blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, nan_minimum_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:nan_cleanup_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:terms_ offset:0 atIndex:2]; [encoder setBuffer:output_ offset:0 atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, nan_cleanup_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        const double* result = static_cast<const double*>(output_.contents);
+        for (uint64_t index = 0; index < count; ++index) require(any_finite ? std::isfinite(result[index]) && result[index] >= -1 && result[index] <= 2 : std::isnan(result[index]), "double_vbx_nan_cleanup_result_invalid");
+        std::memcpy(output, result, count * sizeof(double)); *all_nan = !any_finite;
         return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
@@ -744,6 +778,13 @@ extern "C" int wxdouble_vbx_inactive_mask(void* context, const double* scores, c
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->inactive_mask_vbx(scores, segments, rows, columns, frames, output); return 0; }
         catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_vbx_inactive_failed"); return 1; }
+    }
+}
+extern "C" int wxdouble_vbx_nan_cleanup(void* context, const double* scores, uint32_t rows, uint32_t columns, double* output, uint32_t* all_nan, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->nan_cleanup_vbx(scores, rows, columns, output, all_nan); return 0; }
+        catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_vbx_nan_cleanup_failed"); return 1; }
     }
 }
 extern "C" void wxdouble_destroy(void* context) { @autoreleasepool { delete static_cast<DoubleContext*>(context); } }

@@ -146,7 +146,7 @@ def inactive_speaker_mask(context, records, scores, segments):
     staged_segments = np.ascontiguousarray(segments.transpose(0, 2, 1), dtype=np.float64).reshape(rows, frames)
     output, record = context.inactive_mask_vbx(staged_scores, staged_segments)
     record = dict(record)
-    record.update({"adapter_scope": "vbx_constrained_inactive_speaker_preparation", "original_call_sha256": VBX_CALL_SHA256, "segment_source_dtype": str(segments.dtype), "host_score_staging_copy_bytes": 0 if np.shares_memory(staged_scores, scores) else staged_scores.nbytes, "host_segment_staging_copy_bytes": 0 if np.shares_memory(staged_segments, segments) else staged_segments.nbytes, "cpu_residuals": ["constrained_nan_replacement_and_solver", "ahc", "optional_kmeans", "host_staging_and_control"]})
+    record.update({"adapter_scope": "vbx_constrained_inactive_speaker_preparation", "original_call_sha256": VBX_CALL_SHA256, "segment_source_dtype": str(segments.dtype), "host_score_staging_copy_bytes": 0 if np.shares_memory(staged_scores, scores) else staged_scores.nbytes, "host_segment_staging_copy_bytes": 0 if np.shares_memory(staged_segments, segments) else staged_segments.nbytes, "cpu_residuals": ["constrained_assignment_downstream", "ahc", "optional_kmeans", "host_staging_and_control"]})
     records.append(record)
     return output.reshape(scores.shape)
 
