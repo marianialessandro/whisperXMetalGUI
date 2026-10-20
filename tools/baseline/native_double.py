@@ -391,6 +391,29 @@ class NativeDoubleNormalization:
         return output, {"scope": "experimental_native_binary64_finite_logsumexp", "rows": rows, "columns": columns, "reduction_order": reduction_order, "shift_domain": [-60, 0], "approximation_policy": "scipy_1_15_3_separated_maxima_openlibm_math", "scipy_bitwise_certified": False, "arithmetic": "bounded_binary64_integer_emulation", "gpu_kernels": ["double_vbx_lse_terms", "double_vbx_lse_final"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
 
+    def argmax_vbx(self, scores):
+        if type(scores) is not np.ndarray or scores.dtype != np.float64 or scores.ndim != 2 or not scores.flags.c_contiguous:
+            raise ValueError("double_vbx_argmax_input_format_invalid")
+        rows, columns = scores.shape
+        if not 0 < rows <= 4096 or not 0 < columns <= 1024:
+            raise ValueError("double_vbx_argmax_shape_invalid")
+        output, metrics, error = np.empty(rows, dtype=np.int64), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_vbx_argmax
+            except AttributeError as failure:
+                raise ValueError("double_vbx_argmax_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, scores.ctypes.data, rows, columns, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 1 or (output < 0).any() or (output >= columns).any():
+            raise ValueError("double_vbx_argmax_native_result_invalid")
+        return output, {"scope": "experimental_native_binary64_vbx_argmax", "rows": rows, "columns": columns, "comparison_policy": "first_nan_else_first_maximum_signed_zero_equal", "gpu_kernels": ["double_vbx_argmax"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": scores.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
     def cosine_vbx(self, embeddings, centroids, soft_scores=False):
         if any(type(value) is not np.ndarray or value.dtype != np.float64 or value.ndim != 2 or not value.flags.c_contiguous for value in (embeddings, centroids)):
             raise ValueError("double_vbx_cosine_input_format_invalid")

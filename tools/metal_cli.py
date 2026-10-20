@@ -59,6 +59,7 @@ def main(argv=None):
     parser.add_argument("--embedding-library-sha256", help="Expected SHA256 of the optional embedding-normalization dylib; clustering defaults remain unchanged.")
     parser.add_argument("--plda-normalization-library", type=Path, help="Optional native binary64 L2 normalization inside PLDA preprocessing; requires --diarize and its paired SHA256 flag. Matrix products remain original unless --plda-matrix-products is selected; model setup remains original.")
     parser.add_argument("--plda-normalization-library-sha256", help="Expected SHA256 of the binary64-normalization dylib; requires pyannote 4.0.4 and NumPy 2.2.6.")
+    parser.add_argument("--vbx-unconstrained-argmax", action="store_true", help="Run the original unconstrained speaker argmax on Metal; requires --plda-normalization-library and argmax ABI. Keeps first-NaN/first-maximum behavior; constrained assignment remains original.")
     parser.add_argument("--vbx-soft-scores", action="store_true", help="Additionally compute 2 - cosine_distance on Metal in the final cosine kernel; requires --vbx-cosine-distances and cosine-score ABI. Only scores are read back; both original subtractions remain separately rounded.")
     parser.add_argument("--vbx-cosine-distances", action="store_true", help="Run embedding-to-centroid cosine distances on Metal; requires --plda-normalization-library and cosine ABI. Preserves undefined NaN pairs; only cosine metric is supported.")
     parser.add_argument("--vbx-centroids", action="store_true", help="Run weighted centroids after VBx on Metal; requires --plda-normalization-library and centroid ABI. Uses sequential binary64 products; BLAS rounding may differ. Optional K-means remains original.")
@@ -94,6 +95,8 @@ def main(argv=None):
         parser.error("--plda-normalization-library and --plda-normalization-library-sha256 must be supplied together.")
     if args.plda_normalization_library and "--diarize" not in forwarded:
         parser.error("--plda-normalization-library requires --diarize.")
+    if args.vbx_unconstrained_argmax and not args.plda_normalization_library:
+        parser.error("--vbx-unconstrained-argmax requires --plda-normalization-library and its SHA256.")
     if args.vbx_soft_scores and not args.vbx_cosine_distances:
         parser.error("--vbx-soft-scores requires --vbx-cosine-distances.")
     if args.vbx_cosine_distances and not args.plda_normalization_library:
@@ -130,8 +133,8 @@ def main(argv=None):
         parser.error("--vbx-statistics requires --vbx-matrix-products.")
     if args.vbx_precomputed_terms and not args.vbx_matrix_products:
         parser.error("--vbx-precomputed-terms requires --vbx-matrix-products.")
-    report = {"schema_version": 1, "scope": "source_checkout_native_mps_ctc", "status": "failed", "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False, "resident_statistics": args.resident_statistics, "embedding_normalization_requested": bool(args.embedding_library), "plda_normalization_requested": bool(args.plda_normalization_library), "plda_matrix_products_requested": args.plda_matrix_products, "plda_centering_scaling_requested": args.plda_centering_scaling, "vbx_soft_scores_requested": args.vbx_soft_scores, "vbx_cosine_distances_requested": args.vbx_cosine_distances, "vbx_centroids_requested": args.vbx_centroids, "vbx_matrix_products_requested": args.vbx_matrix_products, "vbx_initial_one_hot_requested": args.vbx_initial_one_hot, "vbx_initial_softmax_requested": args.vbx_initial_softmax, "vbx_initialization_requested": args.vbx_initialization, "vbx_scalar_arithmetic_requested": args.vbx_scalar_arithmetic, "vbx_logsumexp_requested": args.vbx_logsumexp, "vbx_transcendentals_requested": args.vbx_transcendentals, "vbx_elbo_arithmetic_requested": args.vbx_elbo_arithmetic, "vbx_posterior_arithmetic_requested": args.vbx_posterior_arithmetic, "vbx_prior_updates_requested": args.vbx_prior_updates, "vbx_score_arithmetic_requested": args.vbx_score_arithmetic, "vbx_statistics_requested": args.vbx_statistics, "vbx_precomputed_terms_requested": args.vbx_precomputed_terms}
-    records = {key: [] for key in ("ctc", "bounds", "means", "rounding", "interpolation", "speaker_assignment", "embedding_normalization", "plda_normalization", "plda_matrix_products", "plda_centering_scaling", "vbx_matrix_products", "vbx_precomputed_terms", "vbx_statistics", "vbx_score_arithmetic", "vbx_prior_updates", "vbx_posterior_arithmetic", "vbx_elbo_arithmetic", "vbx_transcendentals", "vbx_logsumexp", "vbx_scalar_arithmetic", "vbx_initialization", "vbx_initial_softmax", "vbx_centroids", "vbx_initial_one_hot", "vbx_cosine_distances")}
+    report = {"schema_version": 1, "scope": "source_checkout_native_mps_ctc", "status": "failed", "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False, "resident_statistics": args.resident_statistics, "embedding_normalization_requested": bool(args.embedding_library), "plda_normalization_requested": bool(args.plda_normalization_library), "plda_matrix_products_requested": args.plda_matrix_products, "plda_centering_scaling_requested": args.plda_centering_scaling, "vbx_unconstrained_argmax_requested": args.vbx_unconstrained_argmax, "vbx_soft_scores_requested": args.vbx_soft_scores, "vbx_cosine_distances_requested": args.vbx_cosine_distances, "vbx_centroids_requested": args.vbx_centroids, "vbx_matrix_products_requested": args.vbx_matrix_products, "vbx_initial_one_hot_requested": args.vbx_initial_one_hot, "vbx_initial_softmax_requested": args.vbx_initial_softmax, "vbx_initialization_requested": args.vbx_initialization, "vbx_scalar_arithmetic_requested": args.vbx_scalar_arithmetic, "vbx_logsumexp_requested": args.vbx_logsumexp, "vbx_transcendentals_requested": args.vbx_transcendentals, "vbx_elbo_arithmetic_requested": args.vbx_elbo_arithmetic, "vbx_posterior_arithmetic_requested": args.vbx_posterior_arithmetic, "vbx_prior_updates_requested": args.vbx_prior_updates, "vbx_score_arithmetic_requested": args.vbx_score_arithmetic, "vbx_statistics_requested": args.vbx_statistics, "vbx_precomputed_terms_requested": args.vbx_precomputed_terms}
+    records = {key: [] for key in ("ctc", "bounds", "means", "rounding", "interpolation", "speaker_assignment", "embedding_normalization", "plda_normalization", "plda_matrix_products", "plda_centering_scaling", "vbx_matrix_products", "vbx_precomputed_terms", "vbx_statistics", "vbx_score_arithmetic", "vbx_prior_updates", "vbx_posterior_arithmetic", "vbx_elbo_arithmetic", "vbx_transcendentals", "vbx_logsumexp", "vbx_scalar_arithmetic", "vbx_initialization", "vbx_initial_softmax", "vbx_centroids", "vbx_initial_one_hot", "vbx_cosine_distances", "vbx_unconstrained_argmax")}
     vbx_calls = []
     with args.native_report.open("x", encoding="utf-8") as output:
         try:
@@ -174,9 +177,9 @@ def main(argv=None):
                             embedding_context = scopes.enter_context(NativeEmbeddingNormalization(args.embedding_library, args.embedding_library_sha256))
                             report["embedding_native_identity"] = embedding_context.identity
                             report["embedding_initialization_wall_ns"] = embedding_context.initialization_wall_ns
-                        if args.embedding_library or args.vbx_centroids or args.vbx_cosine_distances:
+                        if args.embedding_library or args.vbx_centroids or args.vbx_cosine_distances or args.vbx_unconstrained_argmax:
                             from tools.baseline.native_embedding_adapter import native_embedding_normalization
-                            scopes.enter_context(native_embedding_normalization(embedding_context, records["embedding_normalization"], centroid_context=plda_context if args.vbx_centroids else None, centroid_records=records["vbx_centroids"], distance_context=plda_context if args.vbx_cosine_distances else None, distance_records=records["vbx_cosine_distances"], soft_scores=args.vbx_soft_scores))
+                            scopes.enter_context(native_embedding_normalization(embedding_context, records["embedding_normalization"], centroid_context=plda_context if args.vbx_centroids else None, centroid_records=records["vbx_centroids"], distance_context=plda_context if args.vbx_cosine_distances else None, distance_records=records["vbx_cosine_distances"], soft_scores=args.vbx_soft_scores, argmax_context=plda_context if args.vbx_unconstrained_argmax else None, argmax_records=records["vbx_unconstrained_argmax"]))
                         if args.speaker_library:
                             from tools.baseline.native_speaker import NativeSpeakerAssignment, native_speaker_assignment
                             speaker_context = scopes.enter_context(NativeSpeakerAssignment(args.speaker_library, args.speaker_library_sha256))
@@ -192,6 +195,8 @@ def main(argv=None):
         finally:
             report["operations"] = records
             report["native_ctc_calls"] = len(records["ctc"])
+            report["native_vbx_argmax_calls"] = len(records["vbx_unconstrained_argmax"])
+            report["vbx_unconstrained_argmax_observed"] = bool(records["vbx_unconstrained_argmax"])
             report["native_vbx_soft_score_calls"] = sum(item.get("result_kind") == "soft_scores" for item in records["vbx_cosine_distances"])
             report["vbx_soft_scores_observed"] = bool(report["native_vbx_soft_score_calls"])
             report["native_vbx_cosine_calls"] = len(records["vbx_cosine_distances"])

@@ -18,7 +18,7 @@ _HOOK_LOCK = threading.RLock()
 _ACTIVE = False
 
 
-def compile_native_normalization(original, normalize, centroid=None, distance=None, soft_scores=False):
+def compile_native_normalization(original, normalize, centroid=None, distance=None, soft_scores=False, argmax=None):
     source = textwrap.dedent(inspect.getsource(original))
     if hashlib.sha256(source.encode()).hexdigest() != VBX_CALL_SHA256 or original.__closure__:
         raise ValueError("embedding_vbx_source_not_supported")
@@ -33,6 +33,12 @@ def compile_native_normalization(original, normalize, centroid=None, distance=No
         if len(centroid_matches) != 1:
             raise ValueError("embedding_vbx_centroid_contract_changed")
         centroid_matches[0].value = ast.copy_location(ast.parse("__wx_native_centroids(W, train_embeddings.reshape(-1, dimension))").body[0].value, centroid_matches[0].value)
+    if argmax is not None:
+        argmax_expected = ast.parse("hard_clusters = np.argmax(soft_clusters, axis=2)").body[0]
+        argmax_matches = [node for node in ast.walk(tree) if isinstance(node, ast.Assign) and ast.dump(node) == ast.dump(argmax_expected)]
+        if len(argmax_matches) != 1:
+            raise ValueError("embedding_vbx_argmax_contract_changed")
+        argmax_matches[0].value = ast.Call(func=ast.Name(id="__wx_native_argmax", ctx=ast.Load()), args=[ast.Name(id="soft_clusters", ctx=ast.Load())], keywords=[])
     if soft_scores:
         score_expected = ast.parse("soft_clusters = 2 - e2k_distance").body[0]
         score_matches = [node for node in ast.walk(tree) if isinstance(node, ast.Assign) and ast.dump(node) == ast.dump(score_expected)]
@@ -52,6 +58,7 @@ def compile_native_normalization(original, normalize, centroid=None, distance=No
     namespace["__wx_native_embedding_normalize"] = normalize
     namespace["__wx_native_centroids"] = centroid
     namespace["__wx_native_cosine"] = distance
+    namespace["__wx_native_argmax"] = argmax
     ast.fix_missing_locations(tree)
     exec(compile(tree, "<WhisperX scoped native VBx normalization>", "exec"), namespace)
     candidate = namespace[tree.body[0].name]
@@ -94,8 +101,23 @@ def cosine_distances(context, records, embeddings, centroids, metric="cosine", n
     return output
 
 
+def unconstrained_argmax(context, records, scores):
+    if type(scores) is not np.ndarray or scores.dtype != np.float64 or scores.ndim != 3:
+        raise ValueError("vbx_argmax_operand_format_not_supported")
+    chunks, local_speakers, clusters = scores.shape
+    rows = chunks * local_speakers
+    if not 0 < rows <= 4096 or not 0 < clusters <= 1024:
+        raise ValueError("vbx_argmax_shape_not_supported")
+    staged = np.ascontiguousarray(scores).reshape(rows, clusters)
+    output, record = context.argmax_vbx(staged)
+    record = dict(record)
+    record.update({"adapter_scope": "vbx_unconstrained_assignment", "original_call_sha256": VBX_CALL_SHA256, "chunks": chunks, "local_speakers": local_speakers, "host_input_staging_copy_bytes": 0 if np.shares_memory(staged, scores) else staged.nbytes, "cpu_residuals": ["constrained_assignment_when_selected", "ahc", "optional_kmeans", "host_staging_and_control"]})
+    records.append(record)
+    return output.reshape(chunks, local_speakers)
+
+
 @contextlib.contextmanager
-def native_embedding_normalization(context, records, centroid_context=None, centroid_records=None, distance_context=None, distance_records=None, soft_scores=False):
+def native_embedding_normalization(context, records, centroid_context=None, centroid_records=None, distance_context=None, distance_records=None, soft_scores=False, argmax_context=None, argmax_records=None):
     global _ACTIVE
     from pyannote.audio.pipelines.clustering import VBxClustering
 
@@ -111,6 +133,13 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
                 raise ValueError("vbx_centroid_numpy_not_supported")
             if getattr(centroid_context.library, "wxdouble_vbx_centroids", None) is None:
                 raise ValueError("double_vbx_centroid_abi_unavailable")
+        if argmax_context is not None:
+            if not isinstance(argmax_records, list):
+                raise ValueError("vbx_argmax_records_required")
+            if np.__version__ != "2.2.6" or np.dtype(np.intp).itemsize != 8:
+                raise ValueError("vbx_argmax_runtime_not_supported")
+            if getattr(argmax_context.library, "wxdouble_vbx_argmax", None) is None:
+                raise ValueError("double_vbx_argmax_abi_unavailable")
         if type(soft_scores) is not bool or (soft_scores and distance_context is None):
             raise ValueError("vbx_soft_scores_require_cosine")
         if soft_scores and getattr(distance_context.library, "wxdouble_vbx_cosine_scores", None) is None:
@@ -125,7 +154,7 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
                 raise ValueError("double_vbx_cosine_abi_unavailable")
             if VBxClustering.__call__.__globals__.get("cdist") is not spatial_distance.cdist or hashlib.sha256(textwrap.dedent(inspect.getsource(spatial_distance.cdist)).encode()).hexdigest() != CDIST_SHA256:
                 raise ValueError("vbx_cosine_reference_not_supported")
-        if context is None and centroid_context is None and distance_context is None:
+        if context is None and centroid_context is None and distance_context is None and argmax_context is None:
             raise ValueError("embedding_or_centroid_context_required")
         original = VBxClustering.__call__
         owner_thread = threading.get_ident()
@@ -145,7 +174,10 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
         def distances(embeddings, centroids, metric):
             return cosine_distances(distance_context, distance_records, embeddings, centroids, metric, centroid_context is not None, soft_scores)
 
-        candidate = compile_native_normalization(original, normalize if context is not None else None, centroids if centroid_context is not None else None, distances if distance_context is not None else None, soft_scores=soft_scores)
+        def assign(scores):
+            return unconstrained_argmax(argmax_context, argmax_records, scores)
+
+        candidate = compile_native_normalization(original, normalize if context is not None else None, centroids if centroid_context is not None else None, distances if distance_context is not None else None, soft_scores=soft_scores, argmax=assign if argmax_context is not None else None)
 
         @functools.wraps(original)
         def wrapped(*args, **kwargs):

@@ -520,3 +520,25 @@ kernel void double_vbx_cosine_scores(device const ulong* embeddings [[buffer(0)]
     ulong distance = cosine_distance_value(embeddings, d, centroids, norms, index);
     output[index] = distance > 0x7ff0000000000000ul ? distance : df_sub(0x4000000000000000ul, distance);
 }
+
+struct ArgmaxDimensions { uint rows, columns; };
+
+bool binary64_argmax_greater(ulong a, ulong b) {
+    ulong sign = 1ul << 63, mask = sign - 1;
+    if (((a | b) & mask) == 0) return false;
+    if ((a & sign) != (b & sign)) return (a & sign) == 0;
+    return (a & sign) ? (a & mask) < (b & mask) : a > b;
+}
+
+// NumPy argmax prefers the first NaN, otherwise the first maximum, treating opposite signed zeros as equal.
+kernel void double_vbx_argmax(device const ulong* scores [[buffer(0)]], constant ArgmaxDimensions& d [[buffer(1)]], device long* output [[buffer(2)]], uint row [[thread_position_in_grid]]) {
+    if (row >= d.rows) return;
+    uint winner = 0;
+    ulong best = scores[row * d.columns];
+    for (uint column = 0; column < d.columns; ++column) {
+        ulong value = scores[row * d.columns + column];
+        if ((value & ((1ul << 63) - 1)) > 0x7ff0000000000000ul) { winner = column; break; }
+        if (binary64_argmax_greater(value, best)) { winner = column; best = value; }
+    }
+    output[row] = long(winner);
+}

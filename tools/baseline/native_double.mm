@@ -19,6 +19,7 @@ struct ElboDimensions { uint32_t rows, columns, operation, column_order; uint64_
 static_assert(sizeof(ElboDimensions) == 32);
 struct TranscendentalDimensions { uint32_t count, operation; };
 struct LogSumExpDimensions { uint32_t rows, columns, sequential; };
+struct ArgmaxDimensions { uint32_t rows, columns; };
 struct CosineDimensions { uint32_t rows, centroids, features; };
 struct OneHotDimensions { uint32_t rows, columns; };
 struct CentroidDimensions { uint32_t speakers, frames, features, sequential; };
@@ -30,7 +31,7 @@ static_assert(sizeof(DoubleMetrics) == 32);
 class DoubleContext {
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
-    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_, cosine_norm_pipeline_, cosine_distance_pipeline_, cosine_score_pipeline_;
+    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_, cosine_norm_pipeline_, cosine_distance_pipeline_, cosine_score_pipeline_, argmax_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
     void reserve(id<MTLBuffer> __strong& buffer, uint64_t bytes) {
@@ -73,6 +74,8 @@ public:
         id<MTLFunction> lse_terms_function = [library newFunctionWithName:@"double_vbx_lse_terms"], lse_final_function = [library newFunctionWithName:@"double_vbx_lse_final"];
         if (lse_terms_function != nil) lse_terms_pipeline_ = [device_ newComputePipelineStateWithFunction:lse_terms_function error:&error];
         if (lse_final_function != nil) lse_final_pipeline_ = [device_ newComputePipelineStateWithFunction:lse_final_function error:&error];
+        id<MTLFunction> argmax_function = [library newFunctionWithName:@"double_vbx_argmax"];
+        if (argmax_function != nil) argmax_pipeline_ = [device_ newComputePipelineStateWithFunction:argmax_function error:&error];
         id<MTLFunction> cosine_score_function = [library newFunctionWithName:@"double_vbx_cosine_scores"];
         if (cosine_score_function != nil) cosine_score_pipeline_ = [device_ newComputePipelineStateWithFunction:cosine_score_function error:&error];
         id<MTLFunction> cosine_norm_function = [library newFunctionWithName:@"double_vbx_cosine_norms"], cosine_distance_function = [library newFunctionWithName:@"double_vbx_cosine_distances"];
@@ -344,6 +347,25 @@ public:
         for (uint32_t row = 0; row < d.rows; ++row) require(std::isfinite(static_cast<const double*>(terms_.contents)[row]), "double_vbx_logsumexp_shift_domain_invalid");
         std::memcpy(output, terms_.contents, uint64_t(d.rows) * sizeof(double));
         return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
+    DoubleMetrics argmax_vbx(const double* scores, ArgmaxDimensions d, int64_t* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(argmax_pipeline_ != nil, "double_vbx_argmax_kernel_unavailable");
+        require(d.rows > 0 && d.rows <= 4096 && d.columns > 0 && d.columns <= 1024 && scores != nullptr && output != nullptr, "double_vbx_argmax_shape_or_pointer_invalid");
+        auto started = std::chrono::steady_clock::now();
+        uint64_t bytes = uint64_t(d.rows) * d.columns * sizeof(double), result_bytes = uint64_t(d.rows) * sizeof(int64_t);
+        reserve(input_, bytes); reserve(output_, result_bytes); std::memcpy(input_.contents, scores, bytes);
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental VBx unconstrained argmax";
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:argmax_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:output_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(d.rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, argmax_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        const int64_t* result = static_cast<const int64_t*>(output_.contents);
+        for (uint32_t row = 0; row < d.rows; ++row) require(result[row] >= 0 && result[row] < d.columns, "double_vbx_argmax_result_invalid");
+        std::memcpy(output, result, result_bytes);
+        return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
     DoubleMetrics cosine_vbx(const double* embeddings, const double* centroids, CosineDimensions d, double* output, bool soft_scores = false) {
@@ -620,6 +642,13 @@ extern "C" int wxdouble_vbx_cosine_scores(void* context, const double* embedding
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->cosine_vbx(embeddings, centroids, {rows, count, features}, output, true); return 0; }
         catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_vbx_cosine_scores_failed"); return 1; }
+    }
+}
+extern "C" int wxdouble_vbx_argmax(void* context, const double* scores, uint32_t rows, uint32_t columns, int64_t* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->argmax_vbx(scores, {rows, columns}, output); return 0; }
+        catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_vbx_argmax_failed"); return 1; }
     }
 }
 extern "C" void wxdouble_destroy(void* context) { @autoreleasepool { delete static_cast<DoubleContext*>(context); } }
