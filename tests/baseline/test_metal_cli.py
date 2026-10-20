@@ -351,6 +351,28 @@ class MetalCLITests(unittest.TestCase):
             self.assertNotIn("private-secret", report.read_text())
             self.assertNotIn("private.wav", report.read_text())
 
+    def test_vbx_cosine_distances_capability_failure_restores_norm_scope_and_report_privacy(self):
+        import pyannote.audio.utils.vbx as vbx
+        original = vbx.l2_norm
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with patch("tools.baseline.mps_storage_probe.MPSCTC") as native, patch("tools.baseline.native_double.NativeDoubleNormalization") as double:
+                native.return_value.__enter__.return_value.identity = {}
+                native.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.identity = {}
+                double.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.library = SimpleNamespace(wxdouble_matmul=object())
+                with self.assertRaisesRegex(ValueError, "cosine_abi_unavailable"):
+                    main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--plda-normalization-library", "unused.dylib", "--plda-normalization-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--vbx-matrix-products", "--vbx-cosine-distances", "--hf_token", "private-secret"])
+            self.assertIs(vbx.l2_norm, original)
+            data = json.loads(report.read_text())
+            self.assertEqual(data["status"], "failed")
+            self.assertTrue(data["vbx_cosine_distances_requested"])
+            self.assertFalse(data["vbx_cosine_distances_observed"])
+            self.assertEqual(data["vbx_calls"], [])
+            self.assertNotIn("private-secret", report.read_text())
+            self.assertNotIn("private.wav", report.read_text())
+
     def test_vbx_statistics_flag_requires_matrix_products(self):
         with tempfile.TemporaryDirectory() as directory:
             report = Path(directory) / "report.json"
@@ -433,6 +455,13 @@ class MetalCLITests(unittest.TestCase):
             report = Path(directory) / "report.json"
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "audio.wav", "--diarize", "--vbx-centroids"])
+            self.assertFalse(report.exists())
+
+    def test_vbx_cosine_distances_requires_double_library(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "audio.wav", "--diarize", "--vbx-cosine-distances"])
             self.assertFalse(report.exists())
 
     def test_vbx_precompute_flag_requires_matrix_products(self):

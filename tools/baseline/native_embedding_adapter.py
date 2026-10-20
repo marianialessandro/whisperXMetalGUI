@@ -13,11 +13,12 @@ import numpy as np
 
 
 VBX_CALL_SHA256 = "8baf21775d7add4f8b666ab480470c2748592074541f1cfe32a400ed118540d7"
+CDIST_SHA256 = "eb769cabbc7d564024b480d426594d08aff4280675d887ddd5ba6a35b13905fa"
 _HOOK_LOCK = threading.RLock()
 _ACTIVE = False
 
 
-def compile_native_normalization(original, normalize, centroid=None):
+def compile_native_normalization(original, normalize, centroid=None, distance=None):
     source = textwrap.dedent(inspect.getsource(original))
     if hashlib.sha256(source.encode()).hexdigest() != VBX_CALL_SHA256 or original.__closure__:
         raise ValueError("embedding_vbx_source_not_supported")
@@ -32,11 +33,18 @@ def compile_native_normalization(original, normalize, centroid=None):
         if len(centroid_matches) != 1:
             raise ValueError("embedding_vbx_centroid_contract_changed")
         centroid_matches[0].value = ast.copy_location(ast.parse("__wx_native_centroids(W, train_embeddings.reshape(-1, dimension))").body[0].value, centroid_matches[0].value)
+    if distance is not None:
+        distance_expected = ast.parse('cdist(rearrange(embeddings, "c s d -> (c s) d"), centroids, metric=self.metric)').body[0].value
+        distance_matches = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.dump(node) == ast.dump(distance_expected)]
+        if len(distance_matches) != 1:
+            raise ValueError("embedding_vbx_distance_contract_changed")
+        distance_matches[0].func = ast.copy_location(ast.Name(id="__wx_native_cosine", ctx=ast.Load()), distance_matches[0].func)
     if normalize is not None:
         matches[0].value = ast.copy_location(ast.parse("__wx_native_embedding_normalize(train_embeddings)").body[0].value, matches[0].value)
     namespace = dict(original.__globals__)
     namespace["__wx_native_embedding_normalize"] = normalize
     namespace["__wx_native_centroids"] = centroid
+    namespace["__wx_native_cosine"] = distance
     ast.fix_missing_locations(tree)
     exec(compile(tree, "<WhisperX scoped native VBx normalization>", "exec"), namespace)
     candidate = namespace[tree.body[0].name]
@@ -45,7 +53,7 @@ def compile_native_normalization(original, normalize, centroid=None):
     return candidate
 
 
-def weighted_centroids(context, records, weights, features):
+def weighted_centroids(context, records, weights, features, distances=False):
     if type(weights) is not np.ndarray or weights.dtype != np.float64 or weights.ndim != 2 or not (weights.flags.c_contiguous or weights.flags.f_contiguous) or type(features) is not np.ndarray or features.dtype not in (np.dtype(np.float32), np.dtype(np.float64)) or features.ndim != 2:
         raise ValueError("vbx_centroid_operand_format_not_supported")
     frames, speakers = weights.shape
@@ -57,13 +65,30 @@ def weighted_centroids(context, records, weights, features):
     staged_features = np.ascontiguousarray(features, dtype=np.float64)
     output, record = context.centroids_vbx(staged_weights, staged_features, "pairwise" if column_contiguous or speakers == 1 else "sequential")
     record = dict(record)
-    record.update({"adapter_scope": "vbx_weighted_centroids_after_speaker_selection", "original_call_sha256": VBX_CALL_SHA256, "weight_layout": "F" if column_contiguous else "C" if weights.flags.c_contiguous else "strided", "host_weight_staging_copy_bytes": 0 if np.shares_memory(staged_weights, weights) else staged_weights.nbytes, "host_feature_staging_copy_bytes": 0 if staged_features is features else staged_features.nbytes, "feature_dtype_conversion": str(features.dtype) != "float64", "cpu_residuals": ["speaker_selection", "ahc", "optional_kmeans_centroids", "distance_and_constrained_assignment", "host_staging_and_control"]})
+    record.update({"adapter_scope": "vbx_weighted_centroids_after_speaker_selection", "original_call_sha256": VBX_CALL_SHA256, "weight_layout": "F" if column_contiguous else "C" if weights.flags.c_contiguous else "strided", "host_weight_staging_copy_bytes": 0 if np.shares_memory(staged_weights, weights) else staged_weights.nbytes, "host_feature_staging_copy_bytes": 0 if staged_features is features else staged_features.nbytes, "feature_dtype_conversion": str(features.dtype) != "float64", "cpu_residuals": ["speaker_selection", "ahc", "optional_kmeans_centroids", "constrained_assignment" if distances else "distance_and_constrained_assignment", "host_staging_and_control"]})
+    records.append(record)
+    return output
+
+
+def cosine_distances(context, records, embeddings, centroids, metric="cosine", native_centroids=False):
+    if metric != "cosine":
+        raise ValueError("vbx_cosine_metric_not_supported")
+    if any(type(value) is not np.ndarray or value.dtype not in (np.dtype(np.float32), np.dtype(np.float64)) or value.ndim != 2 for value in (embeddings, centroids)):
+        raise ValueError("vbx_cosine_operand_format_not_supported")
+    rows, features = embeddings.shape
+    count = centroids.shape[0]
+    if not 0 < rows <= 4096 or not 0 < count <= 1024 or not 0 < features <= 1024 or centroids.shape[1] != features or rows * count * features > 32 * 1024 * 1024:
+        raise ValueError("vbx_cosine_shape_not_supported")
+    staged_embeddings, staged_centroids = np.ascontiguousarray(embeddings, dtype=np.float64), np.ascontiguousarray(centroids, dtype=np.float64)
+    output, record = context.cosine_vbx(staged_embeddings, staged_centroids)
+    record = dict(record)
+    record.update({"adapter_scope": "vbx_embedding_to_centroid_cosine_distances", "original_call_sha256": VBX_CALL_SHA256, "scipy_cdist_sha256": CDIST_SHA256, "host_embedding_staging_copy_bytes": 0 if staged_embeddings is embeddings else staged_embeddings.nbytes, "host_centroid_staging_copy_bytes": 0 if staged_centroids is centroids else staged_centroids.nbytes, "embedding_dtype_conversion": str(embeddings.dtype) != "float64", "centroid_dtype_conversion": str(centroids.dtype) != "float64", "cpu_residuals": ["ahc", "optional_kmeans", "soft_score_subtraction", "constrained_assignment", "host_staging_and_control"] + ([] if native_centroids else ["weighted_centroids"])})
     records.append(record)
     return output
 
 
 @contextlib.contextmanager
-def native_embedding_normalization(context, records, centroid_context=None, centroid_records=None):
+def native_embedding_normalization(context, records, centroid_context=None, centroid_records=None, distance_context=None, distance_records=None):
     global _ACTIVE
     from pyannote.audio.pipelines.clustering import VBxClustering
 
@@ -79,7 +104,17 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
                 raise ValueError("vbx_centroid_numpy_not_supported")
             if getattr(centroid_context.library, "wxdouble_vbx_centroids", None) is None:
                 raise ValueError("double_vbx_centroid_abi_unavailable")
-        if context is None and centroid_context is None:
+        if distance_context is not None:
+            import scipy.spatial.distance as spatial_distance
+            if not isinstance(distance_records, list):
+                raise ValueError("vbx_cosine_records_required")
+            if np.__version__ != "2.2.6" or importlib.metadata.version("scipy") != "1.15.3":
+                raise ValueError("vbx_cosine_runtime_not_supported")
+            if getattr(distance_context.library, "wxdouble_vbx_cosine", None) is None:
+                raise ValueError("double_vbx_cosine_abi_unavailable")
+            if VBxClustering.__call__.__globals__.get("cdist") is not spatial_distance.cdist or hashlib.sha256(textwrap.dedent(inspect.getsource(spatial_distance.cdist)).encode()).hexdigest() != CDIST_SHA256:
+                raise ValueError("vbx_cosine_reference_not_supported")
+        if context is None and centroid_context is None and distance_context is None:
             raise ValueError("embedding_or_centroid_context_required")
         original = VBxClustering.__call__
         owner_thread = threading.get_ident()
@@ -94,9 +129,12 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
             return output
 
         def centroids(weights, features):
-            return weighted_centroids(centroid_context, centroid_records, weights, features)
+            return weighted_centroids(centroid_context, centroid_records, weights, features, distance_context is not None)
 
-        candidate = compile_native_normalization(original, normalize if context is not None else None, centroids if centroid_context is not None else None)
+        def distances(embeddings, centroids, metric):
+            return cosine_distances(distance_context, distance_records, embeddings, centroids, metric, centroid_context is not None)
+
+        candidate = compile_native_normalization(original, normalize if context is not None else None, centroids if centroid_context is not None else None, distances if distance_context is not None else None)
 
         @functools.wraps(original)
         def wrapped(*args, **kwargs):

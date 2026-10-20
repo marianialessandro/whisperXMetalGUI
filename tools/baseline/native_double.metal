@@ -481,3 +481,31 @@ struct OneHotDimensions { uint rows, columns; };
 kernel void double_vbx_one_hot(device const long* labels [[buffer(0)]], constant OneHotDimensions& d [[buffer(1)]], device ulong* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
     if (index < d.rows * d.columns) output[index] = labels[index / d.columns] == long(index % d.columns) ? 0x3ff0000000000000ul : 0;
 }
+
+struct CosineDimensions { uint rows, centroids, features; };
+
+// Cosine uses sequential squared norms and dot products with separately rounded binary64 arithmetic.
+kernel void double_vbx_cosine_norms(device const ulong* embeddings [[buffer(0)]], constant CosineDimensions& d [[buffer(1)]], device const ulong* centroids [[buffer(2)]], device ulong* norms [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index >= d.rows + d.centroids) return;
+    device const ulong* values = index < d.rows ? embeddings + index * d.features : centroids + (index - d.rows) * d.features;
+    ulong sum = 0, mask = (1ul << 63) - 1;
+    for (uint feature = 0; feature < d.features; ++feature) {
+        ulong value = values[feature] & mask;
+        if (value > 0x7ff0000000000000ul) { norms[index] = 0x7ff8000000000000ul; return; }
+        sum = add_positive_double(sum, multiply_positive_binary64(value, value));
+    }
+    norms[index] = sqrt_positive_binary64(sum);
+}
+
+// Undefined zero-norm or NaN pairs remain NaN; finite cosine values are clamped to [-1,1] before the final subtraction.
+kernel void double_vbx_cosine_distances(device const ulong* embeddings [[buffer(0)]], constant CosineDimensions& d [[buffer(1)]], device const ulong* centroids [[buffer(2)]], device const ulong* norms [[buffer(3)]], device ulong* output [[buffer(4)]], uint index [[thread_position_in_grid]]) {
+    if (index >= d.rows * d.centroids) return;
+    uint row = index / d.centroids, centroid = index % d.centroids;
+    ulong a = norms[row], b = norms[d.rows + centroid], one = 0x3ff0000000000000ul, sign = 1ul << 63;
+    if (a == 0 || b == 0 || a > 0x7ff0000000000000ul || b > 0x7ff0000000000000ul) { output[index] = 0x7ff8000000000000ul; return; }
+    ulong dot = 0;
+    for (uint feature = 0; feature < d.features; ++feature) dot = matrix_add(dot, df_mul(embeddings[row * d.features + feature], centroids[centroid * d.features + feature]));
+    ulong cosine = df_div(dot, multiply_positive_binary64(a, b));
+    if ((cosine & (sign - 1)) > one) cosine = one | (cosine & sign);
+    output[index] = df_sub(one, cosine);
+}
