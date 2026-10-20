@@ -19,7 +19,7 @@ import pyannote.audio.pipelines.clustering as clustering
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.baseline.native_double import NativeDoubleNormalization, build_library
 from tools.baseline.native_vbx_matrix import native_vbx_matrix_products
-from tools.baseline.native_vbx_qinit import compile_native_cluster, initial_softmax, initial_one_hot, native_vbx_qinit
+from tools.baseline.native_vbx_qinit import compile_native_cluster, initial_softmax, initial_one_hot, initial_resident_qinit, native_vbx_qinit
 
 
 @unittest.skipUnless(platform.system() == "Darwin" and torch.backends.mps.is_available(), "Apple Metal required")
@@ -229,6 +229,69 @@ class NativeVBXQinitTests(unittest.TestCase):
         changed = source.replace("ahc_init.astype(int)", "ahc_init.astype(np.int64)")
         with patch("tools.baseline.native_vbx_qinit.inspect.getsource", return_value=changed), patch("tools.baseline.native_vbx_qinit.CLUSTER_SHA256", hashlib.sha256(changed.encode()).hexdigest()), self.assertRaisesRegex(ValueError, "one_hot_expression_contract_changed"):
             compile_native_cluster(vbx.cluster_vbx, None, object(), one_hot=object())
+
+    def test_resident_initialization_primitive_exact_separate_policy_and_domains(self):
+        with self.context() as context:
+            for rows, columns in ((1, 1), (19, 3), (19, 129), (64, 1024), (4096, 1)):
+                labels = np.arange(rows, dtype=np.int64) % columns
+                labels.flags.writeable = False
+                one_hot, _ = context.one_hot_vbx(labels, columns)
+                for smoothing in (0., -0., 7., 60.):
+                    expected, _ = context.qinit_softmax_vbx(one_hot, smoothing)
+                    actual, record = context.qinit_from_labels_vbx(labels, columns, smoothing)
+                    np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+                    self.assertEqual(len(record["gpu_kernels"]), 3)
+                    self.assertEqual(record["command_buffers_per_run"], 1)
+                    self.assertEqual(record["logical_input_upload_bytes"], labels.nbytes)
+                    self.assertEqual(record["logical_one_hot_boundary_bytes_avoided"], 2 * one_hot.nbytes)
+                    self.assertLessEqual(record["allocated_shared_buffer_bytes"], 72 * 1024 * 1024 + 40 * 1024)
+            for labels, columns, smoothing in ((np.array([-1], np.int64), 3, 7.), (np.array([3], np.int64), 3, 7.), (np.zeros(65, np.int64), 1024, 7.), (np.zeros(4097, np.int64), 1, 7.), (np.zeros(3, np.int64), 3, -1.), (np.zeros(3, np.int64), 3, np.nan)):
+                with self.assertRaises(ValueError):
+                    context.qinit_from_labels_vbx(labels, columns, smoothing)
+            with patch.object(context, "library", SimpleNamespace()), self.assertRaisesRegex(ValueError, "resident_initialization_abi_unavailable"):
+                context.qinit_from_labels_vbx(np.zeros(3, np.int64), 3, 7.)
+        with self.assertRaisesRegex(ValueError, "closed"):
+            context.qinit_from_labels_vbx(np.zeros(3, np.int64), 3, 7.)
+
+    def test_resident_initialization_whole_cluster_and_negative_smoothing_bypass(self):
+        rng = np.random.default_rng(991)
+        features, phi, labels = rng.normal(scale=.3, size=(19, 8)), rng.uniform(.4, 2., 8), np.arange(19) % 3
+        with self.context() as context:
+            for smoothing in (-1., 0., 7.):
+                for iterations in (0, 3):
+                    with native_vbx_qinit(context, [], one_hot=True, one_hot_records=[]):
+                        expected = vbx.cluster_vbx(labels, features, phi, .07, .8, maxIters=iterations, init_smoothing=smoothing)
+                    one_hot_records, records = [], []
+                    with native_vbx_qinit(context, records, one_hot=True, one_hot_records=one_hot_records, resident_initialization=True):
+                        actual = clustering.cluster_vbx(labels, features, phi, .07, .8, maxIters=iterations, init_smoothing=smoothing)
+                    for left, right in zip(expected, actual):
+                        np.testing.assert_array_equal(left.view(np.uint64), right.view(np.uint64))
+                    self.assertEqual(len(one_hot_records), 1)
+                    self.assertEqual(len(records), int(smoothing >= 0))
+                    self.assertEqual(one_hot_records[0]["command_buffers_per_run"], int(smoothing < 0))
+                    if smoothing >= 0:
+                        self.assertEqual(one_hot_records[0]["shared_softmax_dispatch_index"], 0)
+                        self.assertTrue(records[0]["resident_initialization"])
+
+    def test_resident_initialization_configuration_source_fault_and_restore(self):
+        original = vbx.cluster_vbx
+        with self.context() as context:
+            with self.assertRaisesRegex(ValueError, "configuration_invalid"):
+                with native_vbx_qinit(context, [], resident_initialization=True):
+                    pass
+            with patch.object(context, "library", SimpleNamespace(wxdouble_vbx_one_hot=object(), wxdouble_vbx_qinit=object())), self.assertRaisesRegex(ValueError, "resident_initialization_abi_unavailable"):
+                with native_vbx_qinit(context, [], one_hot=True, one_hot_records=[], resident_initialization=True):
+                    pass
+            with self.assertRaisesRegex(ValueError, "injected_resident_initialization_failure"):
+                with native_vbx_qinit(context, (records := []), one_hot=True, one_hot_records=(one_hot_records := []), resident_initialization=True), patch.object(context, "qinit_from_labels_vbx", side_effect=ValueError("injected_resident_initialization_failure")):
+                    vbx.cluster_vbx(np.array([0, 2]), None, None, 1., 1.)
+            self.assertEqual(records, [])
+            self.assertEqual(one_hot_records, [])
+        self.assertIs(vbx.cluster_vbx, original)
+        self.assertIs(clustering.cluster_vbx, original)
+        changed = textwrap.dedent(inspect.getsource(original)).replace("init_smoothing < 0", "init_smoothing <= -1")
+        with patch("tools.baseline.native_vbx_qinit.inspect.getsource", return_value=changed), patch("tools.baseline.native_vbx_qinit.CLUSTER_SHA256", hashlib.sha256(changed.encode()).hexdigest()), self.assertRaisesRegex(ValueError, "resident_initialization_expression_contract_changed"):
+            compile_native_cluster(original, object(), object(), one_hot=object(), resident_initialize=object())
 
     def test_source_and_expression_pins_and_runtime(self):
         source = textwrap.dedent(inspect.getsource(vbx.cluster_vbx))

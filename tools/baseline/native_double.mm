@@ -349,6 +349,34 @@ public:
         return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
+    DoubleMetrics qinit_from_labels_vbx(const int64_t* labels, uint32_t rows, uint32_t columns, double smoothing, double* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(one_hot_pipeline_ != nil && qinit_pipeline_ != nil && initialization_pipeline_ != nil, "double_vbx_resident_initialization_kernel_unavailable");
+        uint64_t count = uint64_t(rows) * columns, bytes = count * sizeof(double);
+        require(rows > 0 && rows <= 4096 && columns > 0 && columns <= 1024 && count <= 65536 && labels != nullptr && output != nullptr, "double_vbx_resident_initialization_shape_or_pointer_invalid");
+        require(std::isfinite(smoothing) && smoothing >= 0 && smoothing <= 60 && (smoothing == 0 || smoothing >= 0x1p-200), "double_vbx_qinit_smoothing_domain_invalid");
+        for (uint32_t row = 0; row < rows; ++row) require(labels[row] >= 0 && labels[row] < columns, "double_vbx_one_hot_label_invalid");
+        auto started = std::chrono::steady_clock::now();
+        reserve(input_, bytes); reserve(output_, bytes); std::memcpy(input_.contents, labels, uint64_t(rows) * sizeof(int64_t));
+        OneHotDimensions one_hot = {rows, columns}; QinitDimensions qinit = {rows, columns, 0}; InitializationDimensions normalization = {rows, columns, 1, 0};
+        std::memcpy(&qinit.smoothing, &smoothing, sizeof(double));
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental resident cluster initialization";
+        auto encode = [&](id<MTLComputePipelineState> pipeline, id<MTLBuffer> source, const void* dimensions, uint64_t size, id<MTLBuffer> destination, uint64_t threads) {
+            id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+            [encoder setComputePipelineState:pipeline]; [encoder setBuffer:source offset:0 atIndex:0]; [encoder setBytes:dimensions length:size atIndex:1]; [encoder setBuffer:destination offset:0 atIndex:2];
+            [encoder dispatchThreads:MTLSizeMake(threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, pipeline.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        };
+        encode(one_hot_pipeline_, input_, &one_hot, sizeof(one_hot), output_, count);
+        encode(qinit_pipeline_, output_, &qinit, sizeof(qinit), input_, count);
+        encode(initialization_pipeline_, input_, &normalization, sizeof(normalization), output_, rows);
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        const double* result = static_cast<const double*>(output_.contents);
+        for (uint64_t index = 0; index < count; ++index) require(std::isfinite(result[index]) && result[index] >= 0 && result[index] <= 1, "double_vbx_resident_initialization_result_invalid");
+        std::memcpy(output, result, bytes);
+        return {1, 3, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
     DoubleMetrics argmax_vbx(const double* scores, ArgmaxDimensions d, int64_t* output) {
         std::lock_guard<std::mutex> guard(mutex_);
         require(argmax_pipeline_ != nil, "double_vbx_argmax_kernel_unavailable");
@@ -672,6 +700,13 @@ extern "C" int wxdouble_vbx_cosine_scores_argmax(void* context, const double* em
         }
         catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_vbx_resident_argmax_failed"); return 1; }
+    }
+}
+extern "C" int wxdouble_vbx_qinit_from_labels(void* context, const int64_t* labels, uint32_t rows, uint32_t columns, double smoothing, double* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->qinit_from_labels_vbx(labels, rows, columns, smoothing, output); return 0; }
+        catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_vbx_resident_initialization_failed"); return 1; }
     }
 }
 extern "C" void wxdouble_destroy(void* context) { @autoreleasepool { delete static_cast<DoubleContext*>(context); } }

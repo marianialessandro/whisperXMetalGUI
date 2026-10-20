@@ -27,6 +27,7 @@ extern "C" int wxdouble_vbx_cosine(void*, const double*, const double*, uint32_t
 extern "C" int wxdouble_vbx_cosine_scores(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_argmax(void*, const double*, uint32_t, uint32_t, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_cosine_scores_argmax(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, int64_t*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_vbx_qinit_from_labels(void*, const int64_t*, uint32_t, uint32_t, double, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -316,6 +317,15 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_cosine_scores_argmax(context, score_a, score_b, 4097, 1, 2, output, argmax_output, &metrics, error, sizeof(error)) != 0);
     assert(wxdouble_vbx_cosine_scores_argmax(context, invalid_cosine, score_b, 1, 1, 1, output, argmax_output, &metrics, error, sizeof(error)) != 0);
     assert(output[0] == 91. && argmax_output[0] == 92);
+    assert(wxdouble_vbx_qinit_from_labels(context, label, 1, 2, 0., output, &metrics, error, sizeof(error)) == 0 && output[0] == .5 && output[1] == .5 && metrics.kernels == 3);
+    output[0] = 91.; output[1] = 92.;
+    assert(wxdouble_vbx_qinit_from_labels(context, nullptr, 1, 2, 7., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_qinit_from_labels(context, label, 1, 2, 7., nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_qinit_from_labels(context, label, 1, 2, 7., output, nullptr, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_qinit_from_labels(context, label, 65, 1024, 7., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_qinit_from_labels(context, negative_label, 1, 2, 7., output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_qinit_from_labels(context, label, 1, 2, -1., output, &metrics, error, sizeof(error)) != 0);
+    assert(output[0] == 91. && output[1] == 92.);
     wxdouble_destroy(context);
     wxdouble_destroy(nullptr);
     std::string legacy_shader = shader.substr(0, shader.find("\nstruct MatrixDimensions"));
@@ -392,6 +402,7 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_centroids(context, one_hot, input, 1, 2, 1, 0, output, &metrics, error, sizeof(error)) == 0);
     output[0] = 91.;
     assert(wxdouble_vbx_one_hot(context, label, 1, 2, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
+    assert(wxdouble_vbx_qinit_from_labels(context, label, 1, 2, 7., output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
     wxdouble_destroy(context);
     std::string one_hot_shader = shader.substr(0, shader.find("\nstruct CosineDimensions"));
     assert(wxdouble_create(one_hot_shader.data(), one_hot_shader.size(), &context, error, sizeof(error)) == 0);
