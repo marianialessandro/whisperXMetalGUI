@@ -30,7 +30,7 @@ static_assert(sizeof(DoubleMetrics) == 32);
 class DoubleContext {
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
-    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_, cosine_norm_pipeline_, cosine_distance_pipeline_;
+    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_, cosine_norm_pipeline_, cosine_distance_pipeline_, cosine_score_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
     void reserve(id<MTLBuffer> __strong& buffer, uint64_t bytes) {
@@ -73,6 +73,8 @@ public:
         id<MTLFunction> lse_terms_function = [library newFunctionWithName:@"double_vbx_lse_terms"], lse_final_function = [library newFunctionWithName:@"double_vbx_lse_final"];
         if (lse_terms_function != nil) lse_terms_pipeline_ = [device_ newComputePipelineStateWithFunction:lse_terms_function error:&error];
         if (lse_final_function != nil) lse_final_pipeline_ = [device_ newComputePipelineStateWithFunction:lse_final_function error:&error];
+        id<MTLFunction> cosine_score_function = [library newFunctionWithName:@"double_vbx_cosine_scores"];
+        if (cosine_score_function != nil) cosine_score_pipeline_ = [device_ newComputePipelineStateWithFunction:cosine_score_function error:&error];
         id<MTLFunction> cosine_norm_function = [library newFunctionWithName:@"double_vbx_cosine_norms"], cosine_distance_function = [library newFunctionWithName:@"double_vbx_cosine_distances"];
         if (cosine_norm_function != nil) cosine_norm_pipeline_ = [device_ newComputePipelineStateWithFunction:cosine_norm_function error:&error];
         if (cosine_distance_function != nil) cosine_distance_pipeline_ = [device_ newComputePipelineStateWithFunction:cosine_distance_function error:&error];
@@ -344,9 +346,10 @@ public:
         return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
-    DoubleMetrics cosine_vbx(const double* embeddings, const double* centroids, CosineDimensions d, double* output) {
+    DoubleMetrics cosine_vbx(const double* embeddings, const double* centroids, CosineDimensions d, double* output, bool soft_scores = false) {
         std::lock_guard<std::mutex> guard(mutex_);
-        require(cosine_norm_pipeline_ != nil && cosine_distance_pipeline_ != nil, "double_vbx_cosine_kernel_unavailable");
+        id<MTLComputePipelineState> final_pipeline = soft_scores ? cosine_score_pipeline_ : cosine_distance_pipeline_;
+        require(cosine_norm_pipeline_ != nil && final_pipeline != nil, "double_vbx_cosine_kernel_unavailable");
         require(d.rows > 0 && d.rows <= 4096 && d.centroids > 0 && d.centroids <= 1024 && d.features > 0 && d.features <= 1024, "double_vbx_cosine_shape_invalid");
         uint64_t count = uint64_t(d.rows) * d.centroids, input_count = uint64_t(d.rows) * d.features, centroid_count = uint64_t(d.centroids) * d.features;
         require(count * d.features <= 32 * 1024 * 1024 && embeddings != nullptr && centroids != nullptr && output != nullptr, "double_vbx_cosine_work_or_pointer_invalid");
@@ -370,8 +373,8 @@ public:
         [encoder setComputePipelineState:cosine_norm_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:right_ offset:0 atIndex:2]; [encoder setBuffer:terms_ offset:0 atIndex:3];
         [encoder dispatchThreads:MTLSizeMake(d.rows + d.centroids, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, cosine_norm_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
         encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
-        [encoder setComputePipelineState:cosine_distance_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:right_ offset:0 atIndex:2]; [encoder setBuffer:terms_ offset:0 atIndex:3]; [encoder setBuffer:output_ offset:0 atIndex:4];
-        [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, cosine_distance_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        [encoder setComputePipelineState:final_pipeline]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:right_ offset:0 atIndex:2]; [encoder setBuffer:terms_ offset:0 atIndex:3]; [encoder setBuffer:output_ offset:0 atIndex:4];
+        [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, final_pipeline.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
         [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
         const double* result = static_cast<const double*>(output_.contents);
         for (uint32_t row = 0; row < d.rows; ++row) for (uint32_t centroid = 0; centroid < d.centroids; ++centroid) {
@@ -610,6 +613,13 @@ extern "C" int wxdouble_vbx_cosine(void* context, const double* embeddings, cons
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->cosine_vbx(embeddings, centroids, {rows, count, features}, output); return 0; }
         catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_vbx_cosine_failed"); return 1; }
+    }
+}
+extern "C" int wxdouble_vbx_cosine_scores(void* context, const double* embeddings, const double* centroids, uint32_t rows, uint32_t count, uint32_t features, double* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->cosine_vbx(embeddings, centroids, {rows, count, features}, output, true); return 0; }
+        catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_vbx_cosine_scores_failed"); return 1; }
     }
 }
 extern "C" void wxdouble_destroy(void* context) { @autoreleasepool { delete static_cast<DoubleContext*>(context); } }

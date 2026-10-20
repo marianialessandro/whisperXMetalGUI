@@ -24,6 +24,7 @@ extern "C" int wxdouble_vbx_qinit(void*, const double*, uint32_t, uint32_t, doub
 extern "C" int wxdouble_vbx_centroids(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_one_hot(void*, const int64_t*, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_cosine(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_vbx_cosine_scores(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -288,6 +289,12 @@ int main(int argc, char** argv) {
     double invalid_cosine[] = {std::numeric_limits<double>::infinity()};
     assert(wxdouble_vbx_cosine(context, invalid_cosine, input, 1, 1, 1, output, &metrics, error, sizeof(error)) != 0);
     assert(output[0] == 91. && output[1] == 92.);
+    double score_a[] = {1., 0.}, score_b[] = {-1., 0.};
+    assert(wxdouble_vbx_cosine_scores(context, score_a, score_b, 1, 1, 2, output, &metrics, error, sizeof(error)) == 0 && output[0] == 0. && metrics.kernels == 2);
+    assert(wxdouble_vbx_cosine_scores(context, score_a, score_a, 1, 1, 2, output, &metrics, error, sizeof(error)) == 0 && output[0] == 2.);
+    assert(wxdouble_vbx_cosine_scores(context, zeros, score_b, 1, 1, 2, output, &metrics, error, sizeof(error)) == 0 && std::isnan(output[0]));
+    output[0] = 91.;
+    assert(wxdouble_vbx_cosine_scores(context, score_a, score_b, 4097, 1, 2, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
     wxdouble_destroy(context);
     wxdouble_destroy(nullptr);
     std::string legacy_shader = shader.substr(0, shader.find("\nstruct MatrixDimensions"));
@@ -370,6 +377,12 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_one_hot(context, label, 1, 2, output, &metrics, error, sizeof(error)) == 0);
     output[0] = 91.;
     assert(wxdouble_vbx_cosine(context, input, input, 1, 1, 2, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
+    wxdouble_destroy(context);
+    std::string cosine_shader = shader.substr(0, shader.find("\n// Retain both separately rounded subtractions"));
+    assert(wxdouble_create(cosine_shader.data(), cosine_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_vbx_cosine(context, score_a, score_b, 1, 1, 2, output, &metrics, error, sizeof(error)) == 0);
+    output[0] = 91.;
+    assert(wxdouble_vbx_cosine_scores(context, score_a, score_b, 1, 1, 2, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
     wxdouble_destroy(context);
     std::string matrix_shader = shader.substr(0, shader.find("\nstruct ElementDimensions"));
     context = nullptr;

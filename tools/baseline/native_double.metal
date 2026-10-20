@@ -498,14 +498,25 @@ kernel void double_vbx_cosine_norms(device const ulong* embeddings [[buffer(0)]]
 }
 
 // Undefined zero-norm or NaN pairs remain NaN; finite cosine values are clamped to [-1,1] before the final subtraction.
-kernel void double_vbx_cosine_distances(device const ulong* embeddings [[buffer(0)]], constant CosineDimensions& d [[buffer(1)]], device const ulong* centroids [[buffer(2)]], device const ulong* norms [[buffer(3)]], device ulong* output [[buffer(4)]], uint index [[thread_position_in_grid]]) {
-    if (index >= d.rows * d.centroids) return;
+ulong cosine_distance_value(device const ulong* embeddings, constant CosineDimensions& d, device const ulong* centroids, device const ulong* norms, uint index) {
     uint row = index / d.centroids, centroid = index % d.centroids;
     ulong a = norms[row], b = norms[d.rows + centroid], one = 0x3ff0000000000000ul, sign = 1ul << 63;
-    if (a == 0 || b == 0 || a > 0x7ff0000000000000ul || b > 0x7ff0000000000000ul) { output[index] = 0x7ff8000000000000ul; return; }
+    if (a == 0 || b == 0 || a > 0x7ff0000000000000ul || b > 0x7ff0000000000000ul) { return 0x7ff8000000000000ul; }
     ulong dot = 0;
     for (uint feature = 0; feature < d.features; ++feature) dot = matrix_add(dot, df_mul(embeddings[row * d.features + feature], centroids[centroid * d.features + feature]));
     ulong cosine = df_div(dot, multiply_positive_binary64(a, b));
     if ((cosine & (sign - 1)) > one) cosine = one | (cosine & sign);
-    output[index] = df_sub(one, cosine);
+    return df_sub(one, cosine);
+}
+
+
+kernel void double_vbx_cosine_distances(device const ulong* embeddings [[buffer(0)]], constant CosineDimensions& d [[buffer(1)]], device const ulong* centroids [[buffer(2)]], device const ulong* norms [[buffer(3)]], device ulong* output [[buffer(4)]], uint index [[thread_position_in_grid]]) {
+    if (index < d.rows * d.centroids) output[index] = cosine_distance_value(embeddings, d, centroids, norms, index);
+}
+
+// Retain both separately rounded subtractions in 2 - (1 - cosine), with undefined pairs propagated before binary64 arithmetic.
+kernel void double_vbx_cosine_scores(device const ulong* embeddings [[buffer(0)]], constant CosineDimensions& d [[buffer(1)]], device const ulong* centroids [[buffer(2)]], device const ulong* norms [[buffer(3)]], device ulong* output [[buffer(4)]], uint index [[thread_position_in_grid]]) {
+    if (index >= d.rows * d.centroids) return;
+    ulong distance = cosine_distance_value(embeddings, d, centroids, norms, index);
+    output[index] = distance > 0x7ff0000000000000ul ? distance : df_sub(0x4000000000000000ul, distance);
 }

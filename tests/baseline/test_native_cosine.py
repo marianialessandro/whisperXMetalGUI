@@ -152,6 +152,65 @@ class NativeCosineTests(unittest.TestCase):
             self.assertEqual(records, [])
         self.assertIs(VBxClustering.__call__, original)
 
+    def test_fused_scores_keep_both_subtractions_bitwise_and_undefined_pairs(self):
+        rng = np.random.default_rng(1591)
+        with self.context() as context:
+            for rows, count, features in ((1, 1, 1), (19, 3, 8), (3, 7, 129), (2, 2, 1024)):
+                a, b = rng.normal(size=(rows, features)), rng.normal(size=(count, features))
+                a[0] = 0.
+                if rows > 1:
+                    a[1, 0] = np.nan
+                distances, _ = context.cosine_vbx(a, b)
+                actual, record = context.cosine_vbx(a, b, soft_scores=True)
+                expected = 2. - distances
+                np.testing.assert_array_equal(np.isnan(actual), np.isnan(expected))
+                finite = np.isfinite(actual)
+                np.testing.assert_array_equal(actual[finite].view(np.uint64), expected[finite].view(np.uint64))
+                self.assertEqual(record["result_kind"], "soft_scores")
+                self.assertEqual(record["gpu_kernels"], ["double_vbx_cosine_norms", "double_vbx_cosine_scores"])
+                self.assertEqual(record["logical_result_readback_bytes"], actual.nbytes)
+            with self.assertRaisesRegex(ValueError, "score_mode_invalid"):
+                context.cosine_vbx(np.ones((1, 2)), np.ones((1, 2)), soft_scores=1)
+            with patch.object(context, "library", SimpleNamespace(wxdouble_vbx_cosine=object())), self.assertRaisesRegex(ValueError, "score_abi_unavailable"):
+                context.cosine_vbx(np.ones((1, 2)), np.ones((1, 2)), soft_scores=True)
+
+    def test_fused_scores_complete_clustering_and_scoped_failures(self):
+        embeddings, instance, q = embedding_tests.NativeEmbeddingAdapterTests().fixture()
+        original = VBxClustering.__call__
+        norm = np.linalg.norm
+        normalization = SimpleNamespace(normalize=lambda values: (values / norm(values, axis=1, keepdims=True), {}))
+        with self.context() as context, patch("pyannote.audio.pipelines.clustering.cluster_vbx", return_value=(q, np.ones(3))):
+            for exact in (None, 2):
+                for mask in range(4):
+                    options = {"centroid_context": context if mask & 2 else None, "centroid_records": [], "distance_context": context, "distance_records": []}
+                    with native_embedding_normalization(normalization if mask & 1 else None, [], **options):
+                        expected = VBxClustering.__call__(instance, embeddings, min_clusters=1, max_clusters=10, num_clusters=exact)
+                    records = []
+                    options["distance_records"] = records
+                    with native_embedding_normalization(normalization if mask & 1 else None, [], soft_scores=True, **options):
+                        actual = VBxClustering.__call__(instance, embeddings, min_clusters=1, max_clusters=10, num_clusters=exact)
+                    for left, right in zip(expected, actual):
+                        np.testing.assert_array_equal(left.view(np.uint8), right.view(np.uint8))
+                    self.assertEqual(records[0]["result_kind"], "soft_scores")
+                    self.assertNotIn("soft_score_subtraction", records[0]["cpu_residuals"])
+            with self.assertRaisesRegex(ValueError, "require_cosine"):
+                with native_embedding_normalization(normalization, [], soft_scores=True):
+                    pass
+            with patch.object(context, "library", SimpleNamespace(wxdouble_vbx_cosine=object())), self.assertRaisesRegex(ValueError, "score_abi_unavailable"):
+                with native_embedding_normalization(None, [], distance_context=context, distance_records=[], soft_scores=True):
+                    pass
+            with self.assertRaisesRegex(ValueError, "injected_score_failure"):
+                with native_embedding_normalization(None, [], distance_context=context, distance_records=[], soft_scores=True), patch.object(context, "cosine_vbx", side_effect=ValueError("injected_score_failure")):
+                    VBxClustering.__call__(instance, embeddings, min_clusters=1, max_clusters=10)
+        self.assertIs(VBxClustering.__call__, original)
+
+    def test_fused_score_expression_and_single_consumer_pin(self):
+        original = VBxClustering.__call__
+        source = textwrap.dedent(inspect.getsource(original))
+        for changed in (source.replace("2 - e2k_distance", "2.0 - e2k_distance"), source.replace("soft_clusters = 2 - e2k_distance", "unused = e2k_distance\n    soft_clusters = 2 - e2k_distance")):
+            with patch("tools.baseline.native_embedding_adapter.inspect.getsource", return_value=changed), patch("tools.baseline.native_embedding_adapter.VBX_CALL_SHA256", hashlib.sha256(changed.encode()).hexdigest()), self.assertRaisesRegex(ValueError, "soft_score_contract_changed"):
+                compile_native_normalization(original, None, distance=object(), soft_scores=True)
+
     def test_scope_runtime_capability_and_expression_pins(self):
         with self.context() as context:
             with self.assertRaisesRegex(ValueError, "records_required"):
