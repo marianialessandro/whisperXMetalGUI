@@ -13,6 +13,43 @@ from tools.metal_cli import main, native_alignment
 
 
 class MetalCLITests(unittest.TestCase):
+    def test_clustering_cpu_audit_requires_diarization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "audio.wav", "--clustering-cpu-audit"])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertFalse(report.exists())
+
+    def test_clustering_cpu_audit_failure_keeps_observations_private_and_restores(self):
+        import numpy as np
+        import pyannote.audio.pipelines.clustering as clustering
+
+        def cli():
+            self.assertNotIn("--clustering-cpu-audit", sys.argv)
+            clustering.linear_sum_assignment(np.array([[1., 2.]]), maximize=True)
+            raise ValueError("private-secret-error")
+
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            original_argv = sys.argv
+            with patch("tools.baseline.mps_storage_probe.MPSCTC") as native, patch("tools.metal_cli.native_alignment", side_effect=lambda *a: contextlib.nullcontext()), patch("whisperx.__main__.cli", side_effect=cli):
+                native.return_value.__enter__.return_value.identity = {}
+                native.return_value.__enter__.return_value.initialization_wall_ns = 1
+                with self.assertRaisesRegex(ValueError, "private-secret-error"):
+                    main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--clustering-cpu-audit", "--hf_token", "private-token"])
+            data = json.loads(report.read_text())
+            self.assertEqual(data["status"], "failed")
+            self.assertTrue(data["clustering_cpu_audit_requested"])
+            self.assertTrue(data["clustering_cpu_audit_observed"])
+            self.assertTrue(data["clustering_cpu_audit_complete"])
+            self.assertEqual(data["clustering_cpu_api_calls"], 1)
+            self.assertEqual(len(data["clustering_cpu_api_observations"]), 4)
+            for private in ("private.wav", "private-token", "private-secret-error"):
+                self.assertNotIn(private, report.read_text())
+            self.assertIsNone(sys.getprofile())
+            self.assertIs(sys.argv, original_argv)
+
     def test_speaker_backend_requires_paired_hash_and_diarization(self):
         with tempfile.TemporaryDirectory() as directory:
             common = ["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(Path(directory) / "unused-report.json"), "audio.wav"]
@@ -690,6 +727,10 @@ class MetalCLITests(unittest.TestCase):
             self.assertEqual(data["status"], "failed")
             self.assertEqual(data["native_ctc_calls"], 0)
             self.assertFalse(data["full_pipeline_gpu_certified"])
+            self.assertFalse(data["clustering_cpu_audit_requested"])
+            self.assertFalse(data["clustering_cpu_audit_observed"])
+            self.assertFalse(data["clustering_cpu_audit_complete"])
+            self.assertEqual(data["clustering_cpu_api_observations"], [])
             self.assertNotIn("private-secret", text)
             self.assertNotIn("private.wav", text)
             with self.assertRaises(FileExistsError):

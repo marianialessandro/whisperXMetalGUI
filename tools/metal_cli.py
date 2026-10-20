@@ -59,6 +59,7 @@ def main(argv=None):
     parser.add_argument("--embedding-library-sha256", help="Expected SHA256 of the optional embedding-normalization dylib; clustering defaults remain unchanged.")
     parser.add_argument("--plda-normalization-library", type=Path, help="Optional native binary64 L2 normalization inside PLDA preprocessing; requires --diarize and its paired SHA256 flag. Matrix products remain original unless --plda-matrix-products is selected; model setup remains original.")
     parser.add_argument("--plda-normalization-library-sha256", help="Expected SHA256 of the binary64-normalization dylib; requires pyannote 4.0.4 and NumPy 2.2.6.")
+    parser.add_argument("--clustering-cpu-audit", action="store_true", help="Observe original AHC, KMeans and constrained-solver API calls on the current thread without replacing them; requires --diarize. Adds profiling overhead; reports inclusive wall time, not exclusive CPU time or GPU placement.")
     parser.add_argument("--vbx-constrained-nan-cleanup", action="store_true", help="Replace NaNs with the global finite minimum on Metal before constrained assignment; requires --plda-normalization-library and cleanup ABI. The original solver and all-NaN warning/error behavior remain.")
     parser.add_argument("--vbx-inactive-speaker-mask", action="store_true", help="Compute the global score minimum and inactive-speaker mask on Metal; requires --plda-normalization-library and inactive-mask ABI. Binary segmentation only; constrained solver remains original.")
     parser.add_argument("--vbx-resident-initialization", action="store_true", help="Keep the initial one-hot matrix resident through softmax; requires --vbx-initial-one-hot and --vbx-initial-softmax with fused ABI. Negative smoothing keeps the original one-hot bypass.")
@@ -99,6 +100,8 @@ def main(argv=None):
         parser.error("--plda-normalization-library and --plda-normalization-library-sha256 must be supplied together.")
     if args.plda_normalization_library and "--diarize" not in forwarded:
         parser.error("--plda-normalization-library requires --diarize.")
+    if args.clustering_cpu_audit and "--diarize" not in forwarded:
+        parser.error("--clustering-cpu-audit requires --diarize.")
     if args.vbx_constrained_nan_cleanup and not args.plda_normalization_library:
         parser.error("--vbx-constrained-nan-cleanup requires --plda-normalization-library and its SHA256.")
     if args.vbx_inactive_speaker_mask and not args.plda_normalization_library:
@@ -147,6 +150,8 @@ def main(argv=None):
         parser.error("--vbx-precomputed-terms requires --vbx-matrix-products.")
     report = {"schema_version": 1, "scope": "source_checkout_native_mps_ctc", "status": "failed", "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False, "resident_statistics": args.resident_statistics, "embedding_normalization_requested": bool(args.embedding_library), "plda_normalization_requested": bool(args.plda_normalization_library), "plda_matrix_products_requested": args.plda_matrix_products, "plda_centering_scaling_requested": args.plda_centering_scaling, "vbx_constrained_nan_cleanup_requested": args.vbx_constrained_nan_cleanup, "vbx_inactive_speaker_mask_requested": args.vbx_inactive_speaker_mask, "vbx_resident_initialization_requested": args.vbx_resident_initialization, "vbx_resident_argmax_requested": args.vbx_resident_argmax, "vbx_unconstrained_argmax_requested": args.vbx_unconstrained_argmax, "vbx_soft_scores_requested": args.vbx_soft_scores, "vbx_cosine_distances_requested": args.vbx_cosine_distances, "vbx_centroids_requested": args.vbx_centroids, "vbx_matrix_products_requested": args.vbx_matrix_products, "vbx_initial_one_hot_requested": args.vbx_initial_one_hot, "vbx_initial_softmax_requested": args.vbx_initial_softmax, "vbx_initialization_requested": args.vbx_initialization, "vbx_scalar_arithmetic_requested": args.vbx_scalar_arithmetic, "vbx_logsumexp_requested": args.vbx_logsumexp, "vbx_transcendentals_requested": args.vbx_transcendentals, "vbx_elbo_arithmetic_requested": args.vbx_elbo_arithmetic, "vbx_posterior_arithmetic_requested": args.vbx_posterior_arithmetic, "vbx_prior_updates_requested": args.vbx_prior_updates, "vbx_score_arithmetic_requested": args.vbx_score_arithmetic, "vbx_statistics_requested": args.vbx_statistics, "vbx_precomputed_terms_requested": args.vbx_precomputed_terms}
     records = {key: [] for key in ("ctc", "bounds", "means", "rounding", "interpolation", "speaker_assignment", "embedding_normalization", "plda_normalization", "plda_matrix_products", "plda_centering_scaling", "vbx_matrix_products", "vbx_precomputed_terms", "vbx_statistics", "vbx_score_arithmetic", "vbx_prior_updates", "vbx_posterior_arithmetic", "vbx_elbo_arithmetic", "vbx_transcendentals", "vbx_logsumexp", "vbx_scalar_arithmetic", "vbx_initialization", "vbx_initial_softmax", "vbx_centroids", "vbx_initial_one_hot", "vbx_cosine_distances", "vbx_unconstrained_argmax", "vbx_inactive_speaker_mask", "vbx_constrained_nan_cleanup")}
+    report["clustering_cpu_audit_requested"] = args.clustering_cpu_audit
+    cpu_audit_records = []
     vbx_calls = []
     with args.native_report.open("x", encoding="utf-8") as output:
         try:
@@ -167,6 +172,9 @@ def main(argv=None):
                     report["native_identity"] = context.identity
                     report["initialization_wall_ns"] = context.initialization_wall_ns
                     with contextlib.ExitStack() as scopes:
+                        if args.clustering_cpu_audit:
+                            from tools.baseline.clustering_cpu_audit import clustering_cpu_audit
+                            scopes.enter_context(clustering_cpu_audit(cpu_audit_records))
                         if args.plda_normalization_library:
                             from tools.baseline.native_double import NativeDoubleNormalization
                             from tools.baseline.native_plda_adapter import native_plda_normalization
@@ -208,6 +216,10 @@ def main(argv=None):
             finally:
                 sys.argv = original_argv
         finally:
+            report["clustering_cpu_api_observations"] = cpu_audit_records
+            report["clustering_cpu_api_calls"] = sum(item["calls_started"] for item in cpu_audit_records)
+            report["clustering_cpu_audit_observed"] = bool(report["clustering_cpu_api_calls"])
+            report["clustering_cpu_audit_complete"] = len(cpu_audit_records) == 4 and all(item["observation_complete"] for item in cpu_audit_records)
             report["operations"] = records
             report["native_ctc_calls"] = len(records["ctc"])
             report["native_vbx_constrained_cleanup_calls"] = len(records["vbx_constrained_nan_cleanup"])
