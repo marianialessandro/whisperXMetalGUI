@@ -414,31 +414,35 @@ class NativeDoubleNormalization:
             raise ValueError("double_vbx_argmax_native_result_invalid")
         return output, {"scope": "experimental_native_binary64_vbx_argmax", "rows": rows, "columns": columns, "comparison_policy": "first_nan_else_first_maximum_signed_zero_equal", "gpu_kernels": ["double_vbx_argmax"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": scores.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
-    def cosine_vbx(self, embeddings, centroids, soft_scores=False):
+    def cosine_vbx(self, embeddings, centroids, soft_scores=False, return_labels=False):
         if any(type(value) is not np.ndarray or value.dtype != np.float64 or value.ndim != 2 or not value.flags.c_contiguous for value in (embeddings, centroids)):
             raise ValueError("double_vbx_cosine_input_format_invalid")
-        if type(soft_scores) is not bool:
+        if type(soft_scores) is not bool or type(return_labels) is not bool or (return_labels and not soft_scores):
             raise ValueError("double_vbx_cosine_score_mode_invalid")
         rows, features = embeddings.shape
         count = centroids.shape[0]
         if not 0 < rows <= 4096 or not 0 < count <= 1024 or not 0 < features <= 1024 or centroids.shape[1] != features or rows * count * features > 32 * 1024 * 1024:
             raise ValueError("double_vbx_cosine_shape_invalid")
         output, metrics, error = np.empty((rows, count)), Metrics(), ct.create_string_buffer(128)
+        labels = np.empty(rows, dtype=np.int64) if return_labels else None
         with self.lock:
             if not self.context:
                 raise ValueError("double_context_closed")
             try:
-                native = self.library.wxdouble_vbx_cosine_scores if soft_scores else self.library.wxdouble_vbx_cosine
+                native = self.library.wxdouble_vbx_cosine_scores_argmax if return_labels else self.library.wxdouble_vbx_cosine_scores if soft_scores else self.library.wxdouble_vbx_cosine
             except AttributeError as failure:
-                raise ValueError("double_vbx_cosine_score_abi_unavailable" if soft_scores else "double_vbx_cosine_abi_unavailable") from failure
-            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+                raise ValueError("double_vbx_cosine_argmax_abi_unavailable" if return_labels else "double_vbx_cosine_score_abi_unavailable" if soft_scores else "double_vbx_cosine_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_void_p] + ([ct.c_void_p] if return_labels else []) + [ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
             native.restype = ct.c_int
             started = time.perf_counter_ns()
-            if native(self.context, embeddings.ctypes.data, centroids.ctypes.data, rows, count, features, output.ctypes.data, ct.byref(metrics), error, len(error)):
+            arguments = [self.context, embeddings.ctypes.data, centroids.ctypes.data, rows, count, features, output.ctypes.data] + ([labels.ctypes.data] if return_labels else []) + [ct.byref(metrics), error, len(error)]
+            if native(*arguments):
                 raise ValueError(error.value.decode("ascii"))
-        if metrics.version != 1 or metrics.kernels != 2 or np.isinf(output).any():
+        if metrics.version != 1 or metrics.kernels != (3 if return_labels else 2) or np.isinf(output).any():
             raise ValueError("double_vbx_cosine_native_result_invalid")
-        return output, {"scope": "experimental_native_binary64_vbx_cosine", "result_kind": "soft_scores" if soft_scores else "distances", "rows": rows, "centroids": count, "features": features, "undefined_pairs": int(np.isnan(output).sum()), "arithmetic_policy": "sequential_separately_rounded_binary64", "scipy_bitwise_certified": False, "gpu_kernels": ["double_vbx_cosine_norms", "double_vbx_cosine_scores" if soft_scores else "double_vbx_cosine_distances"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": embeddings.nbytes + centroids.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+        if return_labels and ((labels < 0).any() or (labels >= count).any()):
+            raise ValueError("double_vbx_argmax_native_result_invalid")
+        return (output, labels) if return_labels else output, {"scope": "experimental_native_binary64_vbx_cosine", "resident_argmax": return_labels, "result_kind": "soft_scores" if soft_scores else "distances", "rows": rows, "centroids": count, "features": features, "undefined_pairs": int(np.isnan(output).sum()), "arithmetic_policy": "sequential_separately_rounded_binary64", "scipy_bitwise_certified": False, "gpu_kernels": ["double_vbx_cosine_norms", "double_vbx_cosine_scores" if soft_scores else "double_vbx_cosine_distances"] + (["double_vbx_argmax"] if return_labels else []), "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": embeddings.nbytes + centroids.nbytes, "logical_result_readback_bytes": output.nbytes + (labels.nbytes if return_labels else 0), "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
     def one_hot_vbx(self, labels, columns):
         if type(labels) is not np.ndarray or labels.dtype != np.int64 or labels.ndim != 1 or not labels.flags.c_contiguous:

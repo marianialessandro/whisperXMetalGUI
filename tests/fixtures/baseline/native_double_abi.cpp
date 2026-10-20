@@ -26,6 +26,7 @@ extern "C" int wxdouble_vbx_one_hot(void*, const int64_t*, uint32_t, uint32_t, d
 extern "C" int wxdouble_vbx_cosine(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_cosine_scores(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_argmax(void*, const double*, uint32_t, uint32_t, int64_t*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_vbx_cosine_scores_argmax(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -307,6 +308,14 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_argmax(context, input, 4097, 2, argmax_output, &metrics, error, sizeof(error)) != 0);
     assert(wxdouble_vbx_argmax(context, input, 1, 1025, argmax_output, &metrics, error, sizeof(error)) != 0);
     assert(wxdouble_vbx_argmax(context, input, 1, 0, argmax_output, &metrics, error, sizeof(error)) != 0 && argmax_output[0] == 91);
+    assert(wxdouble_vbx_cosine_scores_argmax(context, score_a, score_b, 1, 1, 2, output, argmax_output, &metrics, error, sizeof(error)) == 0 && output[0] == 0. && argmax_output[0] == 0 && metrics.kernels == 3);
+    output[0] = 91.; argmax_output[0] = 92;
+    assert(wxdouble_vbx_cosine_scores_argmax(context, score_a, score_b, 1, 1, 2, output, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_cosine_scores_argmax(context, score_a, score_b, 1, 1, 2, nullptr, argmax_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_cosine_scores_argmax(context, score_a, score_b, 1, 1, 2, output, reinterpret_cast<int64_t*>(output), &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_cosine_scores_argmax(context, score_a, score_b, 4097, 1, 2, output, argmax_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_cosine_scores_argmax(context, invalid_cosine, score_b, 1, 1, 1, output, argmax_output, &metrics, error, sizeof(error)) != 0);
+    assert(output[0] == 91. && argmax_output[0] == 92);
     wxdouble_destroy(context);
     wxdouble_destroy(nullptr);
     std::string legacy_shader = shader.substr(0, shader.find("\nstruct MatrixDimensions"));
@@ -401,6 +410,7 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_cosine_scores(context, score_a, score_b, 1, 1, 2, output, &metrics, error, sizeof(error)) == 0);
     argmax_output[0] = 91;
     assert(wxdouble_vbx_argmax(context, input, 1, 2, argmax_output, &metrics, error, sizeof(error)) != 0 && argmax_output[0] == 91);
+    assert(wxdouble_vbx_cosine_scores_argmax(context, score_a, score_b, 1, 1, 2, output, argmax_output, &metrics, error, sizeof(error)) != 0 && argmax_output[0] == 91);
     wxdouble_destroy(context);
     std::string matrix_shader = shader.substr(0, shader.find("\nstruct ElementDimensions"));
     context = nullptr;

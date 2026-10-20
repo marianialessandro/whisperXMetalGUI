@@ -18,10 +18,12 @@ _HOOK_LOCK = threading.RLock()
 _ACTIVE = False
 
 
-def compile_native_normalization(original, normalize, centroid=None, distance=None, soft_scores=False, argmax=None):
+def compile_native_normalization(original, normalize, centroid=None, distance=None, soft_scores=False, argmax=None, resident_argmax=False):
     source = textwrap.dedent(inspect.getsource(original))
     if hashlib.sha256(source.encode()).hexdigest() != VBX_CALL_SHA256 or original.__closure__:
         raise ValueError("embedding_vbx_source_not_supported")
+    if resident_argmax and (not soft_scores or argmax is None or distance is None):
+        raise ValueError("vbx_resident_argmax_configuration_invalid")
     tree = ast.parse(source)
     expected = ast.parse("train_embeddings_normed = train_embeddings / np.linalg.norm(train_embeddings, axis=1, keepdims=True)").body[0]
     matches = [node for node in ast.walk(tree) if isinstance(node, ast.Assign) and ast.dump(node) == ast.dump(expected)]
@@ -51,6 +53,8 @@ def compile_native_normalization(original, normalize, centroid=None, distance=No
         distance_matches = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.dump(node) == ast.dump(distance_expected)]
         if len(distance_matches) != 1:
             raise ValueError("embedding_vbx_distance_contract_changed")
+        if resident_argmax:
+            distance_matches[0].keywords.append(ast.keyword(arg="constrained_assignment", value=ast.Name(id="constrained_assignment", ctx=ast.Load())))
         distance_matches[0].func = ast.copy_location(ast.Name(id="__wx_native_cosine", ctx=ast.Load()), distance_matches[0].func)
     if normalize is not None:
         matches[0].value = ast.copy_location(ast.parse("__wx_native_embedding_normalize(train_embeddings)").body[0].value, matches[0].value)
@@ -84,7 +88,7 @@ def weighted_centroids(context, records, weights, features, distances=False):
     return output
 
 
-def cosine_distances(context, records, embeddings, centroids, metric="cosine", native_centroids=False, soft_scores=False):
+def cosine_distances(context, records, embeddings, centroids, metric="cosine", native_centroids=False, soft_scores=False, return_labels=False):
     if metric != "cosine":
         raise ValueError("vbx_cosine_metric_not_supported")
     if any(type(value) is not np.ndarray or value.dtype not in (np.dtype(np.float32), np.dtype(np.float64)) or value.ndim != 2 for value in (embeddings, centroids)):
@@ -94,7 +98,7 @@ def cosine_distances(context, records, embeddings, centroids, metric="cosine", n
     if not 0 < rows <= 4096 or not 0 < count <= 1024 or not 0 < features <= 1024 or centroids.shape[1] != features or rows * count * features > 32 * 1024 * 1024:
         raise ValueError("vbx_cosine_shape_not_supported")
     staged_embeddings, staged_centroids = np.ascontiguousarray(embeddings, dtype=np.float64), np.ascontiguousarray(centroids, dtype=np.float64)
-    output, record = context.cosine_vbx(staged_embeddings, staged_centroids, soft_scores=soft_scores)
+    output, record = context.cosine_vbx(staged_embeddings, staged_centroids, soft_scores=soft_scores, return_labels=return_labels)
     record = dict(record)
     record.update({"adapter_scope": "vbx_embedding_to_centroid_cosine_distances", "original_call_sha256": VBX_CALL_SHA256, "scipy_cdist_sha256": CDIST_SHA256, "host_embedding_staging_copy_bytes": 0 if staged_embeddings is embeddings else staged_embeddings.nbytes, "host_centroid_staging_copy_bytes": 0 if staged_centroids is centroids else staged_centroids.nbytes, "embedding_dtype_conversion": str(embeddings.dtype) != "float64", "centroid_dtype_conversion": str(centroids.dtype) != "float64", "cpu_residuals": ["ahc", "optional_kmeans", "constrained_assignment", "host_staging_and_control"] + ([] if native_centroids else ["weighted_centroids"]) + ([] if soft_scores else ["soft_score_subtraction"])})
     records.append(record)
@@ -117,7 +121,7 @@ def unconstrained_argmax(context, records, scores):
 
 
 @contextlib.contextmanager
-def native_embedding_normalization(context, records, centroid_context=None, centroid_records=None, distance_context=None, distance_records=None, soft_scores=False, argmax_context=None, argmax_records=None):
+def native_embedding_normalization(context, records, centroid_context=None, centroid_records=None, distance_context=None, distance_records=None, soft_scores=False, argmax_context=None, argmax_records=None, resident_argmax=False):
     global _ACTIVE
     from pyannote.audio.pipelines.clustering import VBxClustering
 
@@ -133,6 +137,10 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
                 raise ValueError("vbx_centroid_numpy_not_supported")
             if getattr(centroid_context.library, "wxdouble_vbx_centroids", None) is None:
                 raise ValueError("double_vbx_centroid_abi_unavailable")
+        if type(resident_argmax) is not bool or (resident_argmax and (not soft_scores or argmax_context is None or argmax_context is not distance_context)):
+            raise ValueError("vbx_resident_argmax_configuration_invalid")
+        if resident_argmax and getattr(distance_context.library, "wxdouble_vbx_cosine_scores_argmax", None) is None:
+            raise ValueError("double_vbx_cosine_argmax_abi_unavailable")
         if argmax_context is not None:
             if not isinstance(argmax_records, list):
                 raise ValueError("vbx_argmax_records_required")
@@ -158,6 +166,7 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
             raise ValueError("embedding_or_centroid_context_required")
         original = VBxClustering.__call__
         owner_thread = threading.get_ident()
+        pending_labels = None
 
         def normalize(embeddings):
             output, record = context.normalize(embeddings)
@@ -171,19 +180,42 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
         def centroids(weights, features):
             return weighted_centroids(centroid_context, centroid_records, weights, features, distance_context is not None)
 
-        def distances(embeddings, centroids, metric):
-            return cosine_distances(distance_context, distance_records, embeddings, centroids, metric, centroid_context is not None, soft_scores)
+        def distances(embeddings, centroids, metric, constrained_assignment=False):
+            nonlocal pending_labels
+            resident = resident_argmax and not constrained_assignment
+            result = cosine_distances(distance_context, distance_records, embeddings, centroids, metric, centroid_context is not None, soft_scores, resident)
+            if resident:
+                output, labels = result
+                pending_labels = (output, labels, len(distance_records) - 1)
+                return output
+            pending_labels = None
+            return result
 
         def assign(scores):
+            nonlocal pending_labels
+            if resident_argmax:
+                if pending_labels is None:
+                    raise ValueError("vbx_resident_argmax_cache_missing")
+                output, labels, dispatch = pending_labels
+                if type(scores) is not np.ndarray or scores.ndim != 3 or scores.shape[0] * scores.shape[1] != labels.size or scores.shape[2] != output.shape[1] or not np.shares_memory(scores, output):
+                    raise ValueError("vbx_resident_argmax_cache_mismatch")
+                pending_labels = None
+                argmax_records.append({"adapter_scope": "vbx_unconstrained_assignment", "original_call_sha256": VBX_CALL_SHA256, "resident_label_reuse": True, "shared_cosine_dispatch_index": dispatch, "gpu_kernels": ["double_vbx_argmax"], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "host_input_staging_copy_bytes": 0, "rows": labels.size, "columns": output.shape[1], "quality_certified": False, "full_pipeline_gpu_certified": False})
+                return labels.reshape(scores.shape[:2])
             return unconstrained_argmax(argmax_context, argmax_records, scores)
 
-        candidate = compile_native_normalization(original, normalize if context is not None else None, centroids if centroid_context is not None else None, distances if distance_context is not None else None, soft_scores=soft_scores, argmax=assign if argmax_context is not None else None)
+        candidate = compile_native_normalization(original, normalize if context is not None else None, centroids if centroid_context is not None else None, distances if distance_context is not None else None, soft_scores=soft_scores, argmax=assign if argmax_context is not None else None, resident_argmax=resident_argmax)
 
         @functools.wraps(original)
         def wrapped(*args, **kwargs):
+            nonlocal pending_labels
             if threading.get_ident() != owner_thread:
                 return original(*args, **kwargs)
-            return candidate(*args, **kwargs)
+            pending_labels = None
+            try:
+                return candidate(*args, **kwargs)
+            finally:
+                pending_labels = None
 
         _ACTIVE = True
         VBxClustering.__call__ = wrapped
