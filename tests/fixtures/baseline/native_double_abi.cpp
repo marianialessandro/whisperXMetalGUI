@@ -28,6 +28,7 @@ extern "C" int wxdouble_vbx_cosine_scores(void*, const double*, const double*, u
 extern "C" int wxdouble_vbx_argmax(void*, const double*, uint32_t, uint32_t, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_cosine_scores_argmax(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_qinit_from_labels(void*, const int64_t*, uint32_t, uint32_t, double, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_vbx_inactive_mask(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -326,6 +327,17 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_qinit_from_labels(context, negative_label, 1, 2, 7., output, &metrics, error, sizeof(error)) != 0);
     assert(wxdouble_vbx_qinit_from_labels(context, label, 1, 2, -1., output, &metrics, error, sizeof(error)) != 0);
     assert(output[0] == 91. && output[1] == 92.);
+    double mask_scores[] = {1., 2.}, inactive_segments[] = {0.};
+    assert(wxdouble_vbx_inactive_mask(context, mask_scores, inactive_segments, 1, 2, 1, output, &metrics, error, sizeof(error)) == 0 && output[0] == 0. && output[1] == 0. && metrics.kernels == 2);
+    assert(wxdouble_vbx_inactive_mask(context, mask_scores, inactive_segments, 1, 2, 1, mask_scores, &metrics, error, sizeof(error)) == 0 && mask_scores[0] == 0.);
+    output[0] = 91.; output[1] = 92.;
+    assert(wxdouble_vbx_inactive_mask(context, nullptr, inactive_segments, 1, 2, 1, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_inactive_mask(context, input, nullptr, 1, 2, 1, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_inactive_mask(context, input, inactive_segments, 1, 2, 1, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_inactive_mask(context, input, inactive_segments, 1, 2, 1, output, nullptr, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_inactive_mask(context, input, inactive_segments, 4097, 2, 1, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_inactive_mask(context, input, inactive_segments, 4096, 2, 4096, output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_vbx_inactive_mask(context, input, inactive_segments, 1, 2, 1, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91. && output[1] == 92.);
     wxdouble_destroy(context);
     wxdouble_destroy(nullptr);
     std::string legacy_shader = shader.substr(0, shader.find("\nstruct MatrixDimensions"));
@@ -422,6 +434,12 @@ int main(int argc, char** argv) {
     argmax_output[0] = 91;
     assert(wxdouble_vbx_argmax(context, input, 1, 2, argmax_output, &metrics, error, sizeof(error)) != 0 && argmax_output[0] == 91);
     assert(wxdouble_vbx_cosine_scores_argmax(context, score_a, score_b, 1, 1, 2, output, argmax_output, &metrics, error, sizeof(error)) != 0 && argmax_output[0] == 91);
+    wxdouble_destroy(context);
+    std::string pre_mask_shader = shader.substr(0, shader.find("\nstruct InactiveDimensions"));
+    assert(wxdouble_create(pre_mask_shader.data(), pre_mask_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_vbx_qinit_from_labels(context, label, 1, 2, 0., output, &metrics, error, sizeof(error)) == 0);
+    output[0] = 91.;
+    assert(wxdouble_vbx_inactive_mask(context, mask_scores, inactive_segments, 1, 2, 1, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
     wxdouble_destroy(context);
     std::string matrix_shader = shader.substr(0, shader.find("\nstruct ElementDimensions"));
     context = nullptr;

@@ -18,7 +18,7 @@ _HOOK_LOCK = threading.RLock()
 _ACTIVE = False
 
 
-def compile_native_normalization(original, normalize, centroid=None, distance=None, soft_scores=False, argmax=None, resident_argmax=False):
+def compile_native_normalization(original, normalize, centroid=None, distance=None, soft_scores=False, argmax=None, resident_argmax=False, inactive=None):
     source = textwrap.dedent(inspect.getsource(original))
     if hashlib.sha256(source.encode()).hexdigest() != VBX_CALL_SHA256 or original.__closure__:
         raise ValueError("embedding_vbx_source_not_supported")
@@ -35,6 +35,20 @@ def compile_native_normalization(original, normalize, centroid=None, distance=No
         if len(centroid_matches) != 1:
             raise ValueError("embedding_vbx_centroid_contract_changed")
         centroid_matches[0].value = ast.copy_location(ast.parse("__wx_native_centroids(W, train_embeddings.reshape(-1, dimension))").body[0].value, centroid_matches[0].value)
+    if inactive is not None:
+        const_expected = ast.parse("const = soft_clusters.min() - 1.").body[0]
+        mask_expected = ast.parse("soft_clusters[segmentations.data.sum(1) == 0] = const").body[0]
+        const_matches = [node for node in ast.walk(tree) if isinstance(node, ast.Assign) and ast.dump(node) == ast.dump(const_expected)]
+        mask_matches = [node for node in ast.walk(tree) if isinstance(node, ast.Assign) and ast.dump(node) == ast.dump(mask_expected)]
+        const_loads = [node for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id == "const" and isinstance(node.ctx, ast.Load)]
+        if len(const_matches) != 1 or len(mask_matches) != 1 or len(const_loads) != 1:
+            raise ValueError("embedding_vbx_inactive_contract_changed")
+        const_matches[0].targets = [ast.Name(id="soft_clusters", ctx=ast.Store())]
+        const_matches[0].value = ast.parse("__wx_native_inactive(soft_clusters, segmentations.data)").body[0].value
+        class RemoveMask(ast.NodeTransformer):
+            def visit_Assign(self, node):
+                return None if node is mask_matches[0] else self.generic_visit(node)
+        tree = RemoveMask().visit(tree)
     if argmax is not None:
         argmax_expected = ast.parse("hard_clusters = np.argmax(soft_clusters, axis=2)").body[0]
         argmax_matches = [node for node in ast.walk(tree) if isinstance(node, ast.Assign) and ast.dump(node) == ast.dump(argmax_expected)]
@@ -63,6 +77,7 @@ def compile_native_normalization(original, normalize, centroid=None, distance=No
     namespace["__wx_native_centroids"] = centroid
     namespace["__wx_native_cosine"] = distance
     namespace["__wx_native_argmax"] = argmax
+    namespace["__wx_native_inactive"] = inactive
     ast.fix_missing_locations(tree)
     exec(compile(tree, "<WhisperX scoped native VBx normalization>", "exec"), namespace)
     candidate = namespace[tree.body[0].name]
@@ -120,8 +135,24 @@ def unconstrained_argmax(context, records, scores):
     return output.reshape(chunks, local_speakers)
 
 
+def inactive_speaker_mask(context, records, scores, segments):
+    if type(scores) is not np.ndarray or scores.dtype != np.float64 or scores.ndim != 3 or type(segments) is not np.ndarray or segments.ndim != 3 or segments.dtype.kind not in "biuf" or segments.dtype.itemsize > 8:
+        raise ValueError("vbx_inactive_operand_format_not_supported")
+    chunks, speakers, columns = scores.shape
+    rows, frames = chunks * speakers, segments.shape[1]
+    if not 0 < rows <= 4096 or not 0 < columns <= 1024 or not 0 < frames <= 4096 or segments.shape[0] != chunks or segments.shape[2] != speakers or rows * frames > 1024 * 1024:
+        raise ValueError("vbx_inactive_shape_not_supported")
+    staged_scores = np.ascontiguousarray(scores).reshape(rows, columns)
+    staged_segments = np.ascontiguousarray(segments.transpose(0, 2, 1), dtype=np.float64).reshape(rows, frames)
+    output, record = context.inactive_mask_vbx(staged_scores, staged_segments)
+    record = dict(record)
+    record.update({"adapter_scope": "vbx_constrained_inactive_speaker_preparation", "original_call_sha256": VBX_CALL_SHA256, "segment_source_dtype": str(segments.dtype), "host_score_staging_copy_bytes": 0 if np.shares_memory(staged_scores, scores) else staged_scores.nbytes, "host_segment_staging_copy_bytes": 0 if np.shares_memory(staged_segments, segments) else staged_segments.nbytes, "cpu_residuals": ["constrained_nan_replacement_and_solver", "ahc", "optional_kmeans", "host_staging_and_control"]})
+    records.append(record)
+    return output.reshape(scores.shape)
+
+
 @contextlib.contextmanager
-def native_embedding_normalization(context, records, centroid_context=None, centroid_records=None, distance_context=None, distance_records=None, soft_scores=False, argmax_context=None, argmax_records=None, resident_argmax=False):
+def native_embedding_normalization(context, records, centroid_context=None, centroid_records=None, distance_context=None, distance_records=None, soft_scores=False, argmax_context=None, argmax_records=None, resident_argmax=False, inactive_context=None, inactive_records=None):
     global _ACTIVE
     from pyannote.audio.pipelines.clustering import VBxClustering
 
@@ -137,6 +168,13 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
                 raise ValueError("vbx_centroid_numpy_not_supported")
             if getattr(centroid_context.library, "wxdouble_vbx_centroids", None) is None:
                 raise ValueError("double_vbx_centroid_abi_unavailable")
+        if inactive_context is not None:
+            if not isinstance(inactive_records, list):
+                raise ValueError("vbx_inactive_records_required")
+            if np.__version__ != "2.2.6":
+                raise ValueError("vbx_inactive_runtime_not_supported")
+            if getattr(inactive_context.library, "wxdouble_vbx_inactive_mask", None) is None:
+                raise ValueError("double_vbx_inactive_abi_unavailable")
         if type(resident_argmax) is not bool or (resident_argmax and (not soft_scores or argmax_context is None or argmax_context is not distance_context)):
             raise ValueError("vbx_resident_argmax_configuration_invalid")
         if resident_argmax and getattr(distance_context.library, "wxdouble_vbx_cosine_scores_argmax", None) is None:
@@ -162,7 +200,7 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
                 raise ValueError("double_vbx_cosine_abi_unavailable")
             if VBxClustering.__call__.__globals__.get("cdist") is not spatial_distance.cdist or hashlib.sha256(textwrap.dedent(inspect.getsource(spatial_distance.cdist)).encode()).hexdigest() != CDIST_SHA256:
                 raise ValueError("vbx_cosine_reference_not_supported")
-        if context is None and centroid_context is None and distance_context is None and argmax_context is None:
+        if context is None and centroid_context is None and distance_context is None and argmax_context is None and inactive_context is None:
             raise ValueError("embedding_or_centroid_context_required")
         original = VBxClustering.__call__
         owner_thread = threading.get_ident()
@@ -204,7 +242,10 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
                 return labels.reshape(scores.shape[:2])
             return unconstrained_argmax(argmax_context, argmax_records, scores)
 
-        candidate = compile_native_normalization(original, normalize if context is not None else None, centroids if centroid_context is not None else None, distances if distance_context is not None else None, soft_scores=soft_scores, argmax=assign if argmax_context is not None else None, resident_argmax=resident_argmax)
+        def mask_inactive(scores, segments):
+            return inactive_speaker_mask(inactive_context, inactive_records, scores, segments)
+
+        candidate = compile_native_normalization(original, normalize if context is not None else None, centroids if centroid_context is not None else None, distances if distance_context is not None else None, soft_scores=soft_scores, argmax=assign if argmax_context is not None else None, resident_argmax=resident_argmax, inactive=mask_inactive if inactive_context is not None else None)
 
         @functools.wraps(original)
         def wrapped(*args, **kwargs):

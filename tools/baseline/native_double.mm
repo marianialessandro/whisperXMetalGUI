@@ -19,6 +19,7 @@ struct ElboDimensions { uint32_t rows, columns, operation, column_order; uint64_
 static_assert(sizeof(ElboDimensions) == 32);
 struct TranscendentalDimensions { uint32_t count, operation; };
 struct LogSumExpDimensions { uint32_t rows, columns, sequential; };
+struct InactiveDimensions { uint32_t rows, columns, frames, blocks; };
 struct ArgmaxDimensions { uint32_t rows, columns; };
 struct CosineDimensions { uint32_t rows, centroids, features; };
 struct OneHotDimensions { uint32_t rows, columns; };
@@ -31,7 +32,7 @@ static_assert(sizeof(DoubleMetrics) == 32);
 class DoubleContext {
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
-    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_, cosine_norm_pipeline_, cosine_distance_pipeline_, cosine_score_pipeline_, argmax_pipeline_;
+    id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_, cosine_norm_pipeline_, cosine_distance_pipeline_, cosine_score_pipeline_, argmax_pipeline_, minimum_pipeline_, inactive_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
     void reserve(id<MTLBuffer> __strong& buffer, uint64_t bytes) {
@@ -74,6 +75,9 @@ public:
         id<MTLFunction> lse_terms_function = [library newFunctionWithName:@"double_vbx_lse_terms"], lse_final_function = [library newFunctionWithName:@"double_vbx_lse_final"];
         if (lse_terms_function != nil) lse_terms_pipeline_ = [device_ newComputePipelineStateWithFunction:lse_terms_function error:&error];
         if (lse_final_function != nil) lse_final_pipeline_ = [device_ newComputePipelineStateWithFunction:lse_final_function error:&error];
+        id<MTLFunction> minimum_function = [library newFunctionWithName:@"double_vbx_score_min_partials"], inactive_function = [library newFunctionWithName:@"double_vbx_inactive_mask"];
+        if (minimum_function != nil) minimum_pipeline_ = [device_ newComputePipelineStateWithFunction:minimum_function error:&error];
+        if (inactive_function != nil) inactive_pipeline_ = [device_ newComputePipelineStateWithFunction:inactive_function error:&error];
         id<MTLFunction> argmax_function = [library newFunctionWithName:@"double_vbx_argmax"];
         if (argmax_function != nil) argmax_pipeline_ = [device_ newComputePipelineStateWithFunction:argmax_function error:&error];
         id<MTLFunction> cosine_score_function = [library newFunctionWithName:@"double_vbx_cosine_scores"];
@@ -346,6 +350,32 @@ public:
         [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
         for (uint32_t row = 0; row < d.rows; ++row) require(std::isfinite(static_cast<const double*>(terms_.contents)[row]), "double_vbx_logsumexp_shift_domain_invalid");
         std::memcpy(output, terms_.contents, uint64_t(d.rows) * sizeof(double));
+        return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
+    DoubleMetrics inactive_mask_vbx(const double* scores, const double* segments, uint32_t rows, uint32_t columns, uint32_t frames, double* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(minimum_pipeline_ != nil && inactive_pipeline_ != nil, "double_vbx_inactive_kernel_unavailable");
+        require(rows > 0 && rows <= 4096 && columns > 0 && columns <= 1024 && frames > 0 && frames <= 4096 && uint64_t(rows) * frames <= 1024 * 1024 && scores != nullptr && segments != nullptr && output != nullptr, "double_vbx_inactive_shape_or_pointer_invalid");
+        uint64_t count = uint64_t(rows) * columns, segment_count = uint64_t(rows) * frames;
+        for (uint64_t index = 0; index < count; ++index) require(std::isnan(scores[index]) || (std::isfinite(scores[index]) && scores[index] >= 0 && scores[index] <= 2), "double_vbx_inactive_score_domain_invalid");
+        for (uint64_t index = 0; index < segment_count; ++index) require(segments[index] == 0 || segments[index] == 1, "double_vbx_inactive_binary_segments_required");
+        InactiveDimensions d = {rows, columns, frames, uint32_t((count + 1023) / 1024)};
+        auto started = std::chrono::steady_clock::now();
+        reserve(input_, count * sizeof(double)); reserve(right_, segment_count * sizeof(double)); reserve(output_, count * sizeof(double)); reserve(terms_, uint64_t(d.blocks) * sizeof(double));
+        std::memcpy(input_.contents, scores, count * sizeof(double)); std::memcpy(right_.contents, segments, segment_count * sizeof(double));
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental inactive speaker mask";
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:minimum_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:terms_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(d.blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, minimum_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:inactive_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:right_ offset:0 atIndex:2]; [encoder setBuffer:terms_ offset:0 atIndex:3]; [encoder setBuffer:output_ offset:0 atIndex:4];
+        [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, inactive_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        const double* result = static_cast<const double*>(output_.contents);
+        for (uint64_t index = 0; index < count; ++index) require(std::isnan(result[index]) || (std::isfinite(result[index]) && result[index] >= -1 && result[index] <= 2), "double_vbx_inactive_result_invalid");
+        std::memcpy(output, result, count * sizeof(double));
         return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
@@ -707,6 +737,13 @@ extern "C" int wxdouble_vbx_qinit_from_labels(void* context, const int64_t* labe
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->qinit_from_labels_vbx(labels, rows, columns, smoothing, output); return 0; }
         catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_vbx_resident_initialization_failed"); return 1; }
+    }
+}
+extern "C" int wxdouble_vbx_inactive_mask(void* context, const double* scores, const double* segments, uint32_t rows, uint32_t columns, uint32_t frames, double* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->inactive_mask_vbx(scores, segments, rows, columns, frames, output); return 0; }
+        catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_vbx_inactive_failed"); return 1; }
     }
 }
 extern "C" void wxdouble_destroy(void* context) { @autoreleasepool { delete static_cast<DoubleContext*>(context); } }

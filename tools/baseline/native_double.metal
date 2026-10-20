@@ -542,3 +542,37 @@ kernel void double_vbx_argmax(device const ulong* scores [[buffer(0)]], constant
     }
     output[row] = long(winner);
 }
+
+struct InactiveDimensions { uint rows, columns, frames, blocks; };
+
+// Scores are bounded nonnegative values or NaN, so integer magnitudes preserve finite minimum comparisons.
+kernel void double_vbx_score_min_partials(device const ulong* scores [[buffer(0)]], constant InactiveDimensions& d [[buffer(1)]], device ulong* partials [[buffer(2)]], uint block [[thread_position_in_grid]]) {
+    if (block >= d.blocks) return;
+    uint end = min((block + 1) * 1024, d.rows * d.columns);
+    ulong value = 0x4000000000000000ul;
+    for (uint index = block * 1024; index < end; ++index) {
+        ulong candidate = scores[index] & ((1ul << 63) - 1);
+        if (candidate > 0x7ff0000000000000ul) { value = 0x7ff8000000000000ul; break; }
+        value = min(value, candidate);
+    }
+    partials[block] = value;
+}
+
+// Binary segmentation has zero sum exactly when every frame is zero, including negative zero.
+kernel void double_vbx_inactive_mask(device const ulong* scores [[buffer(0)]], constant InactiveDimensions& d [[buffer(1)]], device const ulong* segments [[buffer(2)]], device const ulong* partials [[buffer(3)]], device ulong* output [[buffer(4)]], uint row [[thread_position_in_grid]]) {
+    if (row >= d.rows) return;
+    bool active = false;
+    for (uint frame = 0; frame < d.frames; ++frame) if ((segments[row * d.frames + frame] & ((1ul << 63) - 1)) != 0) { active = true; break; }
+    ulong replacement = 0;
+    if (!active) {
+        ulong minimum = 0x4000000000000000ul;
+        for (uint block = 0; block < d.blocks; ++block) {
+            ulong value = partials[block];
+            if (value > 0x7ff0000000000000ul) { minimum = 0x7ff8000000000000ul; break; }
+            minimum = min(minimum, value);
+        }
+        // Subtracting one rounds to negative one at or below 2^-54, including subnormal minima.
+        replacement = minimum > 0x7ff0000000000000ul ? minimum : minimum <= 0x3c90000000000000ul ? 0xbff0000000000000ul : df_sub(minimum, 0x3ff0000000000000ul);
+    }
+    for (uint column = 0; column < d.columns; ++column) output[row * d.columns + column] = active ? scores[row * d.columns + column] : replacement;
+}

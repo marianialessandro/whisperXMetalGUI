@@ -417,6 +417,28 @@ class MetalCLITests(unittest.TestCase):
             self.assertNotIn("private-secret", report.read_text())
             self.assertNotIn("private.wav", report.read_text())
 
+    def test_vbx_inactive_speaker_mask_capability_failure_restores_norm_scope_and_report_privacy(self):
+        import pyannote.audio.utils.vbx as vbx
+        original = vbx.l2_norm
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with patch("tools.baseline.mps_storage_probe.MPSCTC") as native, patch("tools.baseline.native_double.NativeDoubleNormalization") as double:
+                native.return_value.__enter__.return_value.identity = {}
+                native.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.identity = {}
+                double.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.library = SimpleNamespace(wxdouble_matmul=object())
+                with self.assertRaisesRegex(ValueError, "inactive_abi_unavailable"):
+                    main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--plda-normalization-library", "unused.dylib", "--plda-normalization-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--vbx-matrix-products", "--vbx-inactive-speaker-mask", "--hf_token", "private-secret"])
+            self.assertIs(vbx.l2_norm, original)
+            data = json.loads(report.read_text())
+            self.assertEqual(data["status"], "failed")
+            self.assertTrue(data["vbx_inactive_speaker_mask_requested"])
+            self.assertFalse(data["vbx_inactive_speaker_mask_observed"])
+            self.assertEqual(data["vbx_calls"], [])
+            self.assertNotIn("private-secret", report.read_text())
+            self.assertNotIn("private.wav", report.read_text())
+
     def test_vbx_resident_argmax_capability_failure_restores_norm_scope_and_report_privacy(self):
         import pyannote.audio.utils.vbx as vbx
         original = vbx.l2_norm
@@ -564,6 +586,13 @@ class MetalCLITests(unittest.TestCase):
             report = Path(directory) / "report.json"
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "audio.wav", "--diarize", "--vbx-unconstrained-argmax"])
+            self.assertFalse(report.exists())
+
+    def test_vbx_inactive_speaker_mask_requires_double_library(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "audio.wav", "--diarize", "--vbx-inactive-speaker-mask"])
             self.assertFalse(report.exists())
 
     def test_vbx_resident_argmax_requires_both_stages(self):
