@@ -42,6 +42,7 @@ extern "C" int wxdouble_kmeans_candidate_search(void*, const float*, const doubl
 extern "C" int wxdouble_kmeans_best_candidate(void*, const float*, uint32_t, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_linear_assignment_max(void*, const double*, uint32_t, uint32_t, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_assignment_batch(void*, const double*, uint32_t, uint32_t, uint32_t, int8_t*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_inactive_assignment(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, uint32_t, double*, int8_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -57,6 +58,42 @@ int main(int argc, char** argv) {
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    double resident_scores[] = {1, 2, 0, 2, 1, 0}, resident_segments[] = {1, 0, 0, 0}, resident_masked[] = {91, 92, 93, 94, 95, 96};
+    int8_t resident_labels[] = {91, 92};
+    assert(wxdouble_inactive_assignment(context, resident_scores, resident_segments, 1, 2, 3, 2, resident_masked, resident_labels, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 5 && resident_labels[0] == 1 && resident_labels[1] == 0 && resident_masked[3] == -1.);
+    resident_masked[0] = 91; resident_labels[0] = 91;
+    assert(wxdouble_inactive_assignment(nullptr, resident_scores, resident_segments, 1, 2, 3, 2, resident_masked, resident_labels, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_inactive_assignment(context, nullptr, resident_segments, 1, 2, 3, 2, resident_masked, resident_labels, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_inactive_assignment(context, resident_scores, nullptr, 1, 2, 3, 2, resident_masked, resident_labels, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_inactive_assignment(context, resident_scores, resident_segments, 1, 2, 3, 2, nullptr, resident_labels, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_inactive_assignment(context, resident_scores, resident_segments, 1, 2, 3, 2, resident_masked, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_inactive_assignment(context, resident_scores, resident_segments, 1, 2, 3, 2, resident_masked, resident_labels, nullptr, error, sizeof(error)) != 0);
+    assert(wxdouble_inactive_assignment(context, resident_scores, resident_segments, 1, 2, 3, 2, resident_masked, reinterpret_cast<int8_t*>(resident_masked) + 1, &metrics, error, sizeof(error)) != 0);
+    for (uint32_t dimension = 0; dimension < 4; ++dimension) {
+        uint32_t dimensions[] = {1, 2, 3, 2}; dimensions[dimension] = 0;
+        assert(wxdouble_inactive_assignment(context, resident_scores, resident_segments, dimensions[0], dimensions[1], dimensions[2], dimensions[3], resident_masked, resident_labels, &metrics, error, sizeof(error)) != 0);
+    }
+    assert(wxdouble_inactive_assignment(context, resident_scores, resident_segments, 2049, 2, 1, 2, resident_masked, resident_labels, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_inactive_assignment(context, resident_scores, resident_segments, 1, 17, 17, 2, resident_masked, resident_labels, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_inactive_assignment(context, resident_scores, resident_segments, 1, 2, 3, 4097, resident_masked, resident_labels, &metrics, error, sizeof(error)) != 0);
+    assert(resident_masked[0] == 91 && resident_labels[0] == 91);
+    for (double invalid : {-1., 0x1p-65, 3., std::numeric_limits<double>::infinity()}) {
+        resident_scores[0] = invalid;
+        assert(wxdouble_inactive_assignment(context, resident_scores, resident_segments, 1, 2, 3, 2, resident_masked, resident_labels, &metrics, error, sizeof(error)) != 0 && resident_masked[0] == 91 && resident_labels[0] == 91);
+    }
+    resident_scores[0] = std::numeric_limits<double>::quiet_NaN();
+    resident_segments[0] = 0;
+    assert(wxdouble_inactive_assignment(context, resident_scores, resident_segments, 1, 2, 3, 2, resident_masked, resident_labels, &metrics, error, sizeof(error)) != 0 && std::string(error) == "double_inactive_assignment_all_nan_input" && resident_masked[0] == 91 && resident_labels[0] == 91);
+    resident_scores[0] = 1; resident_segments[0] = .5;
+    assert(wxdouble_inactive_assignment(context, resident_scores, resident_segments, 1, 2, 3, 2, resident_masked, resident_labels, &metrics, error, sizeof(error)) != 0 && resident_masked[0] == 91 && resident_labels[0] == 91);
+    resident_segments[0] = 1;
+    alignas(double) unsigned char resident_unaligned_scores[sizeof(resident_scores) + 1], resident_unaligned_segments[sizeof(resident_segments) + 1], resident_unaligned_masked[sizeof(resident_scores) + 1];
+    std::memcpy(resident_unaligned_scores + 1, resident_scores, sizeof(resident_scores)); std::memcpy(resident_unaligned_segments + 1, resident_segments, sizeof(resident_segments));
+    assert(wxdouble_inactive_assignment(context, reinterpret_cast<double*>(resident_unaligned_scores + 1), reinterpret_cast<double*>(resident_unaligned_segments + 1), 1, 2, 3, 2, reinterpret_cast<double*>(resident_unaligned_masked + 1), resident_labels, &metrics, error, sizeof(error)) == 0);
+    std::memcpy(resident_masked, resident_unaligned_masked + 1, sizeof(resident_masked));
+    assert(resident_masked[0] == 1 && resident_masked[3] == -1 && resident_labels[0] == 1);
+    assert(wxdouble_inactive_assignment(context, resident_scores, resident_segments, 1, 2, 3, 2, resident_scores, reinterpret_cast<int8_t*>(resident_segments), &metrics, error, sizeof(error)) == 0 && resident_scores[3] == -1.);
+
     double batch_scores[] = {1, 2, 0, 2, 1, 0, std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN()};
     int8_t batch_labels[] = {91, 92, 93, 94};
     assert(wxdouble_assignment_batch(context, batch_scores, 2, 2, 3, batch_labels, &metrics, error, sizeof(error)) == 0 && batch_labels[0] == 1 && batch_labels[1] == 0 && batch_labels[2] == 0 && batch_labels[3] == 1 && metrics.kernels == 3);
@@ -763,6 +800,14 @@ int main(int argc, char** argv) {
     assert(wxdouble_linear_assignment_max(context, legacy_assignment_scores, 2, 3, assignment_output, &metrics, error, sizeof(error)) == 0 && assignment_output[2] == 2);
     batch_labels[0] = 91;
     assert(wxdouble_assignment_batch(context, batch_scores, 2, 2, 3, batch_labels, &metrics, error, sizeof(error)) != 0 && batch_labels[0] == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_resident_shader = shader.substr(0, shader.find("\n// Retain masked scores for the public VBx result"));
+    assert(wxdouble_create(pre_resident_shader.data(), pre_resident_shader.size(), &context, error, sizeof(error)) == 0);
+    double resident_old_scores[] = {1, 2, 0, 2, 1, 0}, resident_old_segments[] = {1, 0, 0, 0};
+    assert(wxdouble_assignment_batch(context, resident_old_scores, 1, 2, 3, batch_labels, &metrics, error, sizeof(error)) == 0);
+    resident_labels[0] = 91; resident_masked[0] = 91;
+    assert(wxdouble_inactive_assignment(context, resident_old_scores, resident_old_segments, 1, 2, 3, 2, resident_masked, resident_labels, &metrics, error, sizeof(error)) != 0 && resident_labels[0] == 91 && resident_masked[0] == 91);
     wxdouble_destroy(context);
 
 }

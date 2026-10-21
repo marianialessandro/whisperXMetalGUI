@@ -537,6 +537,31 @@ class NativeDoubleNormalization:
             raise ValueError("double_vbx_one_hot_native_result_invalid")
         return output, {"scope": "experimental_native_binary64_vbx_one_hot", "operation": "initial_one_hot", "rows": rows, "columns": columns, "gpu_kernels": ["double_vbx_one_hot"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": labels.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
+    def inactive_assignment(self, scores, segments):
+        if any(type(value) is not np.ndarray or value.dtype != np.float64 or value.ndim != 3 or not value.flags.c_contiguous for value in (scores, segments)):
+            raise ValueError("double_inactive_assignment_input_format_invalid")
+        chunks, rows, columns = scores.shape
+        frames = segments.shape[2]
+        if not 0 < chunks <= 4096 or not 0 < rows <= 64 or not 0 < columns <= 64 or min(rows, columns) > 16 or chunks * rows > 4096 or segments.shape[:2] != (chunks, rows) or not 0 < frames <= 4096 or segments.size > 1024 * 1024:
+            raise ValueError("double_inactive_assignment_shape_invalid")
+        masked, labels = np.empty_like(scores), np.empty((chunks, rows), dtype=np.int8)
+        metrics, error = Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_inactive_assignment
+            except AttributeError as failure:
+                raise ValueError("double_inactive_assignment_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, scores.ctypes.data, segments.ctypes.data, chunks, rows, columns, frames, masked.ctypes.data, labels.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 5 or np.isinf(masked).any() or np.any((labels != -2) & ((labels < 0) | (labels >= columns))):
+            raise ValueError("double_inactive_assignment_native_result_invalid")
+        return (labels, masked), {"scope": "experimental_native_resident_inactive_and_constrained_assignment", "chunks": chunks, "rows": rows, "columns": columns, "frames": frames, "logical_assignment_matrices": chunks, "gpu_kernels": ["double_vbx_score_min_partials", "double_vbx_inactive_mask", "double_vbx_nan_min_partials", "double_vbx_nan_cleanup", "double_inactive_assignment_batch"], "gpu_blit_encoders": 1, "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": scores.nbytes + segments.nbytes, "logical_result_readback_bytes": masked.nbytes + labels.nbytes + chunks * 4, "logical_public_soft_score_readback_bytes": masked.nbytes, "logical_status_readback_bytes": chunks * 4, "intermediate_score_readback_bytes": 0, "assignment_pair_readback_bytes": 0, "host_numeric_label_scatter": False, "physical_copy_bytes": None, "nan_payload_certified": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+
     def assignment_batch(self, scores):
         if type(scores) is not np.ndarray or scores.dtype != np.float64 or scores.ndim != 3 or not scores.flags.c_contiguous:
             raise ValueError("double_assignment_batch_operand_format_invalid")

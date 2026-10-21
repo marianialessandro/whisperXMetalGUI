@@ -13,6 +13,37 @@ from tools.metal_cli import main, native_alignment
 
 
 class MetalCLITests(unittest.TestCase):
+    def test_vbx_resident_assignment_requires_library_and_rejects_standalone_flags(self):
+        for extra in ([], ["--vbx-inactive-speaker-mask"], ["--vbx-constrained-nan-cleanup"], ["--vbx-constrained-assignment"], ["--vbx-batched-assignment"]):
+            with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stderr(io.StringIO()):
+                report = Path(directory) / "report.json"
+                with self.assertRaises(SystemExit) as caught:
+                    main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--vbx-resident-assignment", *extra])
+                self.assertEqual(caught.exception.code, 2)
+                self.assertFalse(report.exists())
+
+    def test_vbx_resident_assignment_capability_failure_restores_scope_and_privacy(self):
+        from pyannote.audio.pipelines.clustering import VBxClustering
+        original = VBxClustering.__call__
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with patch("tools.baseline.mps_storage_probe.MPSCTC") as native, patch("tools.baseline.native_double.NativeDoubleNormalization") as double:
+                native.return_value.__enter__.return_value.identity = {}
+                native.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.identity = {}
+                double.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.library = SimpleNamespace()
+                with self.assertRaisesRegex(ValueError, "inactive_assignment_abi_unavailable"):
+                    main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--plda-normalization-library", "unused.dylib", "--plda-normalization-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--vbx-resident-assignment", "--hf_token", "private-secret"])
+            data = json.loads(report.read_text())
+            self.assertTrue(data["vbx_resident_assignment_requested"])
+            self.assertFalse(data["vbx_resident_assignment_observed"])
+            self.assertEqual(data["native_vbx_resident_assignment_calls"], 0)
+            self.assertEqual(data["vbx_resident_assignment_matrices"], 0)
+            self.assertIs(VBxClustering.__call__, original)
+            self.assertNotIn("private.wav", report.read_text())
+            self.assertNotIn("private-secret", report.read_text())
+
     def test_vbx_batched_assignment_requires_library_and_excludes_standalone_modes(self):
         for extra in ([], ["--vbx-constrained-nan-cleanup"], ["--vbx-constrained-nan-cleanup", "--vbx-constrained-assignment"]):
             with tempfile.TemporaryDirectory() as directory:

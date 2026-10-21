@@ -888,3 +888,20 @@ kernel void double_assignment_batch(device const ulong* scores [[buffer(0)]], co
     uint matched = min(d.rows, d.columns);
     for (uint i = 0; i < matched; ++i) hard_labels[chunk * d.rows + uint(pairs[i])] = char(pairs[matched + i]);
 }
+
+
+// Retain masked scores for the public VBx result while assignments consume the cleaned resident copy.
+kernel void double_inactive_assignment_batch(device const ulong* scores [[buffer(0)]], constant AssignmentBatchDimensions& d [[buffer(1)]], device char* hard_labels [[buffer(2)]], device uint* status [[buffer(3)]], device const ulong* partials [[buffer(4)]], constant CleanupDimensions& cleanup [[buffer(5)]], uint chunk [[thread_position_in_grid]]) {
+    if (chunk >= d.chunks) return;
+    bool any_finite = false;
+    for (uint block = 0; block < cleanup.blocks; ++block) if (partials[block] != 0x7ff0000000000000ul) { any_finite = true; break; }
+    if (!any_finite) { status[chunk] = 2; return; }
+    long pairs[32];
+    AssignmentDimensions matrix = {d.rows, d.columns};
+    bool solved = assignment_solve(scores + ulong(chunk) * d.rows * d.columns, matrix, pairs);
+    status[chunk] = solved ? 0u : 1u;
+    if (!solved) return;
+    for (uint row = 0; row < d.rows; ++row) hard_labels[chunk * d.rows + row] = char(-2);
+    uint matched = min(d.rows, d.columns);
+    for (uint i = 0; i < matched; ++i) hard_labels[chunk * d.rows + uint(pairs[i])] = char(pairs[matched + i]);
+}

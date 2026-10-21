@@ -19,7 +19,7 @@ _HOOK_LOCK = threading.RLock()
 _ACTIVE = False
 
 
-def compile_native_normalization(original, normalize, centroid=None, distance=None, soft_scores=False, argmax=None, resident_argmax=False, inactive=None, kmeans_centroid=None):
+def compile_native_normalization(original, normalize, centroid=None, distance=None, soft_scores=False, argmax=None, resident_argmax=False, inactive=None, kmeans_centroid=None, resident_assignment=None):
     source = textwrap.dedent(inspect.getsource(original))
     if hashlib.sha256(source.encode()).hexdigest() != VBX_CALL_SHA256 or original.__closure__:
         raise ValueError("embedding_vbx_source_not_supported")
@@ -42,6 +42,14 @@ def compile_native_normalization(original, normalize, centroid=None, distance=No
         if len(kmeans_matches) != 1:
             raise ValueError("embedding_vbx_kmeans_centroid_contract_changed")
         kmeans_matches[0].value = ast.parse("__wx_native_kmeans_centroids(train_embeddings, kmeans_clusters, num_clusters)").body[0].value
+    if resident_assignment is not None:
+        if inactive is not None:
+            raise ValueError("vbx_resident_assignment_configuration_invalid")
+        expected_body = ast.parse("const = soft_clusters.min() - 1.\nsoft_clusters[segmentations.data.sum(1) == 0] = const\nhard_clusters = self.constrained_argmax(soft_clusters)").body
+        branches = [node for node in ast.walk(tree) if isinstance(node, ast.If) and ast.dump(node.test) == ast.dump(ast.Name(id="constrained_assignment", ctx=ast.Load()))]
+        if len(branches) != 1 or len(branches[0].body) != len(expected_body) or any(ast.dump(a) != ast.dump(b) for a, b in zip(branches[0].body, expected_body)):
+            raise ValueError("vbx_resident_assignment_expression_contract_changed")
+        branches[0].body = ast.parse("hard_clusters, soft_clusters = __wx_resident_assignment(self, soft_clusters, segmentations.data)").body
     if inactive is not None:
         const_expected = ast.parse("const = soft_clusters.min() - 1.").body[0]
         mask_expected = ast.parse("soft_clusters[segmentations.data.sum(1) == 0] = const").body[0]
@@ -85,6 +93,7 @@ def compile_native_normalization(original, normalize, centroid=None, distance=No
     namespace["__wx_native_cosine"] = distance
     namespace["__wx_native_argmax"] = argmax
     namespace["__wx_native_inactive"] = inactive
+    namespace["__wx_resident_assignment"] = resident_assignment
     namespace["__wx_native_kmeans_centroids"] = kmeans_centroid
     ast.fix_missing_locations(tree)
     exec(compile(tree, "<WhisperX scoped native VBx normalization>", "exec"), namespace)
@@ -176,7 +185,7 @@ def inactive_speaker_mask(context, records, scores, segments):
 
 
 @contextlib.contextmanager
-def native_embedding_normalization(context, records, centroid_context=None, centroid_records=None, distance_context=None, distance_records=None, soft_scores=False, argmax_context=None, argmax_records=None, resident_argmax=False, inactive_context=None, inactive_records=None, kmeans_context=None, kmeans_records=None):
+def native_embedding_normalization(context, records, centroid_context=None, centroid_records=None, distance_context=None, distance_records=None, soft_scores=False, argmax_context=None, argmax_records=None, resident_argmax=False, inactive_context=None, inactive_records=None, kmeans_context=None, kmeans_records=None, resident_assignment_context=None, resident_assignment_records=None):
     global _ACTIVE
     from pyannote.audio.pipelines.clustering import VBxClustering
 
@@ -202,6 +211,22 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
                 raise ValueError("vbx_centroid_numpy_not_supported")
             if getattr(centroid_context.library, "wxdouble_vbx_centroids", None) is None:
                 raise ValueError("double_vbx_centroid_abi_unavailable")
+        if resident_assignment_context is not None:
+            from pyannote.audio.pipelines.clustering import BaseClustering
+            from scipy.optimize import linear_sum_assignment
+            from tools.baseline.native_assignment import validate_assignment_reference
+            from tools.baseline.native_constrained_cleanup import compile_native_cleanup
+            if inactive_context is not None or not isinstance(resident_assignment_records, list):
+                raise ValueError("vbx_resident_assignment_configuration_invalid")
+            if np.__version__ != "2.2.6" or VBxClustering.__call__.__globals__.get("np") is not np:
+                raise ValueError("vbx_resident_assignment_runtime_not_supported")
+            if getattr(resident_assignment_context.library, "wxdouble_inactive_assignment", None) is None:
+                raise ValueError("double_inactive_assignment_abi_unavailable")
+            original_constrained = BaseClustering.constrained_argmax
+            compile_native_cleanup(original_constrained, None)
+            if original_constrained.__globals__.get("np") is not np or original_constrained.__globals__.get("linear_sum_assignment") is not linear_sum_assignment:
+                raise ValueError("vbx_resident_assignment_reference_changed")
+            validate_assignment_reference(linear_sum_assignment)
         if inactive_context is not None:
             if not isinstance(inactive_records, list):
                 raise ValueError("vbx_inactive_records_required")
@@ -234,7 +259,7 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
                 raise ValueError("double_vbx_cosine_abi_unavailable")
             if VBxClustering.__call__.__globals__.get("cdist") is not spatial_distance.cdist or hashlib.sha256(textwrap.dedent(inspect.getsource(spatial_distance.cdist)).encode()).hexdigest() != CDIST_SHA256:
                 raise ValueError("vbx_cosine_reference_not_supported")
-        if context is None and centroid_context is None and distance_context is None and argmax_context is None and inactive_context is None and kmeans_context is None:
+        if context is None and centroid_context is None and distance_context is None and argmax_context is None and inactive_context is None and kmeans_context is None and resident_assignment_context is None:
             raise ValueError("embedding_or_centroid_context_required")
         original = VBxClustering.__call__
         owner_thread = threading.get_ident()
@@ -282,7 +307,16 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
         def forced_centroids(features, labels, clusters):
             return kmeans_centroids(kmeans_context, kmeans_records, features, labels, clusters)
 
-        candidate = compile_native_normalization(original, normalize if context is not None else None, centroids if centroid_context is not None else None, distances if distance_context is not None else None, soft_scores=soft_scores, argmax=assign if argmax_context is not None else None, resident_argmax=resident_argmax, inactive=mask_inactive if inactive_context is not None else None, kmeans_centroid=forced_centroids if kmeans_context is not None else None)
+        def assign_resident(instance, scores, segments):
+            from pyannote.audio.pipelines.clustering import BaseClustering
+            from tools.baseline.native_resident_assignment import resident_assignment
+            if type(instance) is not VBxClustering or BaseClustering.constrained_argmax is not original_constrained or getattr(instance.constrained_argmax, "__func__", None) is not original_constrained:
+                raise ValueError("vbx_resident_assignment_instance_not_supported")
+            output = resident_assignment(resident_assignment_context, resident_assignment_records, scores, segments)
+            resident_assignment_records[-1]["original_call_sha256"] = VBX_CALL_SHA256
+            return output
+
+        candidate = compile_native_normalization(original, normalize if context is not None else None, centroids if centroid_context is not None else None, distances if distance_context is not None else None, soft_scores=soft_scores, argmax=assign if argmax_context is not None else None, resident_argmax=resident_argmax, inactive=mask_inactive if inactive_context is not None else None, kmeans_centroid=forced_centroids if kmeans_context is not None else None, resident_assignment=assign_resident if resident_assignment_context is not None else None)
 
         @functools.wraps(original)
         def wrapped(*args, **kwargs):

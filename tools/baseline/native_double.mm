@@ -57,7 +57,7 @@ class DoubleContext {
     id<MTLComputePipelineState> kmeans_centroid_pipeline_;
     id<MTLComputePipelineState> float_shift_pipeline_;
     id<MTLComputePipelineState> tolerance_mean_pipeline_, tolerance_square_pipeline_, tolerance_final_pipeline_;
-    id<MTLComputePipelineState> assignment_batch_pipeline_, assignment_pipeline_, kmeans_best_pipeline_, kmeans_search_pipeline_, kmeans_probability_sum_pipeline_, kmeans_probability_pipeline_, kmeans_minimum_pipeline_, kmeans_norm_pipeline_, kmeans_weighted_products_pipeline_, kmeans_weighted_prefix_pipeline_;
+    id<MTLComputePipelineState> inactive_assignment_pipeline_, assignment_batch_pipeline_, assignment_pipeline_, kmeans_best_pipeline_, kmeans_search_pipeline_, kmeans_probability_sum_pipeline_, kmeans_probability_pipeline_, kmeans_minimum_pipeline_, kmeans_norm_pipeline_, kmeans_weighted_products_pipeline_, kmeans_weighted_prefix_pipeline_;
     id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_, cosine_norm_pipeline_, cosine_distance_pipeline_, cosine_score_pipeline_, argmax_pipeline_, minimum_pipeline_, inactive_pipeline_, nan_minimum_pipeline_, nan_cleanup_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
@@ -140,6 +140,8 @@ public:
         if (best_candidate_function != nil) kmeans_best_pipeline_ = [device_ newComputePipelineStateWithFunction:best_candidate_function error:&error];
         id<MTLFunction> assignment_function = [library newFunctionWithName:@"double_linear_assignment_max"];
         if (assignment_function != nil) assignment_pipeline_ = [device_ newComputePipelineStateWithFunction:assignment_function error:&error];
+        id<MTLFunction> inactive_assignment_function = [library newFunctionWithName:@"double_inactive_assignment_batch"];
+        if (inactive_assignment_function != nil) inactive_assignment_pipeline_ = [device_ newComputePipelineStateWithFunction:inactive_assignment_function error:&error];
         id<MTLFunction> batch_assignment_function = [library newFunctionWithName:@"double_assignment_batch"];
         if (batch_assignment_function != nil) assignment_batch_pipeline_ = [device_ newComputePipelineStateWithFunction:batch_assignment_function error:&error];
         id<MTLFunction> centroid_function = [library newFunctionWithName:@"double_vbx_centroids"];
@@ -406,6 +408,63 @@ public:
         for (uint32_t row = 0; row < d.rows; ++row) require(std::isfinite(static_cast<const double*>(terms_.contents)[row]), "double_vbx_logsumexp_shift_domain_invalid");
         std::memcpy(output, terms_.contents, uint64_t(d.rows) * sizeof(double));
         return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
+    DoubleMetrics inactive_assignment(const double* scores, const double* segments, AssignmentBatchDimensions d, uint32_t frames, double* masked, int8_t* labels) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(minimum_pipeline_ != nil && inactive_pipeline_ != nil && nan_minimum_pipeline_ != nil && nan_cleanup_pipeline_ != nil && inactive_assignment_pipeline_ != nil, "double_inactive_assignment_kernel_unavailable");
+        require(scores != nullptr && segments != nullptr && masked != nullptr && labels != nullptr && d.chunks > 0 && d.chunks <= 4096 && d.rows > 0 && d.rows <= 64 && d.columns > 0 && d.columns <= 64 && std::min(d.rows, d.columns) <= 16 && uint64_t(d.chunks) * d.rows <= 4096 && frames > 0 && frames <= 4096 && uint64_t(d.chunks) * d.rows * frames <= 1024 * 1024, "double_inactive_assignment_shape_or_pointer_invalid");
+        uint64_t rows = uint64_t(d.chunks) * d.rows, count = rows * d.columns, bytes = count * sizeof(double), segment_bytes = rows * frames * sizeof(double);
+        uintptr_t masked_address = reinterpret_cast<uintptr_t>(masked), labels_address = reinterpret_cast<uintptr_t>(labels);
+        require(masked_address <= labels_address ? labels_address - masked_address >= bytes : masked_address - labels_address >= rows, "double_inactive_assignment_output_overlap");
+        for (uint64_t index = 0; index < count; ++index) {
+            uint64_t bits = assignment_input_bits(scores, index), magnitude = bits & 0x7ffffffffffffffful;
+            require(magnitude > 0x7ff0000000000000ul || (magnitude == 0 || ((bits >> 63) == 0 && magnitude >= std::bit_cast<uint64_t>(0x1p-64) && magnitude <= std::bit_cast<uint64_t>(2.))), "double_inactive_assignment_score_domain_invalid");
+        }
+        for (uint64_t index = 0; index < rows * frames; ++index) {
+            uint64_t bits = assignment_input_bits(segments, index);
+            require((bits & 0x7ffffffffffffffful) == 0 || bits == std::bit_cast<uint64_t>(1.), "double_inactive_assignment_binary_segments_required");
+        }
+        InactiveDimensions inactive = {uint32_t(rows), d.columns, frames, uint32_t((count + 1023) / 1024)};
+        CleanupDimensions cleanup = {uint32_t(rows), d.columns, inactive.blocks};
+        auto started = std::chrono::steady_clock::now();
+        reserve(input_, bytes); reserve(output_, bytes); reserve(terms_, uint64_t(cleanup.blocks) * sizeof(double)); reserve(right_, std::max(segment_bytes, bytes + uint64_t(d.chunks) * sizeof(uint32_t)));
+        std::memcpy(input_.contents, reinterpret_cast<const unsigned char*>(scores), bytes); std::memcpy(right_.contents, reinterpret_cast<const unsigned char*>(segments), segment_bytes);
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental resident inactive mask and constrained assignment";
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:minimum_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&inactive length:sizeof(inactive) atIndex:1]; [encoder setBuffer:terms_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(inactive.blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, minimum_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:inactive_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&inactive length:sizeof(inactive) atIndex:1]; [encoder setBuffer:right_ offset:0 atIndex:2]; [encoder setBuffer:terms_ offset:0 atIndex:3]; [encoder setBuffer:output_ offset:0 atIndex:4];
+        [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, inactive_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder]; require(blit != nil, "double_blit_creation_failed");
+        [blit copyFromBuffer:output_ sourceOffset:0 toBuffer:right_ destinationOffset:0 size:bytes]; [blit endEncoding];
+        encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:nan_minimum_pipeline_]; [encoder setBuffer:output_ offset:0 atIndex:0]; [encoder setBytes:&cleanup length:sizeof(cleanup) atIndex:1]; [encoder setBuffer:terms_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(cleanup.blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, nan_minimum_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:nan_cleanup_pipeline_]; [encoder setBuffer:output_ offset:0 atIndex:0]; [encoder setBytes:&cleanup length:sizeof(cleanup) atIndex:1]; [encoder setBuffer:terms_ offset:0 atIndex:2]; [encoder setBuffer:input_ offset:0 atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, nan_cleanup_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:inactive_assignment_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:output_ offset:0 atIndex:2]; [encoder setBuffer:right_ offset:bytes atIndex:3]; [encoder setBuffer:terms_ offset:0 atIndex:4]; [encoder setBytes:&cleanup length:sizeof(cleanup) atIndex:5];
+        [encoder dispatchThreads:MTLSizeMake(d.chunks, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(32, inactive_assignment_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        const uint32_t* status = reinterpret_cast<const uint32_t*>(static_cast<const unsigned char*>(right_.contents) + bytes);
+        for (uint32_t chunk = 0; chunk < d.chunks; ++chunk) require(status[chunk] != 2, "double_inactive_assignment_all_nan_input");
+        for (uint32_t chunk = 0; chunk < d.chunks; ++chunk) require(status[chunk] == 0, "double_inactive_assignment_solver_failed");
+        const int8_t* result = static_cast<const int8_t*>(output_.contents);
+        for (uint32_t chunk = 0; chunk < d.chunks; ++chunk) {
+            uint64_t used = 0; uint32_t assigned = 0;
+            for (uint32_t row = 0; row < d.rows; ++row) {
+                int label = result[uint64_t(chunk) * d.rows + row];
+                require(label == -2 || (label >= 0 && uint32_t(label) < d.columns), "double_inactive_assignment_result_invalid");
+                if (label >= 0) { uint64_t bit = uint64_t(1) << label; require((used & bit) == 0, "double_inactive_assignment_result_invalid"); used |= bit; ++assigned; }
+            }
+            require(assigned == std::min(d.rows, d.columns), "double_inactive_assignment_result_invalid");
+        }
+        std::memcpy(reinterpret_cast<unsigned char*>(masked), right_.contents, bytes); std::memcpy(labels, result, rows);
+        return {1, 5, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
     DoubleMetrics assignment_batch(const double* scores, AssignmentBatchDimensions d, int8_t* output) {
@@ -1225,5 +1284,14 @@ extern "C" int wxdouble_assignment_batch(void* context, const double* scores, ui
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->assignment_batch(scores, {chunks, rows, columns}, output); return 0; }
         catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_assignment_batch_failed"); return 1; }
+    }
+}
+
+
+extern "C" int wxdouble_inactive_assignment(void* context, const double* scores, const double* segments, uint32_t chunks, uint32_t rows, uint32_t columns, uint32_t frames, double* masked, int8_t* labels, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->inactive_assignment(scores, segments, {chunks, rows, columns}, frames, masked, labels); return 0; }
+        catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_inactive_assignment_failed"); return 1; }
     }
 }
