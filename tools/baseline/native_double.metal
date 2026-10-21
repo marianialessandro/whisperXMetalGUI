@@ -976,3 +976,10 @@ kernel void double_fcluster_distance(device const ulong* tree [[buffer(0)]], con
         --depth;
     }
 }
+
+
+struct CutLabelDimensions { uint count; };
+
+kernel void integer_cut_labels_i64(device const int* labels [[buffer(0)]], constant CutLabelDimensions& d [[buffer(1)]], device long* output [[buffer(2)]], uint row [[thread_position_in_grid]]) {
+    if (row < d.count) output[row] = long(labels[row]);
+}

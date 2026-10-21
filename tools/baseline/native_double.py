@@ -537,6 +537,29 @@ class NativeDoubleNormalization:
             raise ValueError("double_vbx_one_hot_native_result_invalid")
         return output, {"scope": "experimental_native_binary64_vbx_one_hot", "operation": "initial_one_hot", "rows": rows, "columns": columns, "gpu_kernels": ["double_vbx_one_hot"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": labels.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
+    def fcluster_reindex(self, tree, cutoff):
+        if type(tree) is not np.ndarray or tree.dtype != np.float64 or tree.ndim != 2 or not tree.flags.c_contiguous:
+            raise ValueError("double_fcluster_reindex_input_format_invalid")
+        leaves = len(tree) + 1
+        if tree.shape[1] != 4 or not 2 <= leaves <= 256 or type(cutoff) not in (float, int, np.float64, np.float32):
+            raise ValueError("double_fcluster_reindex_shape_or_policy_invalid")
+        output, metrics, error = np.empty(leaves, dtype=np.int64), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_fcluster_reindex
+            except AttributeError as failure:
+                raise ValueError("double_fcluster_reindex_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_double, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, tree.ctypes.data, leaves, float(cutoff), output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 2 or np.any(output < 0) or np.any(output >= leaves):
+            raise ValueError("double_fcluster_reindex_native_result_invalid")
+        return output, {"scope": "experimental_native_resident_flat_cut_and_reindex", "leaves": leaves, "resident_reindex": True, "zero_based_output": True, "reindex_policy": "identity_for_contiguous_native_cluster_ids", "criterion": "distance", "gpu_kernels": ["double_fcluster_distance", "integer_cut_labels_i64"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": tree.nbytes, "logical_result_readback_bytes": output.nbytes, "intermediate_label_readback_bytes": 0, "host_label_dtype_conversion": False, "host_label_offset": False, "host_numeric_tree_cut": False, "host_numeric_label_reindex": False, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+
     def fcluster_distance(self, tree, cutoff, zero_based=False):
         if type(tree) is not np.ndarray or tree.dtype != np.float64 or tree.ndim != 2 or not tree.flags.c_contiguous:
             raise ValueError("double_fcluster_input_format_invalid")

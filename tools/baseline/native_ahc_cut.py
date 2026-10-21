@@ -30,3 +30,14 @@ def cut_tree(context, records, tree, cutoff):
     record.update({"adapter_scope": "vbx_distance_fcluster_and_zero_based_label_offset", "fcluster_source_sha256": FCLUSTER_SHA256, "hierarchy_binary_sha256": HIERARCHY_BINARY_SHA256, "hierarchy_reference_sha256": HIERARCHY_REFERENCE_SHA256, "host_input_staging_copy_bytes": 0 if np.shares_memory(staged, tree) else staged.nbytes, "cpu_residuals": ["centroid_linkage", "tree_structure_validation", "host_staging_and_control"]})
     records.append(record)
     return output
+
+
+def resident_cut_tree(context, records, tree, cutoff):
+    if type(tree) is not np.ndarray or tree.dtype != np.float64 or tree.ndim != 2:
+        raise ValueError("ahc_cut_operand_format_not_supported")
+    staged = np.ascontiguousarray(tree)
+    output, record = context.fcluster_reindex(staged, cutoff)
+    record = dict(record)
+    record.update({"adapter_scope": "vbx_resident_distance_fcluster_and_numpy_inverse", "fcluster_source_sha256": FCLUSTER_SHA256, "hierarchy_binary_sha256": HIERARCHY_BINARY_SHA256, "hierarchy_reference_sha256": HIERARCHY_REFERENCE_SHA256, "host_input_staging_copy_bytes": 0 if np.shares_memory(staged, tree) else staged.nbytes, "cpu_residuals": ["centroid_linkage", "tree_structure_validation", "host_staging_and_control"]})
+    records.append(record)
+    return output

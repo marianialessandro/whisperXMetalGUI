@@ -46,6 +46,7 @@ extern "C" int wxdouble_inactive_assignment(void*, const double*, const double*,
 extern "C" int wxdouble_pdist_euclidean(void*, const double*, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_ahc_reindex(void*, const int64_t*, uint32_t, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_fcluster_distance(void*, const double*, uint32_t, double, uint32_t, int32_t*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_fcluster_reindex(void*, const double*, uint32_t, double, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -61,6 +62,29 @@ int main(int argc, char** argv) {
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    double resident_cut_tree[] = {0, 1, 2, 2, 2, 3, 1, 3};
+    int64_t resident_cut_output[] = {91, 92, 93};
+    assert(wxdouble_fcluster_reindex(context, resident_cut_tree, 3, 1., resident_cut_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 2 && resident_cut_output[0] == 0 && resident_cut_output[1] == 1 && resident_cut_output[2] == 2);
+    assert(wxdouble_fcluster_reindex(context, resident_cut_tree, 3, 2., resident_cut_output, &metrics, error, sizeof(error)) == 0 && resident_cut_output[0] == 0 && resident_cut_output[1] == 0 && resident_cut_output[2] == 0);
+    resident_cut_output[0] = 91;
+    assert(wxdouble_fcluster_reindex(nullptr, resident_cut_tree, 3, 1., resident_cut_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_fcluster_reindex(context, nullptr, 3, 1., resident_cut_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_fcluster_reindex(context, resident_cut_tree, 3, 1., nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_fcluster_reindex(context, resident_cut_tree, 3, 1., resident_cut_output, nullptr, error, sizeof(error)) != 0);
+    for (uint32_t leaves : {0u, 1u, 257u}) assert(wxdouble_fcluster_reindex(context, resident_cut_tree, leaves, 1., resident_cut_output, &metrics, error, sizeof(error)) != 0 && resident_cut_output[0] == 91);
+    assert(wxdouble_fcluster_reindex(context, resident_cut_tree, 3, std::numeric_limits<double>::quiet_NaN(), resident_cut_output, &metrics, error, sizeof(error)) != 0 && resident_cut_output[0] == 91);
+    resident_cut_tree[0] = 1;
+    assert(wxdouble_fcluster_reindex(context, resident_cut_tree, 3, 1., resident_cut_output, &metrics, error, sizeof(error)) != 0 && resident_cut_output[0] == 91);
+    resident_cut_tree[0] = 0;
+    alignas(double) unsigned char resident_cut_unaligned_input[sizeof(resident_cut_tree) + 1], resident_cut_unaligned_output[sizeof(resident_cut_output) + 1];
+    std::memcpy(resident_cut_unaligned_input + 1, resident_cut_tree, sizeof(resident_cut_tree));
+    assert(wxdouble_fcluster_reindex(context, reinterpret_cast<double*>(resident_cut_unaligned_input + 1), 3, 1., reinterpret_cast<int64_t*>(resident_cut_unaligned_output + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(resident_cut_output, resident_cut_unaligned_output + 1, sizeof(resident_cut_output));
+    assert(resident_cut_output[0] == 0 && resident_cut_output[2] == 2);
+    assert(wxdouble_fcluster_reindex(context, resident_cut_tree, 3, 1., reinterpret_cast<int64_t*>(resident_cut_tree), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(resident_cut_output, resident_cut_tree, sizeof(resident_cut_output));
+    assert(resident_cut_output[0] == 0 && resident_cut_output[2] == 2);
+
     double cut_tree[] = {0, 1, 2, 2, 2, 3, 1, 3};
     int32_t cut_output[] = {91, 92, 93};
     assert(wxdouble_fcluster_distance(context, cut_tree, 3, 1., 0, cut_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 1 && cut_output[0] == 1 && cut_output[1] == 2 && cut_output[2] == 3);
@@ -911,6 +935,14 @@ int main(int argc, char** argv) {
     double cut_legacy_tree[] = {0, 1, 1, 2};
     cut_output[0] = 91;
     assert(wxdouble_fcluster_distance(context, cut_legacy_tree, 2, 1., 0, cut_output, &metrics, error, sizeof(error)) != 0 && cut_output[0] == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_resident_cut_shader = shader.substr(0, shader.find("\nstruct CutLabelDimensions"));
+    assert(wxdouble_create(pre_resident_cut_shader.data(), pre_resident_cut_shader.size(), &context, error, sizeof(error)) == 0);
+    double resident_cut_legacy_tree[] = {0, 1, 1, 2};
+    assert(wxdouble_fcluster_distance(context, resident_cut_legacy_tree, 2, 1., 0, cut_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 1 && cut_output[0] == 1);
+    resident_cut_output[0] = 91;
+    assert(wxdouble_fcluster_reindex(context, resident_cut_legacy_tree, 2, 1., resident_cut_output, &metrics, error, sizeof(error)) != 0 && resident_cut_output[0] == 91);
     wxdouble_destroy(context);
 
 }
