@@ -617,3 +617,11 @@ kernel void float_vbx_kmeans_centroids(device const float* features [[buffer(0)]
     }
     output[index] = sum / float(count);
 }
+
+struct FloatShiftDimensions { uint rows, columns, add; };
+
+kernel void float_vbx_shift(device const float* values [[buffer(0)]], constant FloatShiftDimensions& d [[buffer(1)]], device const float* mean [[buffer(2)]], device float* output [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index >= d.rows * d.columns) return;
+    float offset = mean[index % d.columns];
+    output[index] = d.add ? values[index] + offset : values[index] - offset;
+}

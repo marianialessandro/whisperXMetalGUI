@@ -31,6 +31,7 @@ extern "C" int wxdouble_vbx_qinit_from_labels(void*, const int64_t*, uint32_t, u
 extern "C" int wxdouble_vbx_inactive_mask(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_nan_cleanup(void*, const double*, uint32_t, uint32_t, double*, uint32_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_kmeans_centroids(void*, const float*, const int32_t*, uint32_t, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_float_shift(void*, const float*, const float*, uint32_t, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -46,6 +47,21 @@ int main(int argc, char** argv) {
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    float shift_values[] = {1, 2, 3, 4}, shift_mean[] = {.5f, 1}, shift_output[] = {91, 92, 93, 94};
+    assert(wxdouble_float_shift(context, shift_values, shift_mean, 2, 2, 0, shift_output, &metrics, error, sizeof(error)) == 0 && shift_output[0] == .5f && shift_output[3] == 3);
+    assert(wxdouble_float_shift(context, shift_values, shift_mean, 2, 2, 1, shift_output, &metrics, error, sizeof(error)) == 0 && shift_output[0] == 1.5f && shift_output[3] == 5);
+    shift_output[0] = 91;
+    assert(wxdouble_float_shift(context, nullptr, shift_mean, 2, 2, 0, shift_output, &metrics, error, sizeof(error)) != 0 && shift_output[0] == 91);
+    assert(wxdouble_float_shift(context, shift_values, nullptr, 2, 2, 0, shift_output, &metrics, error, sizeof(error)) != 0 && shift_output[0] == 91);
+    assert(wxdouble_float_shift(context, shift_values, shift_mean, 2, 2, 0, nullptr, &metrics, error, sizeof(error)) != 0 && shift_output[0] == 91);
+    assert(wxdouble_float_shift(context, shift_values, shift_mean, 4097, 2, 0, shift_output, &metrics, error, sizeof(error)) != 0 && shift_output[0] == 91);
+    assert(wxdouble_float_shift(context, shift_values, shift_mean, 2, 2, 2, shift_output, &metrics, error, sizeof(error)) != 0 && shift_output[0] == 91);
+    shift_values[0] = 0x1p-101f;
+    assert(wxdouble_float_shift(context, shift_values, shift_mean, 2, 2, 0, shift_output, &metrics, error, sizeof(error)) != 0 && shift_output[0] == 91);
+    shift_values[0] = 1; shift_mean[0] = std::numeric_limits<float>::infinity();
+    assert(wxdouble_float_shift(context, shift_values, shift_mean, 2, 2, 0, shift_output, &metrics, error, sizeof(error)) != 0 && shift_output[0] == 91);
+    shift_mean[0] = .5f;
+    assert(wxdouble_float_shift(context, shift_values, shift_mean, 2, 2, 0, shift_values, &metrics, error, sizeof(error)) == 0 && shift_values[0] == .5f && shift_values[3] == 3);
     assert(wxdouble_vbx_kmeans_centroids(context, km_features, km_labels, 4, 2, 2, km_output, &metrics, error, sizeof(error)) == 0);
     assert(km_output[0] == 2 && km_output[1] == 3 && km_output[2] == 6 && km_output[3] == 7 && metrics.kernels == 1 && metrics.allocated_bytes <= 72 * 1024 * 1024 + 40 * 1024);
     km_output[0] = 91;
@@ -491,6 +507,13 @@ int main(int argc, char** argv) {
     assert(wxdouble_normalize(context, km_legacy_input, 1, 2, 0, output, &metrics, error, sizeof(error)) == 0);
     km_output[0] = 91;
     assert(wxdouble_vbx_kmeans_centroids(context, km_features, km_labels, 4, 2, 2, km_output, &metrics, error, sizeof(error)) != 0 && km_output[0] == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_shift_shader = shader.substr(0, shader.find("\nstruct FloatShiftDimensions"));
+    assert(wxdouble_create(pre_shift_shader.data(), pre_shift_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_vbx_kmeans_centroids(context, km_features, km_labels, 4, 2, 2, km_output, &metrics, error, sizeof(error)) == 0);
+    shift_output[0] = 91;
+    assert(wxdouble_float_shift(context, shift_values, shift_mean, 2, 2, 0, shift_output, &metrics, error, sizeof(error)) != 0 && shift_output[0] == 91);
     wxdouble_destroy(context);
 
 }
