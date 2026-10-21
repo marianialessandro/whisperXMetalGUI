@@ -59,6 +59,7 @@ def main(argv=None):
     parser.add_argument("--embedding-library-sha256", help="Expected SHA256 of the optional embedding-normalization dylib; clustering defaults remain unchanged.")
     parser.add_argument("--plda-normalization-library", type=Path, help="Optional native binary64 L2 normalization inside PLDA preprocessing; requires --diarize and its paired SHA256 flag. Matrix products remain original unless --plda-matrix-products is selected; model setup remains original.")
     parser.add_argument("--plda-normalization-library-sha256", help="Expected SHA256 of the binary64-normalization dylib; requires pyannote 4.0.4 and NumPy 2.2.6.")
+    parser.add_argument("--kmeans-feature-mean", action="store_true", help="Compute the initial dense float32 KMeans feature mean on Metal; requires --plda-normalization-library with KMeans-centroid ABI. Preserves the original fit decorator, subtraction, initialization, Lloyd/Elkan and restoration.")
     parser.add_argument("--vbx-kmeans-centroids", action="store_true", help="Compute float32 centroids after forced KMeans on Metal; requires --plda-normalization-library and KMeans-centroid ABI. Original KMeans remains CPU; at least two features and nonempty clusters are required.")
     parser.add_argument("--clustering-cpu-audit", action="store_true", help="Observe original AHC, KMeans and constrained-solver API calls on the current thread without replacing them; requires --diarize. Adds profiling overhead; reports inclusive wall time, not exclusive CPU time or GPU placement.")
     parser.add_argument("--vbx-constrained-nan-cleanup", action="store_true", help="Replace NaNs with the global finite minimum on Metal before constrained assignment; requires --plda-normalization-library and cleanup ABI. The original solver and all-NaN warning/error behavior remain.")
@@ -101,6 +102,8 @@ def main(argv=None):
         parser.error("--plda-normalization-library and --plda-normalization-library-sha256 must be supplied together.")
     if args.plda_normalization_library and "--diarize" not in forwarded:
         parser.error("--plda-normalization-library requires --diarize.")
+    if args.kmeans_feature_mean and not args.plda_normalization_library:
+        parser.error("--kmeans-feature-mean requires --plda-normalization-library and its SHA256.")
     if args.vbx_kmeans_centroids and not args.plda_normalization_library:
         parser.error("--vbx-kmeans-centroids requires --plda-normalization-library and its SHA256.")
     if args.clustering_cpu_audit and "--diarize" not in forwarded:
@@ -152,7 +155,8 @@ def main(argv=None):
     if args.vbx_precomputed_terms and not args.vbx_matrix_products:
         parser.error("--vbx-precomputed-terms requires --vbx-matrix-products.")
     report = {"schema_version": 1, "scope": "source_checkout_native_mps_ctc", "status": "failed", "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False, "resident_statistics": args.resident_statistics, "embedding_normalization_requested": bool(args.embedding_library), "plda_normalization_requested": bool(args.plda_normalization_library), "plda_matrix_products_requested": args.plda_matrix_products, "plda_centering_scaling_requested": args.plda_centering_scaling, "vbx_constrained_nan_cleanup_requested": args.vbx_constrained_nan_cleanup, "vbx_inactive_speaker_mask_requested": args.vbx_inactive_speaker_mask, "vbx_resident_initialization_requested": args.vbx_resident_initialization, "vbx_resident_argmax_requested": args.vbx_resident_argmax, "vbx_unconstrained_argmax_requested": args.vbx_unconstrained_argmax, "vbx_soft_scores_requested": args.vbx_soft_scores, "vbx_cosine_distances_requested": args.vbx_cosine_distances, "vbx_centroids_requested": args.vbx_centroids, "vbx_matrix_products_requested": args.vbx_matrix_products, "vbx_initial_one_hot_requested": args.vbx_initial_one_hot, "vbx_initial_softmax_requested": args.vbx_initial_softmax, "vbx_initialization_requested": args.vbx_initialization, "vbx_scalar_arithmetic_requested": args.vbx_scalar_arithmetic, "vbx_logsumexp_requested": args.vbx_logsumexp, "vbx_transcendentals_requested": args.vbx_transcendentals, "vbx_elbo_arithmetic_requested": args.vbx_elbo_arithmetic, "vbx_posterior_arithmetic_requested": args.vbx_posterior_arithmetic, "vbx_prior_updates_requested": args.vbx_prior_updates, "vbx_score_arithmetic_requested": args.vbx_score_arithmetic, "vbx_statistics_requested": args.vbx_statistics, "vbx_precomputed_terms_requested": args.vbx_precomputed_terms}
-    records = {key: [] for key in ("ctc", "bounds", "means", "rounding", "interpolation", "speaker_assignment", "embedding_normalization", "plda_normalization", "plda_matrix_products", "plda_centering_scaling", "vbx_matrix_products", "vbx_precomputed_terms", "vbx_statistics", "vbx_score_arithmetic", "vbx_prior_updates", "vbx_posterior_arithmetic", "vbx_elbo_arithmetic", "vbx_transcendentals", "vbx_logsumexp", "vbx_scalar_arithmetic", "vbx_initialization", "vbx_initial_softmax", "vbx_centroids", "vbx_initial_one_hot", "vbx_cosine_distances", "vbx_unconstrained_argmax", "vbx_inactive_speaker_mask", "vbx_constrained_nan_cleanup", "vbx_kmeans_centroids")}
+    records = {key: [] for key in ("ctc", "bounds", "means", "rounding", "interpolation", "speaker_assignment", "embedding_normalization", "plda_normalization", "plda_matrix_products", "plda_centering_scaling", "vbx_matrix_products", "vbx_precomputed_terms", "vbx_statistics", "vbx_score_arithmetic", "vbx_prior_updates", "vbx_posterior_arithmetic", "vbx_elbo_arithmetic", "vbx_transcendentals", "vbx_logsumexp", "vbx_scalar_arithmetic", "vbx_initialization", "vbx_initial_softmax", "vbx_centroids", "vbx_initial_one_hot", "vbx_cosine_distances", "vbx_unconstrained_argmax", "vbx_inactive_speaker_mask", "vbx_constrained_nan_cleanup", "vbx_kmeans_centroids", "kmeans_feature_mean")}
+    report["kmeans_feature_mean_requested"] = args.kmeans_feature_mean
     report["vbx_kmeans_centroids_requested"] = args.vbx_kmeans_centroids
     report["clustering_cpu_audit_requested"] = args.clustering_cpu_audit
     cpu_audit_records = []
@@ -198,6 +202,9 @@ def main(argv=None):
                             if args.vbx_matrix_products:
                                 from tools.baseline.native_vbx_matrix import native_vbx_matrix_products
                                 scopes.enter_context(native_vbx_matrix_products(plda_context, records["vbx_matrix_products"], vbx_calls, precompute=args.vbx_precomputed_terms, precompute_records=records["vbx_precomputed_terms"], statistics=args.vbx_statistics, statistics_records=records["vbx_statistics"], scores=args.vbx_score_arithmetic, score_records=records["vbx_score_arithmetic"], prior=args.vbx_prior_updates, prior_records=records["vbx_prior_updates"], posterior=args.vbx_posterior_arithmetic, posterior_records=records["vbx_posterior_arithmetic"], elbo=args.vbx_elbo_arithmetic, elbo_records=records["vbx_elbo_arithmetic"], transcendentals=args.vbx_transcendentals, transcendental_records=records["vbx_transcendentals"], logsumexp=args.vbx_logsumexp, logsumexp_records=records["vbx_logsumexp"], scalars=args.vbx_scalar_arithmetic, scalar_records=records["vbx_scalar_arithmetic"], initialization=args.vbx_initialization, initialization_records=records["vbx_initialization"]))
+                        if args.kmeans_feature_mean:
+                            from tools.baseline.native_kmeans_mean import native_kmeans_feature_mean
+                            scopes.enter_context(native_kmeans_feature_mean(plda_context, records["kmeans_feature_mean"]))
                         embedding_context = None
                         if args.embedding_library:
                             from tools.baseline.native_embedding import NativeEmbeddingNormalization
@@ -224,6 +231,8 @@ def main(argv=None):
             report["clustering_cpu_api_calls"] = sum(item["calls_started"] for item in cpu_audit_records)
             report["clustering_cpu_audit_observed"] = bool(report["clustering_cpu_api_calls"])
             report["clustering_cpu_audit_complete"] = len(cpu_audit_records) == 4 and all(item["observation_complete"] for item in cpu_audit_records)
+            report["native_kmeans_feature_mean_calls"] = len(records["kmeans_feature_mean"])
+            report["kmeans_feature_mean_observed"] = bool(records["kmeans_feature_mean"])
             report["native_vbx_kmeans_centroid_calls"] = len(records["vbx_kmeans_centroids"])
             report["vbx_kmeans_centroids_observed"] = bool(records["vbx_kmeans_centroids"])
             report["operations"] = records
