@@ -537,6 +537,29 @@ class NativeDoubleNormalization:
             raise ValueError("double_vbx_one_hot_native_result_invalid")
         return output, {"scope": "experimental_native_binary64_vbx_one_hot", "operation": "initial_one_hot", "rows": rows, "columns": columns, "gpu_kernels": ["double_vbx_one_hot"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": labels.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
+    def fcluster_distance(self, tree, cutoff, zero_based=False):
+        if type(tree) is not np.ndarray or tree.dtype != np.float64 or tree.ndim != 2 or not tree.flags.c_contiguous:
+            raise ValueError("double_fcluster_input_format_invalid")
+        leaves = len(tree) + 1
+        if tree.shape[1] != 4 or not 2 <= leaves <= 256 or type(zero_based) is not bool or type(cutoff) not in (float, int, np.float64, np.float32):
+            raise ValueError("double_fcluster_shape_or_policy_invalid")
+        output, metrics, error = np.empty(leaves, dtype=np.int32), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_fcluster_distance
+            except AttributeError as failure:
+                raise ValueError("double_fcluster_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_double, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, tree.ctypes.data, leaves, float(cutoff), int(zero_based), output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 1 or np.any(output < int(not zero_based)) or np.any(output > leaves - int(zero_based)):
+            raise ValueError("double_fcluster_native_result_invalid")
+        return output, {"scope": "experimental_native_distance_flat_clustering", "leaves": leaves, "zero_based_output": zero_based, "criterion": "distance", "label_order": "pinned_scipy_cluster_monocrit_traversal", "gpu_kernels": ["double_fcluster_distance"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": tree.nbytes, "logical_result_readback_bytes": output.nbytes, "private_tree_workspace_bound_bytes": 3584, "host_numeric_tree_cut": False, "host_label_offset": False, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+
     def ahc_reindex(self, labels):
         if type(labels) is not np.ndarray or labels.dtype != np.int64 or labels.ndim != 1 or not labels.flags.c_contiguous:
             raise ValueError("double_ahc_reindex_input_format_invalid")

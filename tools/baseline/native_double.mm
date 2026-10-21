@@ -20,6 +20,8 @@ struct KmeansMinimumDimensions { uint32_t rows, columns; };
 struct KmeansProbabilityDimensions { uint32_t count; };
 struct KmeansSearchDimensions { uint32_t count, queries; };
 struct KmeansBestDimensions { uint32_t count; };
+struct FclusterDimensions { uint32_t leaves, zero_based; uint64_t cutoff; };
+static_assert(sizeof(FclusterDimensions) == 16);
 struct ReindexDimensions { uint32_t count; };
 struct PdistDimensions { uint32_t rows, features; };
 struct AssignmentDimensions { uint32_t rows, columns; };
@@ -59,7 +61,7 @@ class DoubleContext {
     id<MTLComputePipelineState> kmeans_centroid_pipeline_;
     id<MTLComputePipelineState> float_shift_pipeline_;
     id<MTLComputePipelineState> tolerance_mean_pipeline_, tolerance_square_pipeline_, tolerance_final_pipeline_;
-    id<MTLComputePipelineState> reindex_pipeline_, pdist_pipeline_, inactive_assignment_pipeline_, assignment_batch_pipeline_, assignment_pipeline_, kmeans_best_pipeline_, kmeans_search_pipeline_, kmeans_probability_sum_pipeline_, kmeans_probability_pipeline_, kmeans_minimum_pipeline_, kmeans_norm_pipeline_, kmeans_weighted_products_pipeline_, kmeans_weighted_prefix_pipeline_;
+    id<MTLComputePipelineState> fcluster_pipeline_, reindex_pipeline_, pdist_pipeline_, inactive_assignment_pipeline_, assignment_batch_pipeline_, assignment_pipeline_, kmeans_best_pipeline_, kmeans_search_pipeline_, kmeans_probability_sum_pipeline_, kmeans_probability_pipeline_, kmeans_minimum_pipeline_, kmeans_norm_pipeline_, kmeans_weighted_products_pipeline_, kmeans_weighted_prefix_pipeline_;
     id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_, cosine_norm_pipeline_, cosine_distance_pipeline_, cosine_score_pipeline_, argmax_pipeline_, minimum_pipeline_, inactive_pipeline_, nan_minimum_pipeline_, nan_cleanup_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
@@ -142,6 +144,8 @@ public:
         if (best_candidate_function != nil) kmeans_best_pipeline_ = [device_ newComputePipelineStateWithFunction:best_candidate_function error:&error];
         id<MTLFunction> assignment_function = [library newFunctionWithName:@"double_linear_assignment_max"];
         if (assignment_function != nil) assignment_pipeline_ = [device_ newComputePipelineStateWithFunction:assignment_function error:&error];
+        id<MTLFunction> fcluster_function = [library newFunctionWithName:@"double_fcluster_distance"];
+        if (fcluster_function != nil) fcluster_pipeline_ = [device_ newComputePipelineStateWithFunction:fcluster_function error:&error];
         id<MTLFunction> reindex_function = [library newFunctionWithName:@"integer_ahc_reindex"];
         if (reindex_function != nil) reindex_pipeline_ = [device_ newComputePipelineStateWithFunction:reindex_function error:&error];
         id<MTLFunction> pdist_function = [library newFunctionWithName:@"double_pdist_euclidean"];
@@ -414,6 +418,50 @@ public:
         for (uint32_t row = 0; row < d.rows; ++row) require(std::isfinite(static_cast<const double*>(terms_.contents)[row]), "double_vbx_logsumexp_shift_domain_invalid");
         std::memcpy(output, terms_.contents, uint64_t(d.rows) * sizeof(double));
         return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
+    DoubleMetrics fcluster_distance(const double* tree, uint32_t leaves, double cutoff, uint32_t zero_based, int32_t* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(fcluster_pipeline_ != nil, "double_fcluster_kernel_unavailable");
+        require(tree != nullptr && output != nullptr && leaves >= 2 && leaves <= 256 && zero_based <= 1, "double_fcluster_shape_or_pointer_invalid");
+        uint64_t cutoff_bits = std::bit_cast<uint64_t>(cutoff);
+        uint64_t cutoff_magnitude = cutoff_bits & 0x7ffffffffffffffful;
+        require(cutoff_magnitude <= std::bit_cast<uint64_t>(0x1p64) && (cutoff_magnitude == 0 || cutoff_magnitude >= std::bit_cast<uint64_t>(0x1p-100)), "double_fcluster_cutoff_domain_invalid");
+        bool used[512] = {}; uint32_t sizes[512] = {};
+        for (uint32_t leaf = 0; leaf < leaves; ++leaf) sizes[leaf] = 1;
+        auto integer = [&](uint64_t index, uint32_t maximum) {
+            uint64_t bits = assignment_input_bits(tree, index), magnitude = bits & 0x7ffffffffffffffful;
+            if (magnitude == 0) return uint32_t(0);
+            require((bits >> 63) == 0 && magnitude >= std::bit_cast<uint64_t>(1.) && magnitude <= std::bit_cast<uint64_t>(double(maximum)), "double_fcluster_tree_index_invalid");
+            double value = std::bit_cast<double>(bits);
+            require(std::floor(value) == value, "double_fcluster_tree_index_invalid");
+            return uint32_t(value);
+        };
+        for (uint32_t row = 0; row < leaves - 1; ++row) {
+            uint32_t left = integer(uint64_t(row) * 4, leaves + row - 1), right = integer(uint64_t(row) * 4 + 1, leaves + row - 1);
+            require(left != right && !used[left] && !used[right], "double_fcluster_tree_topology_invalid");
+            used[left] = true; used[right] = true;
+            uint64_t height = assignment_input_bits(tree, uint64_t(row) * 4 + 2), magnitude = height & 0x7ffffffffffffffful;
+            require((magnitude == 0 || ((height >> 63) == 0 && magnitude >= std::bit_cast<uint64_t>(0x1p-100))) && magnitude <= std::bit_cast<uint64_t>(0x1p64), "double_fcluster_height_domain_invalid");
+            sizes[leaves + row] = sizes[left] + sizes[right];
+            require(integer(uint64_t(row) * 4 + 3, leaves) == sizes[leaves + row], "double_fcluster_tree_sizes_invalid");
+        }
+        require(sizes[2 * leaves - 2] == leaves, "double_fcluster_tree_topology_invalid");
+        FclusterDimensions d = {leaves, zero_based, cutoff_bits};
+        auto started = std::chrono::steady_clock::now();
+        uint64_t bytes = uint64_t(leaves - 1) * 4 * sizeof(double);
+        reserve(input_, bytes); reserve(output_, uint64_t(leaves) * sizeof(int32_t));
+        std::memcpy(input_.contents, reinterpret_cast<const unsigned char*>(tree), bytes);
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental flat distance clustering";
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:fcluster_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:output_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        const int32_t* result = static_cast<const int32_t*>(output_.contents);
+        for (uint32_t leaf = 0; leaf < leaves; ++leaf) require(result[leaf] >= int32_t(1 - zero_based) && result[leaf] <= int32_t(leaves - zero_based), "double_fcluster_result_invalid");
+        std::memcpy(reinterpret_cast<unsigned char*>(output), result, uint64_t(leaves) * sizeof(int32_t));
+        return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
     DoubleMetrics ahc_reindex(const int64_t* labels, uint32_t count, int64_t* output) {
@@ -1366,5 +1414,14 @@ extern "C" int wxdouble_ahc_reindex(void* context, const int64_t* labels, uint32
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->ahc_reindex(labels, count, output); return 0; }
         catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_ahc_reindex_failed"); return 1; }
+    }
+}
+
+
+extern "C" int wxdouble_fcluster_distance(void* context, const double* tree, uint32_t leaves, double cutoff, uint32_t zero_based, int32_t* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->fcluster_distance(tree, leaves, cutoff, zero_based, output); return 0; }
+        catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_fcluster_failed"); return 1; }
     }
 }

@@ -19,7 +19,7 @@ _HOOK_LOCK = threading.RLock()
 _ACTIVE = False
 
 
-def compile_native_normalization(original, normalize, centroid=None, distance=None, soft_scores=False, argmax=None, resident_argmax=False, inactive=None, kmeans_centroid=None, resident_assignment=None, ahc_distance=None, ahc_reindex=None):
+def compile_native_normalization(original, normalize, centroid=None, distance=None, soft_scores=False, argmax=None, resident_argmax=False, inactive=None, kmeans_centroid=None, resident_assignment=None, ahc_distance=None, ahc_reindex=None, ahc_cut=None):
     source = textwrap.dedent(inspect.getsource(original))
     if hashlib.sha256(source.encode()).hexdigest() != VBX_CALL_SHA256 or original.__closure__:
         raise ValueError("embedding_vbx_source_not_supported")
@@ -30,6 +30,12 @@ def compile_native_normalization(original, normalize, centroid=None, distance=No
     matches = [node for node in ast.walk(tree) if isinstance(node, ast.Assign) and ast.dump(node) == ast.dump(expected)]
     if len(matches) != 1 or len(tree.body) != 1 or not isinstance(tree.body[0], ast.FunctionDef) or tree.body[0].decorator_list:
         raise ValueError("embedding_vbx_normalization_contract_changed")
+    if ahc_cut is not None:
+        expected_cut = ast.parse('ahc_clusters = fcluster(dendrogram, self.threshold, criterion="distance") - 1').body[0]
+        cut_matches = [node for node in ast.walk(tree) if isinstance(node, ast.Assign) and ast.dump(node) == ast.dump(expected_cut)]
+        if len(cut_matches) != 1:
+            raise ValueError("ahc_cut_expression_contract_changed")
+        cut_matches[0].value = ast.parse("__wx_ahc_cut(dendrogram, self.threshold)", mode="eval").body
     if ahc_reindex is not None:
         expected_reindex = ast.parse("_, ahc_clusters = np.unique(ahc_clusters, return_inverse=True)").body[0]
         reindex_matches = [node for node in ast.walk(tree) if isinstance(node, ast.Assign) and ast.dump(node) == ast.dump(expected_reindex)]
@@ -102,6 +108,7 @@ def compile_native_normalization(original, normalize, centroid=None, distance=No
         matches[0].value = ast.copy_location(ast.parse("__wx_native_embedding_normalize(train_embeddings)").body[0].value, matches[0].value)
     namespace = dict(original.__globals__)
     namespace["__wx_native_embedding_normalize"] = normalize
+    namespace["__wx_ahc_cut"] = ahc_cut
     namespace["__wx_ahc_reindex"] = ahc_reindex
     namespace["__wx_ahc_distances"] = ahc_distance
     namespace["__wx_native_centroids"] = centroid
@@ -200,7 +207,7 @@ def inactive_speaker_mask(context, records, scores, segments):
 
 
 @contextlib.contextmanager
-def native_embedding_normalization(context, records, centroid_context=None, centroid_records=None, distance_context=None, distance_records=None, soft_scores=False, argmax_context=None, argmax_records=None, resident_argmax=False, inactive_context=None, inactive_records=None, kmeans_context=None, kmeans_records=None, resident_assignment_context=None, resident_assignment_records=None, ahc_context=None, ahc_records=None, reindex_context=None, reindex_records=None):
+def native_embedding_normalization(context, records, centroid_context=None, centroid_records=None, distance_context=None, distance_records=None, soft_scores=False, argmax_context=None, argmax_records=None, resident_argmax=False, inactive_context=None, inactive_records=None, kmeans_context=None, kmeans_records=None, resident_assignment_context=None, resident_assignment_records=None, ahc_context=None, ahc_records=None, reindex_context=None, reindex_records=None, cut_context=None, cut_records=None):
     global _ACTIVE
     from pyannote.audio.pipelines.clustering import VBxClustering
 
@@ -226,6 +233,13 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
                 raise ValueError("vbx_centroid_numpy_not_supported")
             if getattr(centroid_context.library, "wxdouble_vbx_centroids", None) is None:
                 raise ValueError("double_vbx_centroid_abi_unavailable")
+        if cut_context is not None:
+            from tools.baseline.native_ahc_cut import validate_cut_reference
+            if not isinstance(cut_records, list):
+                raise ValueError("ahc_cut_records_required")
+            if getattr(cut_context.library, "wxdouble_fcluster_distance", None) is None:
+                raise ValueError("double_fcluster_abi_unavailable")
+            validate_cut_reference(VBxClustering.__call__)
         if reindex_context is not None:
             from tools.baseline.native_ahc_reindex import validate_reindex_reference
             if not isinstance(reindex_records, list):
@@ -288,7 +302,7 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
                 raise ValueError("double_vbx_cosine_abi_unavailable")
             if VBxClustering.__call__.__globals__.get("cdist") is not spatial_distance.cdist or hashlib.sha256(textwrap.dedent(inspect.getsource(spatial_distance.cdist)).encode()).hexdigest() != CDIST_SHA256:
                 raise ValueError("vbx_cosine_reference_not_supported")
-        if context is None and centroid_context is None and distance_context is None and argmax_context is None and inactive_context is None and kmeans_context is None and resident_assignment_context is None and ahc_context is None and reindex_context is None:
+        if context is None and centroid_context is None and distance_context is None and argmax_context is None and inactive_context is None and kmeans_context is None and resident_assignment_context is None and ahc_context is None and reindex_context is None and cut_context is None:
             raise ValueError("embedding_or_centroid_context_required")
         original = VBxClustering.__call__
         owner_thread = threading.get_ident()
@@ -349,15 +363,25 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
             from tools.baseline.native_ahc_distances import condensed_distances
             output = condensed_distances(ahc_context, ahc_records, values)
             ahc_records[-1]["original_call_sha256"] = VBX_CALL_SHA256
+            if cut_context is not None:
+                ahc_records[-1]["cpu_residuals"].remove("original_fcluster")
             return output
 
         def ahc_reindex(labels):
             from tools.baseline.native_ahc_reindex import reindex_labels
             output = reindex_labels(reindex_context, reindex_records, labels)
             reindex_records[-1]["original_call_sha256"] = VBX_CALL_SHA256
+            if cut_context is not None:
+                reindex_records[-1]["cpu_residuals"].remove("fcluster")
             return output
 
-        candidate = compile_native_normalization(original, normalize if context is not None else None, centroids if centroid_context is not None else None, distances if distance_context is not None else None, soft_scores=soft_scores, argmax=assign if argmax_context is not None else None, resident_argmax=resident_argmax, inactive=mask_inactive if inactive_context is not None else None, kmeans_centroid=forced_centroids if kmeans_context is not None else None, resident_assignment=assign_resident if resident_assignment_context is not None else None, ahc_distance=ahc_distances if ahc_context is not None else None, ahc_reindex=ahc_reindex if reindex_context is not None else None)
+        def ahc_cut(tree, cutoff):
+            from tools.baseline.native_ahc_cut import cut_tree
+            output = cut_tree(cut_context, cut_records, tree, cutoff)
+            cut_records[-1]["original_call_sha256"] = VBX_CALL_SHA256
+            return output
+
+        candidate = compile_native_normalization(original, normalize if context is not None else None, centroids if centroid_context is not None else None, distances if distance_context is not None else None, soft_scores=soft_scores, argmax=assign if argmax_context is not None else None, resident_argmax=resident_argmax, inactive=mask_inactive if inactive_context is not None else None, kmeans_centroid=forced_centroids if kmeans_context is not None else None, resident_assignment=assign_resident if resident_assignment_context is not None else None, ahc_distance=ahc_distances if ahc_context is not None else None, ahc_reindex=ahc_reindex if reindex_context is not None else None, ahc_cut=ahc_cut if cut_context is not None else None)
 
         @functools.wraps(original)
         def wrapped(*args, **kwargs):

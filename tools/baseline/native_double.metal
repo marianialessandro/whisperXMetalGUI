@@ -937,3 +937,42 @@ kernel void integer_ahc_reindex(device const long* labels [[buffer(0)]], constan
     rank += popcount(present[word] & ((1ul << (label % 64)) - 1));
     output[row] = long(rank);
 }
+
+
+struct FclusterDimensions { uint leaves, zero_based; ulong cutoff; };
+
+uint fcluster_child(ulong bits) {
+    if ((bits & 0x7ffffffffffffffful) == 0) return 0;
+    return uint(((bits & 0xffffffffffffful) | (1ul << 52)) >> (1075 - uint((bits >> 52) & 0x7ff)));
+}
+
+// Adapted from SciPy cluster_monocrit; copyright and BSD terms are retained in native_fcluster_notice.txt.
+kernel void double_fcluster_distance(device const ulong* tree [[buffer(0)]], constant FclusterDimensions& d [[buffer(1)]], device int* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    if (index != 0) return;
+    ulong maxima[256];
+    uint stack[256];
+    uchar visited[512];
+    for (uint i = 0; i < 512; ++i) visited[i] = 0;
+    for (uint row = 0; row < d.leaves - 1; ++row) {
+        uint left = fcluster_child(tree[row * 4]), right = fcluster_child(tree[row * 4 + 1]);
+        ulong height = tree[row * 4 + 2] & 0x7ffffffffffffffful;
+        if (left >= d.leaves) height = max(height, maxima[left - d.leaves]);
+        if (right >= d.leaves) height = max(height, maxima[right - d.leaves]);
+        maxima[row] = height;
+    }
+    int depth = 0, leader = -1, clusters = 0;
+    stack[0] = 2 * d.leaves - 2;
+    bool negative_cutoff = (d.cutoff >> 63) != 0 && (d.cutoff & 0x7ffffffffffffffful) != 0;
+    ulong cutoff = d.cutoff & 0x7ffffffffffffffful;
+    while (depth >= 0) {
+        uint root = stack[depth] - d.leaves;
+        uint left = fcluster_child(tree[root * 4]), right = fcluster_child(tree[root * 4 + 1]);
+        if (leader == -1 && !negative_cutoff && maxima[root] <= cutoff) { leader = int(root); ++clusters; }
+        if (left >= d.leaves && !visited[left]) { visited[left] = 1; stack[++depth] = left; continue; }
+        if (right >= d.leaves && !visited[right]) { visited[right] = 1; stack[++depth] = right; continue; }
+        if (left < d.leaves) { if (leader == -1) ++clusters; output[left] = clusters - int(d.zero_based); }
+        if (right < d.leaves) { if (leader == -1) ++clusters; output[right] = clusters - int(d.zero_based); }
+        if (leader == int(root)) leader = -1;
+        --depth;
+    }
+}
