@@ -18,7 +18,7 @@ _LOCK = threading.RLock()
 _ACTIVE = False
 
 
-def compile_native_mean(original, mean, shift=None):
+def compile_native_mean(original, mean, shift=None, norms=None):
     inner = inspect.unwrap(original)
     source = inspect.getsource(inner)
     if hashlib.sha256(source.encode()).hexdigest() != FIT_SHA256 or inner.__closure__:
@@ -30,6 +30,12 @@ def compile_native_mean(original, mean, shift=None):
     if len(tree.body) != 1 or not isinstance(tree.body[0], ast.FunctionDef) or len(tree.body[0].decorator_list) != 1 or ast.dump(tree.body[0].decorator_list[0]) != ast.dump(decorator) or len(matches) != 1:
         raise ValueError("kmeans_mean_expression_contract_changed")
     matches[0].value = ast.parse("__wx_native_kmeans_mean(X)", mode="eval").body
+    if norms is not None:
+        expected_norms = ast.parse("x_squared_norms = row_norms(X, squared=True)").body[0]
+        norm_matches = [node for node in ast.walk(tree) if isinstance(node, ast.Assign) and ast.dump(node) == ast.dump(expected_norms)]
+        if len(norm_matches) != 1:
+            raise ValueError("kmeans_squared_norms_expression_contract_changed")
+        norm_matches[0].value = ast.parse("__wx_native_kmeans_squared_norms(X)", mode="eval").body
     if shift is not None:
         replacements = {}
         for name, add in (("X", False), ("init", False), ("X", True), ("best_centers", True)):
@@ -46,6 +52,7 @@ def compile_native_mean(original, mean, shift=None):
     namespace = dict(inner.__globals__)
     namespace["__wx_native_kmeans_mean"] = mean
     namespace["__wx_native_kmeans_shift"] = shift
+    namespace["__wx_native_kmeans_squared_norms"] = norms
     ast.fix_missing_locations(tree)
     exec(compile(tree, "<WhisperX scoped native KMeans mean>", "exec"), namespace)
     candidate = namespace[tree.body[0].name]
@@ -82,7 +89,7 @@ def shift_inplace(context, records, values, mean, add, role):
 
 
 @contextlib.contextmanager
-def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None):
+def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None):
     global _ACTIVE
     from sklearn.base import _fit_context
     from sklearn.cluster import KMeans
@@ -115,6 +122,14 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
         inner = inspect.unwrap(original)
         if not inspect.isfunction(original) or not inspect.isfunction(inner):
             raise ValueError("kmeans_mean_fit_wrapper_not_supported")
+        if norm_records is not None:
+            from tools.baseline.native_kmeans_norms import squared_norms, validate_reference
+            if not isinstance(norm_records, list):
+                raise ValueError("kmeans_squared_norms_records_required")
+            if getattr(context.library, "wxdouble_kmeans_squared_norms", None) is None:
+                raise ValueError("kmeans_squared_norms_abi_unavailable")
+            original_norms = inner.__globals__.get("row_norms")
+            validate_reference(original_norms)
         reference = _fit_context(prefer_skip_nested_validation=True)(inner)
         closure = dict(zip(original.__code__.co_freevars, (cell.cell_contents for cell in original.__closure__ or ())))
         if original.__code__ is not reference.__code__ or getattr(original, "__wrapped__", None) is not inner or closure.get("fit_method") is not inner or closure.get("prefer_skip_nested_validation") is not True or inner.__globals__.get("_fit_context") is not _fit_context or hashlib.sha256(inspect.getsource(_fit_context).encode()).hexdigest() != FIT_CONTEXT_SHA256:
@@ -125,12 +140,19 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
                 records[-1]["cpu_residuals"] = [name for name in records[-1]["cpu_residuals"] if name not in ("feature_subtraction_and_restoration", "final_centroid_translation")]
             if tolerance_records is not None:
                 records[-1]["cpu_residuals"] = [name for name in records[-1]["cpu_residuals"] if name != "tolerance_variance"]
+            if norm_records is not None:
+                records[-1]["cpu_residuals"] = [name for name in records[-1]["cpu_residuals"] if name != "squared_norms"]
+                records[-1]["cpu_residuals"].append("kmeans_initialization_internal_norms")
             return output
 
         def shift(values, offset, add, role):
             return shift_inplace(context, shift_records, values, offset, add, role)
 
-        candidate = compile_native_mean(original, mean, shift=shift if shift_records is not None else None)
+        def norms(features):
+            from scipy import sparse
+            return original_norms(features, squared=True) if sparse.issparse(features) else squared_norms(context, norm_records, features)
+
+        candidate = compile_native_mean(original, mean, shift=shift if shift_records is not None else None, norms=norms if norm_records is not None else None)
         owner = threading.get_ident()
 
         @functools.wraps(original)

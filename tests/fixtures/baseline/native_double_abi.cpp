@@ -33,6 +33,7 @@ extern "C" int wxdouble_vbx_nan_cleanup(void*, const double*, uint32_t, uint32_t
 extern "C" int wxdouble_vbx_kmeans_centroids(void*, const float*, const int32_t*, uint32_t, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_float_shift(void*, const float*, const float*, uint32_t, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_tolerance(void*, const float*, uint32_t, uint32_t, float, float*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_kmeans_squared_norms(void*, const float*, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -48,6 +49,22 @@ int main(int argc, char** argv) {
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    float norm_values[] = {1, 2, 3, 4}, norm_output[] = {91, 92};
+    assert(wxdouble_kmeans_squared_norms(context, norm_values, 2, 2, norm_output, &metrics, error, sizeof(error)) == 0 && norm_output[0] == 5 && norm_output[1] == 25 && metrics.kernels == 1);
+    norm_output[0] = 91;
+    assert(wxdouble_kmeans_squared_norms(nullptr, norm_values, 2, 2, norm_output, &metrics, error, sizeof(error)) != 0 && norm_output[0] == 91);
+    assert(wxdouble_kmeans_squared_norms(context, nullptr, 2, 2, norm_output, &metrics, error, sizeof(error)) != 0 && norm_output[0] == 91);
+    assert(wxdouble_kmeans_squared_norms(context, norm_values, 2, 2, nullptr, &metrics, error, sizeof(error)) != 0 && norm_output[0] == 91);
+    assert(wxdouble_kmeans_squared_norms(context, norm_values, 2, 2, norm_output, nullptr, error, sizeof(error)) != 0 && norm_output[0] == 91);
+    assert(wxdouble_kmeans_squared_norms(context, norm_values, 4097, 2, norm_output, &metrics, error, sizeof(error)) != 0 && norm_output[0] == 91);
+    assert(wxdouble_kmeans_squared_norms(context, norm_values, 2, 0, norm_output, &metrics, error, sizeof(error)) != 0 && norm_output[0] == 91);
+    assert(wxdouble_kmeans_squared_norms(context, norm_values, 2, 1025, norm_output, &metrics, error, sizeof(error)) != 0 && norm_output[0] == 91);
+    for (float invalid : {0x1p-33f, 0x1p33f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+        norm_values[0] = invalid;
+        assert(wxdouble_kmeans_squared_norms(context, norm_values, 2, 2, norm_output, &metrics, error, sizeof(error)) != 0 && norm_output[0] == 91);
+    }
+    norm_values[0] = 1;
+    assert(wxdouble_kmeans_squared_norms(context, norm_values, 2, 2, norm_values, &metrics, error, sizeof(error)) == 0 && norm_values[0] == 5 && norm_values[1] == 25);
     float tolerance_values[] = {1, 2, 3, 4}, tolerance_output = 91;
     assert(wxdouble_kmeans_tolerance(context, tolerance_values, 2, 2, .5f, &tolerance_output, &metrics, error, sizeof(error)) == 0 && tolerance_output == .5f && metrics.kernels == 4);
     tolerance_output = 91;
@@ -535,6 +552,13 @@ int main(int argc, char** argv) {
     assert(wxdouble_float_shift(context, shift_values, shift_mean, 2, 2, 0, shift_output, &metrics, error, sizeof(error)) == 0);
     tolerance_output = 91;
     assert(wxdouble_kmeans_tolerance(context, tolerance_values, 2, 2, .5f, &tolerance_output, &metrics, error, sizeof(error)) != 0 && tolerance_output == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_norm_shader = shader.substr(0, shader.find("\nstruct KmeansNormDimensions"));
+    assert(wxdouble_create(pre_norm_shader.data(), pre_norm_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_kmeans_tolerance(context, tolerance_values, 2, 2, .5f, &tolerance_output, &metrics, error, sizeof(error)) == 0);
+    norm_output[0] = 91;
+    assert(wxdouble_kmeans_squared_norms(context, norm_values, 2, 2, norm_output, &metrics, error, sizeof(error)) != 0 && norm_output[0] == 91);
     wxdouble_destroy(context);
 
 }

@@ -691,3 +691,25 @@ kernel void float_kmeans_tolerance_final(device const float* statistics [[buffer
     if ((sum > 0 && sum < float(d.columns) * 0x1p-126f) || (sum > 0 && mean == 0) || (mean != 0 && (as_type<uint>(mean) & 0x7f800000u) == 0) || (mean > 0 && result == 0) || (result != 0 && (as_type<uint>(result) & 0x7f800000u) == 0)) result = as_type<float>(0x7fc00000u);
     output[0] = result;
 }
+
+struct KmeansNormDimensions { uint rows, columns; };
+
+// Match the pinned NumPy ARM NEON four-lane fused accumulation, with reversed four-vector blocks and a pairwise horizontal sum.
+kernel void float_kmeans_squared_norms(device const float* values [[buffer(0)]], constant KmeansNormDimensions& d [[buffer(1)]], device float* output [[buffer(2)]], uint row [[thread_position_in_grid]]) {
+    if (row >= d.rows) return;
+    float4 accum = float4(0.0f);
+    uint column = 0;
+    for (; column + 16 <= d.columns; column += 16) {
+        for (int block = 3; block >= 0; --block) {
+            uint start = row * d.columns + column + uint(block) * 4;
+            float4 x = float4(values[start], values[start + 1], values[start + 2], values[start + 3]);
+            accum = fma(x, x, accum);
+        }
+    }
+    for (; column < d.columns; column += 4) {
+        float4 x = float4(0.0f);
+        for (uint lane = 0; lane < 4 && column + lane < d.columns; ++lane) x[lane] = values[row * d.columns + column + lane];
+        accum = fma(x, x, accum);
+    }
+    output[row] = 0.0f + ((accum.x + accum.y) + (accum.z + accum.w));
+}
