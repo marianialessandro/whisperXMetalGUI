@@ -738,3 +738,15 @@ kernel void float_kmeans_candidate_minimum(device const float* candidates [[buff
     float a = closest[index % d.columns], b = candidates[index];
     output[index] = a == 0.0f && b == 0.0f ? as_type<float>(as_type<uint>(a) | as_type<uint>(b)) : (a < b ? a : b);
 }
+
+struct KmeansProbabilityDimensions { uint count; };
+
+kernel void float_kmeans_seed_weight_sum(device const float* weights [[buffer(0)]], constant KmeansProbabilityDimensions& d [[buffer(1)]], device float* total [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    if (index != 0) return;
+    float sum = kmeans_float_sum(weights, d.count);
+    total[0] = isfinite(sum) && sum > 0.0f ? sum : as_type<float>(0x7fc00000u);
+}
+
+kernel void float_kmeans_seed_probabilities(device const float* weights [[buffer(0)]], constant KmeansProbabilityDimensions& d [[buffer(1)]], device const float* total [[buffer(2)]], device float* output [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index < d.count) output[index] = weights[index] / total[0];
+}

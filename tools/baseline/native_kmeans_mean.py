@@ -89,7 +89,7 @@ def shift_inplace(context, records, values, mean, add, role):
 
 
 @contextlib.contextmanager
-def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None):
+def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None):
     global _ACTIVE
     from sklearn.base import _fit_context
     from sklearn.cluster import KMeans
@@ -110,9 +110,9 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
                 raise ValueError("kmeans_shift_abi_unavailable")
         original_tolerance = None
         original_plusplus = None
-        if prefix_records is not None or minimum_records is not None:
+        if prefix_records is not None or minimum_records is not None or probability_records is not None:
             import sklearn.cluster._kmeans as kmeans_module
-            from tools.baseline.native_kmeans_prefix import compile_native_prefix, weighted_prefix
+            from tools.baseline.native_kmeans_prefix import compile_native_prefix, seed_probabilities, weighted_prefix
             if prefix_records is not None:
                 if not isinstance(prefix_records, list):
                     raise ValueError("kmeans_weighted_prefix_records_required")
@@ -124,10 +124,16 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
                     raise ValueError("kmeans_candidate_minimum_records_required")
                 if getattr(context.library, "wxdouble_kmeans_candidate_minimum", None) is None:
                     raise ValueError("kmeans_candidate_minimum_abi_unavailable")
+            if probability_records is not None:
+                if not isinstance(probability_records, list):
+                    raise ValueError("kmeans_seed_probabilities_records_required")
+                if getattr(context.library, "wxdouble_kmeans_seed_probabilities", None) is None:
+                    raise ValueError("kmeans_seed_probabilities_abi_unavailable")
             original_plusplus = kmeans_module._kmeans_plusplus
             prefix = (lambda weights, distances: weighted_prefix(context, prefix_records, weights, distances)) if prefix_records is not None else None
             minimum = (lambda closest, candidates: candidate_minimum(context, minimum_records, closest, candidates)) if minimum_records is not None else None
-            candidate_plusplus = compile_native_prefix(original_plusplus, prefix, minimum=minimum)
+            probabilities = (lambda weights: seed_probabilities(context, probability_records, weights)) if probability_records is not None else None
+            candidate_plusplus = compile_native_prefix(original_plusplus, prefix, minimum=minimum, probabilities=probabilities)
         if tolerance_records is not None:
             import sklearn.cluster._kmeans as kmeans_module
             from tools.baseline.native_kmeans_tolerance import compile_native_tolerance, tolerance_value

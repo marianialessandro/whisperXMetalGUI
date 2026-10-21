@@ -9,15 +9,17 @@ import textwrap
 
 import numpy as np
 import numpy._core._multiarray_umath as numpy_core
+from numpy._core import _methods
 
 from tools.baseline.native_kmeans_norms import NUMPY_CORE_SHA256
 
 
 PLUSPLUS_SHA256 = "5ecfa4fcb38b550e535120364d38a8bbb1e9686b32e61a06de03c4537c6f44c1"
 CUMSUM_SHA256 = "ec24882ab4ab9cfcf431ba4a96aba567fa07cd9ae6f67f003ee468cf29dcdcb0"
+SUM_SHA256 = "945c5e7a356ce7e229f9d6c60226751036653bf32ca0727056dcfb4023c5d8f3"
 
 
-def compile_native_prefix(original, prefix, minimum=None):
+def compile_native_prefix(original, prefix, minimum=None, probabilities=None):
     if not inspect.isfunction(original) or original.__closure__ or inspect.unwrap(original) is not original:
         raise ValueError("kmeans_weighted_prefix_reference_not_supported")
     source = inspect.getsource(original)
@@ -38,7 +40,19 @@ def compile_native_prefix(original, prefix, minimum=None):
         if len(minimum_matches) != 1:
             raise ValueError("kmeans_candidate_minimum_expression_contract_changed")
     minimum_replacement = ast.parse("__wx_native_kmeans_candidate_minimum(closest_dist_sq, distance_to_candidates)", mode="eval").body
+    probability_matches = []
+    if probabilities is not None:
+        if hashlib.sha256(inspect.getsource(_methods._sum).encode()).hexdigest() != SUM_SHA256:
+            raise ValueError("kmeans_seed_probabilities_runtime_not_supported")
+        expected_probability = ast.parse("sample_weight / sample_weight.sum()", mode="eval").body
+        probability_matches = [node for node in ast.walk(tree) if isinstance(node, ast.BinOp) and ast.dump(node) == ast.dump(expected_probability)]
+        if len(probability_matches) != 1:
+            raise ValueError("kmeans_seed_probabilities_expression_contract_changed")
+    probability_replacement = ast.parse("__wx_native_kmeans_seed_probabilities(sample_weight)", mode="eval").body
     class ReplacePrefix(ast.NodeTransformer):
+        def visit_BinOp(self, node):
+            return ast.copy_location(probability_replacement, node) if probability_matches and node is probability_matches[0] else self.generic_visit(node)
+
         def visit_Call(self, node):
             if prefix is not None and node is matches[0]:
                 return ast.copy_location(replacement, node)
@@ -49,6 +63,7 @@ def compile_native_prefix(original, prefix, minimum=None):
     namespace = dict(original.__globals__)
     namespace["__wx_native_kmeans_weighted_prefix"] = prefix
     namespace["__wx_native_kmeans_candidate_minimum"] = minimum
+    namespace["__wx_native_kmeans_seed_probabilities"] = probabilities
     ast.fix_missing_locations(tree)
     exec(compile(tree, "<WhisperX scoped native KMeans++ weighted prefix>", "exec"), namespace)
     candidate = namespace[tree.body[0].name]
@@ -61,5 +76,13 @@ def weighted_prefix(context, records, weights, distances):
     result, record = context.kmeans_weighted_prefix(weights, distances)
     record = dict(record)
     record.update({"adapter_scope": "sklearn_dense_kmeans_plusplus_candidate_distribution", "original_plusplus_sha256": PLUSPLUS_SHA256, "numpy_cumsum_sha256": CUMSUM_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "cpu_residuals": ["rng", "candidate_searchsorted_and_clipping", "distance_and_potential_computation", "best_candidate_selection", "lloyd_or_elkan", "host_staging_and_control"]})
+    records.append(record)
+    return result
+
+
+def seed_probabilities(context, records, weights):
+    result, record = context.kmeans_seed_probabilities(weights)
+    record = dict(record)
+    record.update({"adapter_scope": "sklearn_dense_kmeans_plusplus_first_seed_probabilities", "original_plusplus_sha256": PLUSPLUS_SHA256, "numpy_sum_sha256": SUM_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "cpu_residuals": ["rng_and_choice_internal_probability_validation", "distance_and_potential_computation", "candidate_searchsorted_and_clipping", "best_candidate_selection", "lloyd_or_elkan", "host_staging_and_control"]})
     records.append(record)
     return result
