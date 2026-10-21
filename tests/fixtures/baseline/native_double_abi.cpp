@@ -35,6 +35,7 @@ extern "C" int wxdouble_float_shift(void*, const float*, const float*, uint32_t,
 extern "C" int wxdouble_kmeans_tolerance(void*, const float*, uint32_t, uint32_t, float, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_squared_norms(void*, const float*, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_weighted_prefix(void*, const float*, const float*, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_kmeans_candidate_minimum(void*, const float*, const float*, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -50,6 +51,25 @@ int main(int argc, char** argv) {
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    float minimum_closest[] = {1, 2}, minimum_candidates[] = {3, 1, 0, 4}, minimum_output[] = {91, 92, 93, 94};
+    assert(wxdouble_kmeans_candidate_minimum(context, minimum_closest, minimum_candidates, 2, 2, minimum_output, &metrics, error, sizeof(error)) == 0 && minimum_output[0] == 1 && minimum_output[1] == 1 && minimum_output[2] == 0 && minimum_output[3] == 2 && metrics.kernels == 1);
+    minimum_output[0] = 91;
+    assert(wxdouble_kmeans_candidate_minimum(nullptr, minimum_closest, minimum_candidates, 2, 2, minimum_output, &metrics, error, sizeof(error)) != 0 && minimum_output[0] == 91);
+    assert(wxdouble_kmeans_candidate_minimum(context, nullptr, minimum_candidates, 2, 2, minimum_output, &metrics, error, sizeof(error)) != 0 && minimum_output[0] == 91);
+    assert(wxdouble_kmeans_candidate_minimum(context, minimum_closest, nullptr, 2, 2, minimum_output, &metrics, error, sizeof(error)) != 0 && minimum_output[0] == 91);
+    assert(wxdouble_kmeans_candidate_minimum(context, minimum_closest, minimum_candidates, 2, 2, nullptr, &metrics, error, sizeof(error)) != 0 && minimum_output[0] == 91);
+    assert(wxdouble_kmeans_candidate_minimum(context, minimum_closest, minimum_candidates, 2, 2, minimum_output, nullptr, error, sizeof(error)) != 0 && minimum_output[0] == 91);
+    assert(wxdouble_kmeans_candidate_minimum(context, minimum_closest, minimum_candidates, 0, 2, minimum_output, &metrics, error, sizeof(error)) != 0 && minimum_output[0] == 91);
+    assert(wxdouble_kmeans_candidate_minimum(context, minimum_closest, minimum_candidates, 1025, 2, minimum_output, &metrics, error, sizeof(error)) != 0 && minimum_output[0] == 91);
+    assert(wxdouble_kmeans_candidate_minimum(context, minimum_closest, minimum_candidates, 2, 4097, minimum_output, &metrics, error, sizeof(error)) != 0 && minimum_output[0] == 91);
+    for (float invalid : {-1.f, 0x1p-101f, 0x1p65f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+        minimum_closest[0] = invalid;
+        assert(wxdouble_kmeans_candidate_minimum(context, minimum_closest, minimum_candidates, 2, 2, minimum_output, &metrics, error, sizeof(error)) != 0 && minimum_output[0] == 91);
+        minimum_closest[0] = 1; minimum_candidates[0] = invalid;
+        assert(wxdouble_kmeans_candidate_minimum(context, minimum_closest, minimum_candidates, 2, 2, minimum_output, &metrics, error, sizeof(error)) != 0 && minimum_output[0] == 91);
+        minimum_candidates[0] = 3;
+    }
+    assert(wxdouble_kmeans_candidate_minimum(context, minimum_closest, minimum_candidates, 2, 2, minimum_candidates, &metrics, error, sizeof(error)) == 0 && minimum_candidates[0] == 1 && minimum_candidates[3] == 2);
     float prefix_weights[] = {1, 2, 3}, prefix_distances[] = {2, 3, 4}, prefix_output[] = {91, 92, 93};
     assert(wxdouble_kmeans_weighted_prefix(context, prefix_weights, prefix_distances, 3, prefix_output, &metrics, error, sizeof(error)) == 0 && prefix_output[0] == 2 && prefix_output[1] == 8 && prefix_output[2] == 20 && metrics.kernels == 2);
     prefix_output[0] = 91;
@@ -585,6 +605,13 @@ int main(int argc, char** argv) {
     assert(wxdouble_kmeans_squared_norms(context, norm_values, 2, 2, norm_output, &metrics, error, sizeof(error)) == 0);
     prefix_output[0] = 91;
     assert(wxdouble_kmeans_weighted_prefix(context, prefix_weights, prefix_distances, 3, prefix_output, &metrics, error, sizeof(error)) != 0 && prefix_output[0] == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_minimum_shader = shader.substr(0, shader.find("\nstruct KmeansMinimumDimensions"));
+    assert(wxdouble_create(pre_minimum_shader.data(), pre_minimum_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_kmeans_weighted_prefix(context, prefix_weights, prefix_distances, 3, prefix_output, &metrics, error, sizeof(error)) == 0);
+    minimum_output[0] = 91;
+    assert(wxdouble_kmeans_candidate_minimum(context, minimum_closest, minimum_candidates, 2, 2, minimum_output, &metrics, error, sizeof(error)) != 0 && minimum_output[0] == 91);
     wxdouble_destroy(context);
 
 }

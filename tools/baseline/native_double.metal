@@ -730,3 +730,11 @@ kernel void float_kmeans_weighted_prefix(device const float* products [[buffer(0
         output[i] = accum;
     }
 }
+
+struct KmeansMinimumDimensions { uint rows, columns; };
+
+kernel void float_kmeans_candidate_minimum(device const float* candidates [[buffer(0)]], constant KmeansMinimumDimensions& d [[buffer(1)]], device const float* closest [[buffer(2)]], device float* output [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index >= d.rows * d.columns) return;
+    float a = closest[index % d.columns], b = candidates[index];
+    output[index] = a == 0.0f && b == 0.0f ? as_type<float>(as_type<uint>(a) | as_type<uint>(b)) : (a < b ? a : b);
+}

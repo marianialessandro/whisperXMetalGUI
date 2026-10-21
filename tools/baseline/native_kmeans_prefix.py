@@ -17,7 +17,7 @@ PLUSPLUS_SHA256 = "5ecfa4fcb38b550e535120364d38a8bbb1e9686b32e61a06de03c4537c6f4
 CUMSUM_SHA256 = "ec24882ab4ab9cfcf431ba4a96aba567fa07cd9ae6f67f003ee468cf29dcdcb0"
 
 
-def compile_native_prefix(original, prefix):
+def compile_native_prefix(original, prefix, minimum=None):
     if not inspect.isfunction(original) or original.__closure__ or inspect.unwrap(original) is not original:
         raise ValueError("kmeans_weighted_prefix_reference_not_supported")
     source = inspect.getsource(original)
@@ -31,12 +31,24 @@ def compile_native_prefix(original, prefix):
     if len(tree.body) != 1 or not isinstance(tree.body[0], ast.FunctionDef) or tree.body[0].decorator_list or len(matches) != 1:
         raise ValueError("kmeans_weighted_prefix_expression_contract_changed")
     replacement = ast.parse("__wx_native_kmeans_weighted_prefix(sample_weight, closest_dist_sq)", mode="eval").body
+    minimum_matches = []
+    if minimum is not None:
+        expected_minimum = ast.parse("np.minimum(closest_dist_sq, distance_to_candidates, out=distance_to_candidates)", mode="eval").body
+        minimum_matches = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.dump(node) == ast.dump(expected_minimum)]
+        if len(minimum_matches) != 1:
+            raise ValueError("kmeans_candidate_minimum_expression_contract_changed")
+    minimum_replacement = ast.parse("__wx_native_kmeans_candidate_minimum(closest_dist_sq, distance_to_candidates)", mode="eval").body
     class ReplacePrefix(ast.NodeTransformer):
         def visit_Call(self, node):
-            return ast.copy_location(replacement, node) if node is matches[0] else self.generic_visit(node)
+            if prefix is not None and node is matches[0]:
+                return ast.copy_location(replacement, node)
+            if minimum_matches and node is minimum_matches[0]:
+                return ast.copy_location(minimum_replacement, node)
+            return self.generic_visit(node)
     tree = ReplacePrefix().visit(tree)
     namespace = dict(original.__globals__)
     namespace["__wx_native_kmeans_weighted_prefix"] = prefix
+    namespace["__wx_native_kmeans_candidate_minimum"] = minimum
     ast.fix_missing_locations(tree)
     exec(compile(tree, "<WhisperX scoped native KMeans++ weighted prefix>", "exec"), namespace)
     candidate = namespace[tree.body[0].name]
