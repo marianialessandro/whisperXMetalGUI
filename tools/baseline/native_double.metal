@@ -922,3 +922,18 @@ kernel void double_pdist_euclidean(device const ulong* values [[buffer(0)]], con
     }
     output[pair] = sqrt_positive_binary64(sum);
 }
+
+
+struct ReindexDimensions { uint count; };
+
+// The inverse index is the number of distinct labels smaller than the current label.
+kernel void integer_ahc_reindex(device const long* labels [[buffer(0)]], constant ReindexDimensions& d [[buffer(1)]], device long* output [[buffer(2)]], uint row [[thread_position_in_grid]]) {
+    if (row >= d.count) return;
+    ulong present[64];
+    for (uint word = 0; word < 64; ++word) present[word] = 0;
+    for (uint index = 0; index < d.count; ++index) { uint label = uint(labels[index]); present[label / 64] |= 1ul << (label % 64); }
+    uint label = uint(labels[row]), word = label / 64, rank = 0;
+    for (uint index = 0; index < word; ++index) rank += popcount(present[index]);
+    rank += popcount(present[word] & ((1ul << (label % 64)) - 1));
+    output[row] = long(rank);
+}

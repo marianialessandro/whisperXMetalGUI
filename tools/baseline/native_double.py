@@ -537,6 +537,28 @@ class NativeDoubleNormalization:
             raise ValueError("double_vbx_one_hot_native_result_invalid")
         return output, {"scope": "experimental_native_binary64_vbx_one_hot", "operation": "initial_one_hot", "rows": rows, "columns": columns, "gpu_kernels": ["double_vbx_one_hot"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": labels.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
+    def ahc_reindex(self, labels):
+        if type(labels) is not np.ndarray or labels.dtype != np.int64 or labels.ndim != 1 or not labels.flags.c_contiguous:
+            raise ValueError("double_ahc_reindex_input_format_invalid")
+        if not 0 < labels.size <= 4096:
+            raise ValueError("double_ahc_reindex_shape_invalid")
+        output, metrics, error = np.empty_like(labels), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_ahc_reindex
+            except AttributeError as failure:
+                raise ValueError("double_ahc_reindex_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, labels.ctypes.data, labels.size, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 1 or np.any(output < 0) or np.any(output >= labels.size):
+            raise ValueError("double_ahc_reindex_native_result_invalid")
+        return output, {"scope": "experimental_native_integer_ahc_label_reindex", "count": labels.size, "label_domain_size": 4096, "ordering": "ascending_distinct_label_rank", "gpu_kernels": ["integer_ahc_reindex"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": labels.nbytes, "logical_result_readback_bytes": output.nbytes, "private_presence_bytes_per_thread": 512, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+
     def pdist_euclidean(self, values):
         if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim != 2 or not values.flags.c_contiguous:
             raise ValueError("double_pdist_input_format_invalid")

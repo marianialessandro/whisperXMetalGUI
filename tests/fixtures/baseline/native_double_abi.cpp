@@ -44,6 +44,7 @@ extern "C" int wxdouble_linear_assignment_max(void*, const double*, uint32_t, ui
 extern "C" int wxdouble_assignment_batch(void*, const double*, uint32_t, uint32_t, uint32_t, int8_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_inactive_assignment(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, uint32_t, double*, int8_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_pdist_euclidean(void*, const double*, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_ahc_reindex(void*, const int64_t*, uint32_t, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -59,6 +60,26 @@ int main(int argc, char** argv) {
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    int64_t reindex_labels[] = {63, 0, 63, 4095}, reindex_output[] = {91, 92, 93, 94};
+    assert(wxdouble_ahc_reindex(context, reindex_labels, 4, reindex_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 1 && reindex_output[0] == 1 && reindex_output[1] == 0 && reindex_output[2] == 1 && reindex_output[3] == 2);
+    reindex_output[0] = 91;
+    assert(wxdouble_ahc_reindex(nullptr, reindex_labels, 4, reindex_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_ahc_reindex(context, nullptr, 4, reindex_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_ahc_reindex(context, reindex_labels, 4, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_ahc_reindex(context, reindex_labels, 4, reindex_output, nullptr, error, sizeof(error)) != 0);
+    for (uint32_t count : {0u, 4097u}) assert(wxdouble_ahc_reindex(context, reindex_labels, count, reindex_output, &metrics, error, sizeof(error)) != 0 && reindex_output[0] == 91);
+    for (int64_t invalid : {int64_t(-1), int64_t(4096), std::numeric_limits<int64_t>::max()}) {
+        reindex_labels[0] = invalid;
+        assert(wxdouble_ahc_reindex(context, reindex_labels, 4, reindex_output, &metrics, error, sizeof(error)) != 0 && reindex_output[0] == 91);
+    }
+    reindex_labels[0] = 63;
+    alignas(int64_t) unsigned char reindex_unaligned_input[sizeof(reindex_labels) + 1], reindex_unaligned_output[sizeof(reindex_output) + 1];
+    std::memcpy(reindex_unaligned_input + 1, reindex_labels, sizeof(reindex_labels));
+    assert(wxdouble_ahc_reindex(context, reinterpret_cast<int64_t*>(reindex_unaligned_input + 1), 4, reinterpret_cast<int64_t*>(reindex_unaligned_output + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(reindex_output, reindex_unaligned_output + 1, sizeof(reindex_output));
+    assert(reindex_output[0] == 1 && reindex_output[3] == 2);
+    assert(wxdouble_ahc_reindex(context, reindex_labels, 4, reindex_labels, &metrics, error, sizeof(error)) == 0 && reindex_labels[0] == 1 && reindex_labels[3] == 2);
+
     double pdist_values[] = {0, 0, 3, 4, 3, 0}, pdist_output[] = {91, 92, 93};
     assert(wxdouble_pdist_euclidean(context, pdist_values, 3, 2, pdist_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 1 && pdist_output[0] == 5 && pdist_output[1] == 3 && pdist_output[2] == 4);
     pdist_output[0] = 91;
@@ -837,6 +858,14 @@ int main(int argc, char** argv) {
     assert(wxdouble_inactive_assignment(context, resident_old_scores, resident_old_segments, 1, 2, 3, 2, resident_masked, resident_labels, &metrics, error, sizeof(error)) == 0);
     pdist_output[0] = 91;
     assert(wxdouble_pdist_euclidean(context, pdist_values, 3, 2, pdist_output, &metrics, error, sizeof(error)) != 0 && pdist_output[0] == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_reindex_shader = shader.substr(0, shader.find("\nstruct ReindexDimensions"));
+    assert(wxdouble_create(pre_reindex_shader.data(), pre_reindex_shader.size(), &context, error, sizeof(error)) == 0);
+    double reindex_legacy_points[] = {0, 0, 3, 4};
+    assert(wxdouble_pdist_euclidean(context, reindex_legacy_points, 2, 2, pdist_output, &metrics, error, sizeof(error)) == 0 && pdist_output[0] == 5);
+    reindex_output[0] = 91;
+    assert(wxdouble_ahc_reindex(context, reindex_labels, 4, reindex_output, &metrics, error, sizeof(error)) != 0 && reindex_output[0] == 91);
     wxdouble_destroy(context);
 
 }

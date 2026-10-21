@@ -20,6 +20,7 @@ struct KmeansMinimumDimensions { uint32_t rows, columns; };
 struct KmeansProbabilityDimensions { uint32_t count; };
 struct KmeansSearchDimensions { uint32_t count, queries; };
 struct KmeansBestDimensions { uint32_t count; };
+struct ReindexDimensions { uint32_t count; };
 struct PdistDimensions { uint32_t rows, features; };
 struct AssignmentDimensions { uint32_t rows, columns; };
 struct AssignmentBatchDimensions { uint32_t chunks, rows, columns; };
@@ -58,7 +59,7 @@ class DoubleContext {
     id<MTLComputePipelineState> kmeans_centroid_pipeline_;
     id<MTLComputePipelineState> float_shift_pipeline_;
     id<MTLComputePipelineState> tolerance_mean_pipeline_, tolerance_square_pipeline_, tolerance_final_pipeline_;
-    id<MTLComputePipelineState> pdist_pipeline_, inactive_assignment_pipeline_, assignment_batch_pipeline_, assignment_pipeline_, kmeans_best_pipeline_, kmeans_search_pipeline_, kmeans_probability_sum_pipeline_, kmeans_probability_pipeline_, kmeans_minimum_pipeline_, kmeans_norm_pipeline_, kmeans_weighted_products_pipeline_, kmeans_weighted_prefix_pipeline_;
+    id<MTLComputePipelineState> reindex_pipeline_, pdist_pipeline_, inactive_assignment_pipeline_, assignment_batch_pipeline_, assignment_pipeline_, kmeans_best_pipeline_, kmeans_search_pipeline_, kmeans_probability_sum_pipeline_, kmeans_probability_pipeline_, kmeans_minimum_pipeline_, kmeans_norm_pipeline_, kmeans_weighted_products_pipeline_, kmeans_weighted_prefix_pipeline_;
     id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_, cosine_norm_pipeline_, cosine_distance_pipeline_, cosine_score_pipeline_, argmax_pipeline_, minimum_pipeline_, inactive_pipeline_, nan_minimum_pipeline_, nan_cleanup_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
@@ -141,6 +142,8 @@ public:
         if (best_candidate_function != nil) kmeans_best_pipeline_ = [device_ newComputePipelineStateWithFunction:best_candidate_function error:&error];
         id<MTLFunction> assignment_function = [library newFunctionWithName:@"double_linear_assignment_max"];
         if (assignment_function != nil) assignment_pipeline_ = [device_ newComputePipelineStateWithFunction:assignment_function error:&error];
+        id<MTLFunction> reindex_function = [library newFunctionWithName:@"integer_ahc_reindex"];
+        if (reindex_function != nil) reindex_pipeline_ = [device_ newComputePipelineStateWithFunction:reindex_function error:&error];
         id<MTLFunction> pdist_function = [library newFunctionWithName:@"double_pdist_euclidean"];
         if (pdist_function != nil) pdist_pipeline_ = [device_ newComputePipelineStateWithFunction:pdist_function error:&error];
         id<MTLFunction> inactive_assignment_function = [library newFunctionWithName:@"double_inactive_assignment_batch"];
@@ -411,6 +414,30 @@ public:
         for (uint32_t row = 0; row < d.rows; ++row) require(std::isfinite(static_cast<const double*>(terms_.contents)[row]), "double_vbx_logsumexp_shift_domain_invalid");
         std::memcpy(output, terms_.contents, uint64_t(d.rows) * sizeof(double));
         return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
+    DoubleMetrics ahc_reindex(const int64_t* labels, uint32_t count, int64_t* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(reindex_pipeline_ != nil, "double_ahc_reindex_kernel_unavailable");
+        require(labels != nullptr && output != nullptr && count > 0 && count <= 4096, "double_ahc_reindex_shape_or_pointer_invalid");
+        for (uint32_t index = 0; index < count; ++index) {
+            int64_t label = 0; std::memcpy(&label, reinterpret_cast<const unsigned char*>(labels) + uint64_t(index) * sizeof(label), sizeof(label));
+            require(label >= 0 && label < 4096, "double_ahc_reindex_label_domain_invalid");
+        }
+        ReindexDimensions d = {count};
+        auto started = std::chrono::steady_clock::now();
+        reserve(input_, uint64_t(count) * sizeof(int64_t)); reserve(output_, uint64_t(count) * sizeof(int64_t));
+        std::memcpy(input_.contents, reinterpret_cast<const unsigned char*>(labels), uint64_t(count) * sizeof(int64_t));
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental integer AHC label reindex";
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:reindex_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:output_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(32, reindex_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        const int64_t* result = static_cast<const int64_t*>(output_.contents);
+        for (uint32_t index = 0; index < count; ++index) require(result[index] >= 0 && result[index] < count, "double_ahc_reindex_result_invalid");
+        std::memcpy(reinterpret_cast<unsigned char*>(output), result, uint64_t(count) * sizeof(int64_t));
+        return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
     DoubleMetrics pdist_euclidean(const double* values, PdistDimensions d, double* output) {
@@ -1330,5 +1357,14 @@ extern "C" int wxdouble_pdist_euclidean(void* context, const double* values, uin
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->pdist_euclidean(values, {rows, features}, output); return 0; }
         catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_pdist_failed"); return 1; }
+    }
+}
+
+
+extern "C" int wxdouble_ahc_reindex(void* context, const int64_t* labels, uint32_t count, int64_t* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->ahc_reindex(labels, count, output); return 0; }
+        catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_ahc_reindex_failed"); return 1; }
     }
 }
