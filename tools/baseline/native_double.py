@@ -537,6 +537,30 @@ class NativeDoubleNormalization:
             raise ValueError("double_vbx_one_hot_native_result_invalid")
         return output, {"scope": "experimental_native_binary64_vbx_one_hot", "operation": "initial_one_hot", "rows": rows, "columns": columns, "gpu_kernels": ["double_vbx_one_hot"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": labels.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
+    def kmeans_candidate_search(self, cdf, queries):
+        if type(cdf) is not np.ndarray or cdf.dtype != np.float32 or cdf.ndim != 1 or not cdf.flags.c_contiguous or type(queries) is not np.ndarray or queries.dtype != np.float64 or queries.ndim != 1 or not queries.flags.c_contiguous:
+            raise ValueError("double_kmeans_candidate_search_operand_format_invalid")
+        count, query_count = cdf.size, queries.size
+        if not 0 < count <= 4096 or not 0 < query_count <= 1024:
+            raise ValueError("double_kmeans_candidate_search_shape_invalid")
+        output = np.empty(query_count, dtype=np.int64)
+        metrics, error = Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_kmeans_candidate_search
+            except AttributeError as failure:
+                raise ValueError("double_kmeans_candidate_search_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, cdf.ctypes.data, queries.ctypes.data, count, query_count, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 1 or (output < 0).any() or (output >= count).any():
+            raise ValueError("double_kmeans_candidate_search_native_result_invalid")
+        return output, {"scope": "experimental_native_kmeans_candidate_search", "count": count, "queries": query_count, "arithmetic_policy": "searchsorted_left_exact_float32_to_binary64_order_keys_then_upper_clip", "gpu_kernels": ["float_kmeans_candidate_search"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": cdf.nbytes + queries.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
     def kmeans_seed_probabilities(self, weights):
         if type(weights) is not np.ndarray or weights.dtype != np.float32 or weights.ndim != 1 or not weights.flags.c_contiguous:
             raise ValueError("double_kmeans_seed_probabilities_operand_format_invalid")

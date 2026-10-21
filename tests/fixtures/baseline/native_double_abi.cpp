@@ -1,6 +1,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -37,6 +38,7 @@ extern "C" int wxdouble_kmeans_squared_norms(void*, const float*, uint32_t, uint
 extern "C" int wxdouble_kmeans_weighted_prefix(void*, const float*, const float*, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_candidate_minimum(void*, const float*, const float*, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_seed_probabilities(void*, const float*, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_kmeans_candidate_search(void*, const float*, const double*, uint32_t, uint32_t, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -52,6 +54,33 @@ int main(int argc, char** argv) {
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    float search_cdf[] = {0, 1, 1, 3}; double search_queries[] = {0, 1, 2, 9}; int64_t search_output[] = {91, 92, 93, 94};
+    assert(wxdouble_kmeans_candidate_search(context, search_cdf, search_queries, 4, 4, search_output, &metrics, error, sizeof(error)) == 0 && search_output[0] == 0 && search_output[1] == 1 && search_output[2] == 3 && search_output[3] == 3 && metrics.kernels == 1);
+    search_output[0] = 91;
+    assert(wxdouble_kmeans_candidate_search(nullptr, search_cdf, search_queries, 4, 4, search_output, &metrics, error, sizeof(error)) != 0 && search_output[0] == 91);
+    assert(wxdouble_kmeans_candidate_search(context, nullptr, search_queries, 4, 4, search_output, &metrics, error, sizeof(error)) != 0 && search_output[0] == 91);
+    assert(wxdouble_kmeans_candidate_search(context, search_cdf, nullptr, 4, 4, search_output, &metrics, error, sizeof(error)) != 0 && search_output[0] == 91);
+    assert(wxdouble_kmeans_candidate_search(context, search_cdf, search_queries, 4, 4, nullptr, &metrics, error, sizeof(error)) != 0 && search_output[0] == 91);
+    assert(wxdouble_kmeans_candidate_search(context, search_cdf, search_queries, 4, 4, search_output, nullptr, error, sizeof(error)) != 0 && search_output[0] == 91);
+    assert(wxdouble_kmeans_candidate_search(context, search_cdf, search_queries, 0, 4, search_output, &metrics, error, sizeof(error)) != 0 && search_output[0] == 91);
+    assert(wxdouble_kmeans_candidate_search(context, search_cdf, search_queries, 4097, 4, search_output, &metrics, error, sizeof(error)) != 0 && search_output[0] == 91);
+    assert(wxdouble_kmeans_candidate_search(context, search_cdf, search_queries, 4, 1025, search_output, &metrics, error, sizeof(error)) != 0 && search_output[0] == 91);
+    for (float invalid : {-1.f, 0x1p-101f, 0x1p77f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+        search_cdf[0] = invalid;
+        assert(wxdouble_kmeans_candidate_search(context, search_cdf, search_queries, 4, 4, search_output, &metrics, error, sizeof(error)) != 0 && search_output[0] == 91);
+    }
+    search_cdf[0] = 2;
+    assert(wxdouble_kmeans_candidate_search(context, search_cdf, search_queries, 4, 4, search_output, &metrics, error, sizeof(error)) != 0 && search_output[0] == 91);
+    search_cdf[0] = 0;
+    for (double invalid : {-1., 0x1p81, std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) {
+        search_queries[0] = invalid;
+        assert(wxdouble_kmeans_candidate_search(context, search_cdf, search_queries, 4, 4, search_output, &metrics, error, sizeof(error)) != 0 && search_output[0] == 91);
+    }
+    search_queries[0] = 0;
+    assert(wxdouble_kmeans_candidate_search(context, search_cdf, search_queries, 4, 4, reinterpret_cast<int64_t*>(search_queries), &metrics, error, sizeof(error)) == 0);
+    int64_t aliased_search_result = 0;
+    std::memcpy(&aliased_search_result, search_queries + 3, sizeof(aliased_search_result));
+    assert(aliased_search_result == 3);
     float probability_weights[] = {1, 3}, probability_output[] = {91, 92};
     assert(wxdouble_kmeans_seed_probabilities(context, probability_weights, 2, probability_output, &metrics, error, sizeof(error)) == 0 && probability_output[0] == .25f && probability_output[1] == .75f && metrics.kernels == 2);
     probability_output[0] = 91;
@@ -637,6 +666,13 @@ int main(int argc, char** argv) {
     assert(wxdouble_kmeans_candidate_minimum(context, minimum_closest, minimum_candidates, 2, 2, minimum_output, &metrics, error, sizeof(error)) == 0);
     probability_output[0] = 91;
     assert(wxdouble_kmeans_seed_probabilities(context, probability_weights, 2, probability_output, &metrics, error, sizeof(error)) != 0 && probability_output[0] == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_search_shader = shader.substr(0, shader.find("\nstruct KmeansSearchDimensions"));
+    assert(wxdouble_create(pre_search_shader.data(), pre_search_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_kmeans_seed_probabilities(context, probability_weights, 2, probability_output, &metrics, error, sizeof(error)) == 0);
+    search_output[0] = 91;
+    assert(wxdouble_kmeans_candidate_search(context, search_cdf, search_queries, 4, 4, search_output, &metrics, error, sizeof(error)) != 0 && search_output[0] == 91);
     wxdouble_destroy(context);
 
 }

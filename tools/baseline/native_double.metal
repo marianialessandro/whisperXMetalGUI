@@ -750,3 +750,21 @@ kernel void float_kmeans_seed_weight_sum(device const float* weights [[buffer(0)
 kernel void float_kmeans_seed_probabilities(device const float* weights [[buffer(0)]], constant KmeansProbabilityDimensions& d [[buffer(1)]], device const float* total [[buffer(2)]], device float* output [[buffer(3)]], uint index [[thread_position_in_grid]]) {
     if (index < d.count) output[index] = weights[index] / total[0];
 }
+
+struct KmeansSearchDimensions { uint count, queries; };
+
+// Compare original binary64 query bits with exact promoted float32 CDF values, preserving equality and zero semantics.
+kernel void float_kmeans_candidate_search(device const float* cdf [[buffer(0)]], constant KmeansSearchDimensions& d [[buffer(1)]], device const ulong* queries [[buffer(2)]], device long* output [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index >= d.queries) return;
+    ulong query = queries[index];
+    if ((query << 1) == 0) query = 0;
+    uint left = 0, right = d.count;
+    while (left < right) {
+        uint middle = left + (right - left) / 2;
+        uint bits = as_type<uint>(cdf[middle]);
+        ulong value = (bits & 0x7fffffffu) == 0 ? 0ul : (ulong((bits >> 23) + 896u) << 52) | (ulong(bits & 0x7fffffu) << 29);
+        if (value < query) left = middle + 1;
+        else right = middle;
+    }
+    output[index] = long(min(left, d.count - 1));
+}

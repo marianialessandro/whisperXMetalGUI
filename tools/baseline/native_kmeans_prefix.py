@@ -17,9 +17,11 @@ from tools.baseline.native_kmeans_norms import NUMPY_CORE_SHA256
 PLUSPLUS_SHA256 = "5ecfa4fcb38b550e535120364d38a8bbb1e9686b32e61a06de03c4537c6f44c1"
 CUMSUM_SHA256 = "ec24882ab4ab9cfcf431ba4a96aba567fa07cd9ae6f67f003ee468cf29dcdcb0"
 SUM_SHA256 = "945c5e7a356ce7e229f9d6c60226751036653bf32ca0727056dcfb4023c5d8f3"
+SEARCHSORTED_SHA256 = "f44941290b76f7795a08ade371902f589f73745ec5be21240c39dc86cf8210cb"
+CLIP_SHA256 = "9a0eb9c2e80a635150f89e1397012b8f775d6abfeebb19e569cede3f23a2f155"
 
 
-def compile_native_prefix(original, prefix, minimum=None, probabilities=None):
+def compile_native_prefix(original, prefix, minimum=None, probabilities=None, search=None):
     if not inspect.isfunction(original) or original.__closure__ or inspect.unwrap(original) is not original:
         raise ValueError("kmeans_weighted_prefix_reference_not_supported")
     source = inspect.getsource(original)
@@ -49,11 +51,28 @@ def compile_native_prefix(original, prefix, minimum=None, probabilities=None):
         if len(probability_matches) != 1:
             raise ValueError("kmeans_seed_probabilities_expression_contract_changed")
     probability_replacement = ast.parse("__wx_native_kmeans_seed_probabilities(sample_weight)", mode="eval").body
+    search_matches, clip_matches = [], []
+    if search is not None:
+        if hashlib.sha256(inspect.getsource(np.searchsorted).encode()).hexdigest() != SEARCHSORTED_SHA256 or hashlib.sha256(inspect.getsource(np.clip).encode()).hexdigest() != CLIP_SHA256:
+            raise ValueError("kmeans_candidate_search_runtime_not_supported")
+        expected_search = ast.parse("np.searchsorted(np.cumsum(sample_weight * closest_dist_sq), rand_vals)", mode="eval").body
+        expected_clip = ast.parse("np.clip(candidate_ids, None, closest_dist_sq.size - 1, out=candidate_ids)", mode="eval").body
+        search_matches = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.dump(node) == ast.dump(expected_search)]
+        clip_matches = [node for node in ast.walk(tree) if isinstance(node, ast.Expr) and ast.dump(node.value) == ast.dump(expected_clip)]
+        if len(search_matches) != 1 or len(clip_matches) != 1:
+            raise ValueError("kmeans_candidate_search_expression_contract_changed")
     class ReplacePrefix(ast.NodeTransformer):
+        def visit_Expr(self, node):
+            return ast.copy_location(ast.Pass(), node) if clip_matches and node is clip_matches[0] else self.generic_visit(node)
+
         def visit_BinOp(self, node):
             return ast.copy_location(probability_replacement, node) if probability_matches and node is probability_matches[0] else self.generic_visit(node)
 
         def visit_Call(self, node):
+            if search_matches and node is search_matches[0]:
+                node = self.generic_visit(node)
+                node.func = ast.Name(id="__wx_native_kmeans_candidate_search", ctx=ast.Load())
+                return node
             if prefix is not None and node is matches[0]:
                 return ast.copy_location(replacement, node)
             if minimum_matches and node is minimum_matches[0]:
@@ -64,6 +83,7 @@ def compile_native_prefix(original, prefix, minimum=None, probabilities=None):
     namespace["__wx_native_kmeans_weighted_prefix"] = prefix
     namespace["__wx_native_kmeans_candidate_minimum"] = minimum
     namespace["__wx_native_kmeans_seed_probabilities"] = probabilities
+    namespace["__wx_native_kmeans_candidate_search"] = search
     ast.fix_missing_locations(tree)
     exec(compile(tree, "<WhisperX scoped native KMeans++ weighted prefix>", "exec"), namespace)
     candidate = namespace[tree.body[0].name]
@@ -84,5 +104,13 @@ def seed_probabilities(context, records, weights):
     result, record = context.kmeans_seed_probabilities(weights)
     record = dict(record)
     record.update({"adapter_scope": "sklearn_dense_kmeans_plusplus_first_seed_probabilities", "original_plusplus_sha256": PLUSPLUS_SHA256, "numpy_sum_sha256": SUM_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "cpu_residuals": ["rng_and_choice_internal_probability_validation", "distance_and_potential_computation", "candidate_searchsorted_and_clipping", "best_candidate_selection", "lloyd_or_elkan", "host_staging_and_control"]})
+    records.append(record)
+    return result
+
+
+def candidate_search(context, records, cdf, queries):
+    result, record = context.kmeans_candidate_search(cdf, queries)
+    record = dict(record)
+    record.update({"adapter_scope": "sklearn_dense_kmeans_plusplus_candidate_search_and_clip", "original_plusplus_sha256": PLUSPLUS_SHA256, "numpy_searchsorted_sha256": SEARCHSORTED_SHA256, "numpy_clip_sha256": CLIP_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "cpu_residuals": ["rng_and_query_scaling", "distance_and_potential_computation", "best_candidate_selection", "lloyd_or_elkan", "host_staging_and_control"]})
     records.append(record)
     return result
