@@ -13,6 +13,36 @@ from tools.metal_cli import main, native_alignment
 
 
 class MetalCLITests(unittest.TestCase):
+    def test_kmeans_centroid_flag_requires_library(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "audio.wav", "--diarize", "--vbx-kmeans-centroids"])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertFalse(report.exists())
+
+    def test_kmeans_centroid_capability_failure_preserves_report_privacy(self):
+        from pyannote.audio.pipelines.clustering import VBxClustering
+        original = VBxClustering.__call__
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with patch("tools.baseline.mps_storage_probe.MPSCTC") as native, patch("tools.baseline.native_double.NativeDoubleNormalization") as double:
+                native.return_value.__enter__.return_value.identity = {}
+                native.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.identity = {}
+                double.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.library = object()
+                with self.assertRaisesRegex(ValueError, "kmeans_centroid_abi_unavailable"):
+                    main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--plda-normalization-library", "unused.dylib", "--plda-normalization-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--vbx-kmeans-centroids", "--hf_token", "private-secret"])
+            data = json.loads(report.read_text())
+            self.assertEqual(data["status"], "failed")
+            self.assertTrue(data["vbx_kmeans_centroids_requested"])
+            self.assertFalse(data["vbx_kmeans_centroids_observed"])
+            self.assertEqual(data["native_vbx_kmeans_centroid_calls"], 0)
+            self.assertIs(VBxClustering.__call__, original)
+            self.assertNotIn("private.wav", report.read_text())
+            self.assertNotIn("private-secret", report.read_text())
+
     def test_clustering_cpu_audit_requires_diarization(self):
         with tempfile.TemporaryDirectory() as directory:
             report = Path(directory) / "report.json"

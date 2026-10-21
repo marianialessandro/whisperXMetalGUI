@@ -30,6 +30,7 @@ extern "C" int wxdouble_vbx_cosine_scores_argmax(void*, const double*, const dou
 extern "C" int wxdouble_vbx_qinit_from_labels(void*, const int64_t*, uint32_t, uint32_t, double, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_inactive_mask(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_nan_cleanup(void*, const double*, uint32_t, uint32_t, double*, uint32_t*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_vbx_kmeans_centroids(void*, const float*, const int32_t*, uint32_t, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -39,10 +40,27 @@ int main(int argc, char** argv) {
     void* context = nullptr;
     char error[128] = {};
     DoubleMetrics metrics = {};
+    float km_features[] = {1, 2, 5, 6, 3, 4, 7, 8}, km_output[] = {91, 92, 93, 94};
+    int32_t km_labels[] = {0, 1, 0, 1};
     double input[] = {3., 4.}, output[] = {91., 92.};
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    assert(wxdouble_vbx_kmeans_centroids(context, km_features, km_labels, 4, 2, 2, km_output, &metrics, error, sizeof(error)) == 0);
+    assert(km_output[0] == 2 && km_output[1] == 3 && km_output[2] == 6 && km_output[3] == 7 && metrics.kernels == 1 && metrics.allocated_bytes <= 72 * 1024 * 1024 + 40 * 1024);
+    km_output[0] = 91;
+    assert(wxdouble_vbx_kmeans_centroids(context, nullptr, km_labels, 4, 2, 2, km_output, &metrics, error, sizeof(error)) != 0 && km_output[0] == 91);
+    assert(wxdouble_vbx_kmeans_centroids(context, km_features, nullptr, 4, 2, 2, km_output, &metrics, error, sizeof(error)) != 0 && km_output[0] == 91);
+    assert(wxdouble_vbx_kmeans_centroids(context, km_features, km_labels, 4097, 2, 2, km_output, &metrics, error, sizeof(error)) != 0 && km_output[0] == 91);
+    assert(wxdouble_vbx_kmeans_centroids(context, km_features, km_labels, 4096, 1024, 9, km_output, &metrics, error, sizeof(error)) != 0 && km_output[0] == 91);
+    assert(wxdouble_vbx_kmeans_centroids(context, km_features, km_labels, 4, 1, 2, km_output, &metrics, error, sizeof(error)) != 0 && km_output[0] == 91);
+    assert(wxdouble_vbx_kmeans_centroids(context, km_features, km_labels, 4, 2, 3, km_output, &metrics, error, sizeof(error)) != 0 && km_output[0] == 91);
+    km_labels[0] = -1;
+    assert(wxdouble_vbx_kmeans_centroids(context, km_features, km_labels, 4, 2, 2, km_output, &metrics, error, sizeof(error)) != 0 && km_output[0] == 91);
+    km_labels[0] = 0; km_features[0] = std::numeric_limits<float>::infinity();
+    assert(wxdouble_vbx_kmeans_centroids(context, km_features, km_labels, 4, 2, 2, km_output, &metrics, error, sizeof(error)) != 0 && km_output[0] == 91);
+    km_features[0] = 1;
+    assert(wxdouble_vbx_kmeans_centroids(context, km_features, km_labels, 4, 2, 2, km_features, &metrics, error, sizeof(error)) == 0 && km_features[0] == 2 && km_features[3] == 7);
     assert(wxdouble_normalize(context, input, 1, 2, 0, output, &metrics, error, sizeof(error)) == 0);
     assert(output[0] == .6 && output[1] == .8 && metrics.version == 1 && metrics.kernels == 1);
     output[0] = 91.; output[1] = 92.;
@@ -467,4 +485,12 @@ int main(int argc, char** argv) {
     assert(wxdouble_elementwise(context, input, nullptr, 1, 2, 1, 2, output, &metrics, error, sizeof(error)) != 0 && output[0] == 91.);
     assert(wxdouble_vbx_precompute(context, input, phi, 1, 2, 0, g, v, rho, &metrics, error, sizeof(error)) != 0 && g[0] == 91.);
     wxdouble_destroy(context);
+    std::string pre_kmeans_shader = shader.substr(0, shader.find("\nstruct KmeansCentroidDimensions"));
+    assert(wxdouble_create(pre_kmeans_shader.data(), pre_kmeans_shader.size(), &context, error, sizeof(error)) == 0);
+    double km_legacy_input[] = {3., 4.};
+    assert(wxdouble_normalize(context, km_legacy_input, 1, 2, 0, output, &metrics, error, sizeof(error)) == 0);
+    km_output[0] = 91;
+    assert(wxdouble_vbx_kmeans_centroids(context, km_features, km_labels, 4, 2, 2, km_output, &metrics, error, sizeof(error)) != 0 && km_output[0] == 91);
+    wxdouble_destroy(context);
+
 }

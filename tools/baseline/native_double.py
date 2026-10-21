@@ -537,6 +537,29 @@ class NativeDoubleNormalization:
             raise ValueError("double_vbx_one_hot_native_result_invalid")
         return output, {"scope": "experimental_native_binary64_vbx_one_hot", "operation": "initial_one_hot", "rows": rows, "columns": columns, "gpu_kernels": ["double_vbx_one_hot"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": labels.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
+    def kmeans_centroids_vbx(self, features, labels, clusters):
+        if type(features) is not np.ndarray or features.dtype != np.float32 or features.ndim != 2 or not features.flags.c_contiguous or type(labels) is not np.ndarray or labels.dtype != np.int32 or labels.ndim != 1 or not labels.flags.c_contiguous:
+            raise ValueError("double_vbx_kmeans_operand_format_invalid")
+        rows, dimensions = features.shape
+        if type(clusters) is not int or not 0 < rows <= 4096 or not 2 <= dimensions <= 1024 or not 0 < clusters <= min(rows, 1024) or rows * dimensions * clusters > 32 * 1024 * 1024 or labels.shape != (rows,):
+            raise ValueError("double_vbx_kmeans_shape_invalid")
+        output, metrics, error = np.empty((clusters, dimensions), np.float32), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_vbx_kmeans_centroids
+            except AttributeError as failure:
+                raise ValueError("double_vbx_kmeans_centroid_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, features.ctypes.data, labels.ctypes.data, rows, dimensions, clusters, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 1 or not np.isfinite(output).all():
+            raise ValueError("double_vbx_kmeans_native_result_invalid")
+        return output, {"scope": "experimental_native_float32_kmeans_centroids", "rows": rows, "features": dimensions, "clusters": clusters, "arithmetic_policy": "sequential_float32_sum_then_float32_division", "numpy_bitwise_certified": False, "gpu_kernels": ["float_vbx_kmeans_centroids"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": features.nbytes + labels.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
     def centroids_vbx(self, weights, features, reduction_order="pairwise"):
         if any(type(value) is not np.ndarray or value.dtype != np.float64 or value.ndim != 2 or not value.flags.c_contiguous for value in (weights, features)):
             raise ValueError("double_vbx_centroid_input_format_invalid")

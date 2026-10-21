@@ -1,5 +1,6 @@
 struct DoubleDimensions { uint rows, columns, sequential; };
 
+
 // Normal bounded binary64 multiplication with an exact 106-bit significand product and nearest-even rounding.
 ulong multiply_positive_binary64(ulong a, ulong b) {
     if (a == 0 || b == 0) return 0;
@@ -600,4 +601,19 @@ kernel void double_vbx_nan_cleanup(device const ulong* scores [[buffer(0)]], con
         ulong value = scores[row * d.columns + column];
         output[row * d.columns + column] = (value & mask) > 0x7ff0000000000000ul ? replacement : value;
     }
+}
+
+struct KmeansCentroidDimensions { uint rows, features, clusters; };
+
+kernel void float_vbx_kmeans_centroids(device const float* features [[buffer(0)]], constant KmeansCentroidDimensions& d [[buffer(1)]], device const int* labels [[buffer(2)]], device float* output [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index >= d.clusters * d.features) return;
+    uint cluster = index / d.features, feature = index % d.features, count = 0;
+    float sum = 0.0f;
+    for (uint row = 0; row < d.rows; ++row) {
+        if (labels[row] == int(cluster)) {
+            sum += features[row * d.features + feature];
+            ++count;
+        }
+    }
+    output[index] = sum / float(count);
 }

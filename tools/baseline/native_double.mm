@@ -9,6 +9,7 @@
 #include <vector>
 
 struct DoubleDimensions { uint32_t rows, columns, sequential; };
+struct KmeansCentroidDimensions { uint32_t rows, features, clusters; };
 struct MatrixDimensions { uint32_t rows, inner, columns; };
 struct ElementDimensions { uint32_t rows, columns, operation, scale_dimension; };
 struct StatisticsDimensions { uint32_t rows, columns, features, operation, sequential, reserved; uint64_t fa, fb; };
@@ -33,6 +34,7 @@ static_assert(sizeof(DoubleMetrics) == 32);
 class DoubleContext {
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
+    id<MTLComputePipelineState> kmeans_centroid_pipeline_;
     id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_, cosine_norm_pipeline_, cosine_distance_pipeline_, cosine_score_pipeline_, argmax_pipeline_, minimum_pipeline_, inactive_pipeline_, nan_minimum_pipeline_, nan_cleanup_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
@@ -91,6 +93,8 @@ public:
         if (cosine_distance_function != nil) cosine_distance_pipeline_ = [device_ newComputePipelineStateWithFunction:cosine_distance_function error:&error];
         id<MTLFunction> one_hot_function = [library newFunctionWithName:@"double_vbx_one_hot"];
         if (one_hot_function != nil) one_hot_pipeline_ = [device_ newComputePipelineStateWithFunction:one_hot_function error:&error];
+        id<MTLFunction> kmeans_centroid_function = [library newFunctionWithName:@"float_vbx_kmeans_centroids"];
+        if (kmeans_centroid_function != nil) kmeans_centroid_pipeline_ = [device_ newComputePipelineStateWithFunction:kmeans_centroid_function error:&error];
         id<MTLFunction> centroid_function = [library newFunctionWithName:@"double_vbx_centroids"];
         if (centroid_function != nil) centroid_pipeline_ = [device_ newComputePipelineStateWithFunction:centroid_function error:&error];
         id<MTLFunction> qinit_function = [library newFunctionWithName:@"double_vbx_qinit_exp"];
@@ -355,6 +359,33 @@ public:
         for (uint32_t row = 0; row < d.rows; ++row) require(std::isfinite(static_cast<const double*>(terms_.contents)[row]), "double_vbx_logsumexp_shift_domain_invalid");
         std::memcpy(output, terms_.contents, uint64_t(d.rows) * sizeof(double));
         return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
+    DoubleMetrics kmeans_centroids_vbx(const float* features, const int32_t* labels, KmeansCentroidDimensions d, float* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(kmeans_centroid_pipeline_ != nil, "double_vbx_kmeans_centroid_kernel_unavailable");
+        require(features != nullptr && labels != nullptr && output != nullptr && d.rows > 0 && d.rows <= 4096 && d.features >= 2 && d.features <= 1024 && d.clusters > 0 && d.clusters <= 1024 && d.clusters <= d.rows && uint64_t(d.rows) * d.features * d.clusters <= 32 * 1024 * 1024, "double_vbx_kmeans_centroid_shape_or_pointer_invalid");
+        std::vector<bool> present(d.clusters, false);
+        for (uint32_t row = 0; row < d.rows; ++row) {
+            require(labels[row] >= 0 && uint32_t(labels[row]) < d.clusters, "double_vbx_kmeans_label_invalid");
+            present[labels[row]] = true;
+        }
+        for (bool value : present) require(value, "double_vbx_kmeans_empty_cluster_not_supported");
+        uint64_t count = uint64_t(d.rows) * d.features, result_count = uint64_t(d.clusters) * d.features;
+        for (uint64_t index = 0; index < count; ++index) require(std::isfinite(features[index]) && std::abs(features[index]) <= 0x1p32f && (features[index] == 0 || std::abs(features[index]) >= 0x1p-32f), "double_vbx_kmeans_feature_domain_invalid");
+        auto started = std::chrono::steady_clock::now();
+        reserve(input_, count * sizeof(float)); reserve(right_, uint64_t(d.rows) * sizeof(int32_t)); reserve(output_, result_count * sizeof(float));
+        std::memcpy(input_.contents, features, count * sizeof(float)); std::memcpy(right_.contents, labels, uint64_t(d.rows) * sizeof(int32_t));
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental KMeans float32 centroids";
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:kmeans_centroid_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:right_ offset:0 atIndex:2]; [encoder setBuffer:output_ offset:0 atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(result_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, kmeans_centroid_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        const float* result = static_cast<const float*>(output_.contents);
+        for (uint64_t index = 0; index < result_count; ++index) require(std::isfinite(result[index]) && std::abs(result[index]) <= 0x1p32f, "double_vbx_kmeans_result_invalid");
+        std::memcpy(output, result, result_count * sizeof(float));
+        return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
     DoubleMetrics nan_cleanup_vbx(const double* scores, uint32_t rows, uint32_t columns, double* output, uint32_t* all_nan) {
@@ -785,6 +816,13 @@ extern "C" int wxdouble_vbx_nan_cleanup(void* context, const double* scores, uin
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->nan_cleanup_vbx(scores, rows, columns, output, all_nan); return 0; }
         catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_vbx_nan_cleanup_failed"); return 1; }
+    }
+}
+extern "C" int wxdouble_vbx_kmeans_centroids(void* context, const float* features, const int32_t* labels, uint32_t rows, uint32_t dimensions, uint32_t clusters, float* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->kmeans_centroids_vbx(features, labels, {rows, dimensions, clusters}, output); return 0; }
+        catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_vbx_kmeans_centroids_failed"); return 1; }
     }
 }
 extern "C" void wxdouble_destroy(void* context) { @autoreleasepool { delete static_cast<DoubleContext*>(context); } }

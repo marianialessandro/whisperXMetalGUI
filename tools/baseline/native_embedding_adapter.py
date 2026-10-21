@@ -13,12 +13,13 @@ import numpy as np
 
 
 VBX_CALL_SHA256 = "8baf21775d7add4f8b666ab480470c2748592074541f1cfe32a400ed118540d7"
+KMEANS_FIT_SHA256 = "559a0b7eaf40016786760f88159de545c203e761ecd97084c025b060f025b408"
 CDIST_SHA256 = "eb769cabbc7d564024b480d426594d08aff4280675d887ddd5ba6a35b13905fa"
 _HOOK_LOCK = threading.RLock()
 _ACTIVE = False
 
 
-def compile_native_normalization(original, normalize, centroid=None, distance=None, soft_scores=False, argmax=None, resident_argmax=False, inactive=None):
+def compile_native_normalization(original, normalize, centroid=None, distance=None, soft_scores=False, argmax=None, resident_argmax=False, inactive=None, kmeans_centroid=None):
     source = textwrap.dedent(inspect.getsource(original))
     if hashlib.sha256(source.encode()).hexdigest() != VBX_CALL_SHA256 or original.__closure__:
         raise ValueError("embedding_vbx_source_not_supported")
@@ -35,6 +36,12 @@ def compile_native_normalization(original, normalize, centroid=None, distance=No
         if len(centroid_matches) != 1:
             raise ValueError("embedding_vbx_centroid_contract_changed")
         centroid_matches[0].value = ast.copy_location(ast.parse("__wx_native_centroids(W, train_embeddings.reshape(-1, dimension))").body[0].value, centroid_matches[0].value)
+    if kmeans_centroid is not None:
+        kmeans_expected = ast.parse("centroids = np.vstack([np.mean(train_embeddings[kmeans_clusters == k], axis=0) for k in range(num_clusters)])").body[0]
+        kmeans_matches = [node for node in ast.walk(tree) if isinstance(node, ast.Assign) and ast.dump(node) == ast.dump(kmeans_expected)]
+        if len(kmeans_matches) != 1:
+            raise ValueError("embedding_vbx_kmeans_centroid_contract_changed")
+        kmeans_matches[0].value = ast.parse("__wx_native_kmeans_centroids(train_embeddings, kmeans_clusters, num_clusters)").body[0].value
     if inactive is not None:
         const_expected = ast.parse("const = soft_clusters.min() - 1.").body[0]
         mask_expected = ast.parse("soft_clusters[segmentations.data.sum(1) == 0] = const").body[0]
@@ -78,6 +85,7 @@ def compile_native_normalization(original, normalize, centroid=None, distance=No
     namespace["__wx_native_cosine"] = distance
     namespace["__wx_native_argmax"] = argmax
     namespace["__wx_native_inactive"] = inactive
+    namespace["__wx_native_kmeans_centroids"] = kmeans_centroid
     ast.fix_missing_locations(tree)
     exec(compile(tree, "<WhisperX scoped native VBx normalization>", "exec"), namespace)
     candidate = namespace[tree.body[0].name]
@@ -86,7 +94,23 @@ def compile_native_normalization(original, normalize, centroid=None, distance=No
     return candidate
 
 
-def weighted_centroids(context, records, weights, features, distances=False):
+def kmeans_centroids(context, records, features, labels, clusters):
+    if type(features) is not np.ndarray or features.dtype != np.float32 or features.ndim != 2 or type(labels) is not np.ndarray or labels.dtype not in (np.dtype(np.int32), np.dtype(np.int64)) or labels.ndim != 1:
+        raise ValueError("vbx_kmeans_centroid_operand_format_not_supported")
+    rows, dimensions = features.shape
+    if type(clusters) is not int or not 0 < rows <= 4096 or not 2 <= dimensions <= 1024 or not 0 < clusters <= min(rows, 1024) or rows * dimensions * clusters > 32 * 1024 * 1024 or labels.shape != (rows,):
+        raise ValueError("vbx_kmeans_centroid_shape_not_supported")
+    if np.any(labels < 0) or np.any(labels >= clusters):
+        raise ValueError("vbx_kmeans_centroid_label_not_supported")
+    staged_features, staged_labels = np.ascontiguousarray(features), np.ascontiguousarray(labels, dtype=np.int32)
+    output, record = context.kmeans_centroids_vbx(staged_features, staged_labels, clusters)
+    record = dict(record)
+    record.update({"adapter_scope": "vbx_forced_kmeans_centroids", "original_call_sha256": VBX_CALL_SHA256, "original_kmeans_fit_predict_sha256": KMEANS_FIT_SHA256, "numpy_version": "2.2.6", "scikit_learn_version": "1.9.1", "host_feature_staging_copy_bytes": 0 if staged_features is features else staged_features.nbytes, "host_label_staging_copy_bytes": 0 if staged_labels is labels else staged_labels.nbytes, "cpu_residuals": ["ahc", "kmeans_fit_predict", "host_staging_and_control"]})
+    records.append(record)
+    return output
+
+
+def weighted_centroids(context, records, weights, features, distances=False, native_kmeans=False):
     if type(weights) is not np.ndarray or weights.dtype != np.float64 or weights.ndim != 2 or not (weights.flags.c_contiguous or weights.flags.f_contiguous) or type(features) is not np.ndarray or features.dtype not in (np.dtype(np.float32), np.dtype(np.float64)) or features.ndim != 2:
         raise ValueError("vbx_centroid_operand_format_not_supported")
     frames, speakers = weights.shape
@@ -98,7 +122,7 @@ def weighted_centroids(context, records, weights, features, distances=False):
     staged_features = np.ascontiguousarray(features, dtype=np.float64)
     output, record = context.centroids_vbx(staged_weights, staged_features, "pairwise" if column_contiguous or speakers == 1 else "sequential")
     record = dict(record)
-    record.update({"adapter_scope": "vbx_weighted_centroids_after_speaker_selection", "original_call_sha256": VBX_CALL_SHA256, "weight_layout": "F" if column_contiguous else "C" if weights.flags.c_contiguous else "strided", "host_weight_staging_copy_bytes": 0 if np.shares_memory(staged_weights, weights) else staged_weights.nbytes, "host_feature_staging_copy_bytes": 0 if staged_features is features else staged_features.nbytes, "feature_dtype_conversion": str(features.dtype) != "float64", "cpu_residuals": ["speaker_selection", "ahc", "optional_kmeans_centroids", "constrained_assignment" if distances else "distance_and_constrained_assignment", "host_staging_and_control"]})
+    record.update({"adapter_scope": "vbx_weighted_centroids_after_speaker_selection", "original_call_sha256": VBX_CALL_SHA256, "weight_layout": "F" if column_contiguous else "C" if weights.flags.c_contiguous else "strided", "host_weight_staging_copy_bytes": 0 if np.shares_memory(staged_weights, weights) else staged_weights.nbytes, "host_feature_staging_copy_bytes": 0 if staged_features is features else staged_features.nbytes, "feature_dtype_conversion": str(features.dtype) != "float64", "cpu_residuals": ["speaker_selection", "ahc", "optional_kmeans_fit_predict" if native_kmeans else "optional_kmeans_centroids", "constrained_assignment" if distances else "distance_and_constrained_assignment", "host_staging_and_control"]})
     records.append(record)
     return output
 
@@ -152,7 +176,7 @@ def inactive_speaker_mask(context, records, scores, segments):
 
 
 @contextlib.contextmanager
-def native_embedding_normalization(context, records, centroid_context=None, centroid_records=None, distance_context=None, distance_records=None, soft_scores=False, argmax_context=None, argmax_records=None, resident_argmax=False, inactive_context=None, inactive_records=None):
+def native_embedding_normalization(context, records, centroid_context=None, centroid_records=None, distance_context=None, distance_records=None, soft_scores=False, argmax_context=None, argmax_records=None, resident_argmax=False, inactive_context=None, inactive_records=None, kmeans_context=None, kmeans_records=None):
     global _ACTIVE
     from pyannote.audio.pipelines.clustering import VBxClustering
 
@@ -161,6 +185,16 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
             raise ValueError("embedding_normalization_scope_already_active")
         if importlib.metadata.version("pyannote-audio") != "4.0.4":
             raise ValueError("embedding_pyannote_version_not_supported")
+        if kmeans_context is not None:
+            from sklearn.cluster import KMeans
+            if not isinstance(kmeans_records, list):
+                raise ValueError("vbx_kmeans_centroid_records_required")
+            if np.__version__ != "2.2.6" or importlib.metadata.version("scikit-learn") != "1.9.1":
+                raise ValueError("vbx_kmeans_centroid_runtime_not_supported")
+            if VBxClustering.__call__.__globals__.get("KMeans") is not KMeans or hashlib.sha256(inspect.getsource(inspect.unwrap(KMeans.fit_predict)).encode()).hexdigest() != KMEANS_FIT_SHA256:
+                raise ValueError("vbx_kmeans_centroid_reference_changed")
+            if getattr(kmeans_context.library, "wxdouble_vbx_kmeans_centroids", None) is None:
+                raise ValueError("double_vbx_kmeans_centroid_abi_unavailable")
         if centroid_context is not None:
             if not isinstance(centroid_records, list):
                 raise ValueError("vbx_centroid_records_required")
@@ -200,7 +234,7 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
                 raise ValueError("double_vbx_cosine_abi_unavailable")
             if VBxClustering.__call__.__globals__.get("cdist") is not spatial_distance.cdist or hashlib.sha256(textwrap.dedent(inspect.getsource(spatial_distance.cdist)).encode()).hexdigest() != CDIST_SHA256:
                 raise ValueError("vbx_cosine_reference_not_supported")
-        if context is None and centroid_context is None and distance_context is None and argmax_context is None and inactive_context is None:
+        if context is None and centroid_context is None and distance_context is None and argmax_context is None and inactive_context is None and kmeans_context is None:
             raise ValueError("embedding_or_centroid_context_required")
         original = VBxClustering.__call__
         owner_thread = threading.get_ident()
@@ -216,7 +250,7 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
             return output
 
         def centroids(weights, features):
-            return weighted_centroids(centroid_context, centroid_records, weights, features, distance_context is not None)
+            return weighted_centroids(centroid_context, centroid_records, weights, features, distance_context is not None, kmeans_context is not None)
 
         def distances(embeddings, centroids, metric, constrained_assignment=False):
             nonlocal pending_labels
@@ -245,7 +279,10 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
         def mask_inactive(scores, segments):
             return inactive_speaker_mask(inactive_context, inactive_records, scores, segments)
 
-        candidate = compile_native_normalization(original, normalize if context is not None else None, centroids if centroid_context is not None else None, distances if distance_context is not None else None, soft_scores=soft_scores, argmax=assign if argmax_context is not None else None, resident_argmax=resident_argmax, inactive=mask_inactive if inactive_context is not None else None)
+        def forced_centroids(features, labels, clusters):
+            return kmeans_centroids(kmeans_context, kmeans_records, features, labels, clusters)
+
+        candidate = compile_native_normalization(original, normalize if context is not None else None, centroids if centroid_context is not None else None, distances if distance_context is not None else None, soft_scores=soft_scores, argmax=assign if argmax_context is not None else None, resident_argmax=resident_argmax, inactive=mask_inactive if inactive_context is not None else None, kmeans_centroid=forced_centroids if kmeans_context is not None else None)
 
         @functools.wraps(original)
         def wrapped(*args, **kwargs):
