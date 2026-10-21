@@ -537,6 +537,30 @@ class NativeDoubleNormalization:
             raise ValueError("double_vbx_one_hot_native_result_invalid")
         return output, {"scope": "experimental_native_binary64_vbx_one_hot", "operation": "initial_one_hot", "rows": rows, "columns": columns, "gpu_kernels": ["double_vbx_one_hot"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": labels.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
+    def pdist_euclidean(self, values):
+        if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim != 2 or not values.flags.c_contiguous:
+            raise ValueError("double_pdist_input_format_invalid")
+        rows, features = values.shape
+        pairs = rows * (rows - 1) // 2
+        if not 2 <= rows <= 256 or not 0 < features <= 1024 or pairs * features > 32 * 1024 * 1024:
+            raise ValueError("double_pdist_shape_invalid")
+        output, metrics, error = np.empty(pairs, dtype=np.float64), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_pdist_euclidean
+            except AttributeError as failure:
+                raise ValueError("double_pdist_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, values.ctypes.data, rows, features, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 1 or not np.isfinite(output).all() or np.any(output < 0):
+            raise ValueError("double_pdist_native_result_invalid")
+        return output, {"scope": "experimental_native_condensed_euclidean_distances", "rows": rows, "features": features, "pairs": pairs, "arithmetic": "sequential_separately_rounded_binary64_difference_square_sum_sqrt", "gpu_kernels": ["double_pdist_euclidean"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "scipy_bitwise_certified": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+
     def inactive_assignment(self, scores, segments):
         if any(type(value) is not np.ndarray or value.dtype != np.float64 or value.ndim != 3 or not value.flags.c_contiguous for value in (scores, segments)):
             raise ValueError("double_inactive_assignment_input_format_invalid")

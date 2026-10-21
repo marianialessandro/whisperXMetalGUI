@@ -905,3 +905,20 @@ kernel void double_inactive_assignment_batch(device const ulong* scores [[buffer
     uint matched = min(d.rows, d.columns);
     for (uint i = 0; i < matched; ++i) hard_labels[chunk * d.rows + uint(pairs[i])] = char(pairs[matched + i]);
 }
+
+
+struct PdistDimensions { uint rows, features; };
+
+// Emit the upper triangle in SciPy condensed order, rounding each difference, square and sequential sum separately.
+kernel void double_pdist_euclidean(device const ulong* values [[buffer(0)]], constant PdistDimensions& d [[buffer(1)]], device ulong* output [[buffer(2)]], uint pair [[thread_position_in_grid]]) {
+    if (pair >= d.rows * (d.rows - 1) / 2) return;
+    uint row = 0, offset = pair;
+    while (offset >= d.rows - row - 1) { offset -= d.rows - row - 1; ++row; }
+    uint other = row + offset + 1;
+    ulong sum = 0, mask = (1ul << 63) - 1;
+    for (uint feature = 0; feature < d.features; ++feature) {
+        ulong difference = df_sub(values[row * d.features + feature], values[other * d.features + feature]) & mask;
+        sum = add_positive_double(sum, multiply_positive_binary64(difference, difference));
+    }
+    output[pair] = sqrt_positive_binary64(sum);
+}

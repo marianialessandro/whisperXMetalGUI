@@ -43,6 +43,7 @@ extern "C" int wxdouble_kmeans_best_candidate(void*, const float*, uint32_t, int
 extern "C" int wxdouble_linear_assignment_max(void*, const double*, uint32_t, uint32_t, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_assignment_batch(void*, const double*, uint32_t, uint32_t, uint32_t, int8_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_inactive_assignment(void*, const double*, const double*, uint32_t, uint32_t, uint32_t, uint32_t, double*, int8_t*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_pdist_euclidean(void*, const double*, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -58,6 +59,27 @@ int main(int argc, char** argv) {
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    double pdist_values[] = {0, 0, 3, 4, 3, 0}, pdist_output[] = {91, 92, 93};
+    assert(wxdouble_pdist_euclidean(context, pdist_values, 3, 2, pdist_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 1 && pdist_output[0] == 5 && pdist_output[1] == 3 && pdist_output[2] == 4);
+    pdist_output[0] = 91;
+    assert(wxdouble_pdist_euclidean(nullptr, pdist_values, 3, 2, pdist_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_pdist_euclidean(context, nullptr, 3, 2, pdist_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_pdist_euclidean(context, pdist_values, 3, 2, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_pdist_euclidean(context, pdist_values, 3, 2, pdist_output, nullptr, error, sizeof(error)) != 0);
+    for (uint32_t rows : {0u, 1u, 257u}) assert(wxdouble_pdist_euclidean(context, pdist_values, rows, 2, pdist_output, &metrics, error, sizeof(error)) != 0 && pdist_output[0] == 91);
+    for (uint32_t features : {0u, 1025u}) assert(wxdouble_pdist_euclidean(context, pdist_values, 3, features, pdist_output, &metrics, error, sizeof(error)) != 0 && pdist_output[0] == 91);
+    for (double invalid : {0x1p-65, -0x1p-65, 0x1p33, std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()}) {
+        pdist_values[0] = invalid;
+        assert(wxdouble_pdist_euclidean(context, pdist_values, 3, 2, pdist_output, &metrics, error, sizeof(error)) != 0 && pdist_output[0] == 91);
+    }
+    pdist_values[0] = 0;
+    alignas(double) unsigned char pdist_unaligned_input[sizeof(pdist_values) + 1], pdist_unaligned_output[sizeof(pdist_output) + 1];
+    std::memcpy(pdist_unaligned_input + 1, pdist_values, sizeof(pdist_values));
+    assert(wxdouble_pdist_euclidean(context, reinterpret_cast<double*>(pdist_unaligned_input + 1), 3, 2, reinterpret_cast<double*>(pdist_unaligned_output + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(pdist_output, pdist_unaligned_output + 1, sizeof(pdist_output));
+    assert(pdist_output[0] == 5 && pdist_output[1] == 3 && pdist_output[2] == 4);
+    assert(wxdouble_pdist_euclidean(context, pdist_values, 3, 2, pdist_values, &metrics, error, sizeof(error)) == 0 && pdist_values[0] == 5 && pdist_values[1] == 3 && pdist_values[2] == 4);
+
     double resident_scores[] = {1, 2, 0, 2, 1, 0}, resident_segments[] = {1, 0, 0, 0}, resident_masked[] = {91, 92, 93, 94, 95, 96};
     int8_t resident_labels[] = {91, 92};
     assert(wxdouble_inactive_assignment(context, resident_scores, resident_segments, 1, 2, 3, 2, resident_masked, resident_labels, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 5 && resident_labels[0] == 1 && resident_labels[1] == 0 && resident_masked[3] == -1.);
@@ -808,6 +830,13 @@ int main(int argc, char** argv) {
     assert(wxdouble_assignment_batch(context, resident_old_scores, 1, 2, 3, batch_labels, &metrics, error, sizeof(error)) == 0);
     resident_labels[0] = 91; resident_masked[0] = 91;
     assert(wxdouble_inactive_assignment(context, resident_old_scores, resident_old_segments, 1, 2, 3, 2, resident_masked, resident_labels, &metrics, error, sizeof(error)) != 0 && resident_labels[0] == 91 && resident_masked[0] == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_pdist_shader = shader.substr(0, shader.find("\nstruct PdistDimensions"));
+    assert(wxdouble_create(pre_pdist_shader.data(), pre_pdist_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_inactive_assignment(context, resident_old_scores, resident_old_segments, 1, 2, 3, 2, resident_masked, resident_labels, &metrics, error, sizeof(error)) == 0);
+    pdist_output[0] = 91;
+    assert(wxdouble_pdist_euclidean(context, pdist_values, 3, 2, pdist_output, &metrics, error, sizeof(error)) != 0 && pdist_output[0] == 91);
     wxdouble_destroy(context);
 
 }

@@ -19,6 +19,27 @@ class ClusteringCPUAuditTests(unittest.TestCase):
         assigned = clustering.linear_sum_assignment(np.array([[1., 2., 3.], [3., 2., 1.]]), maximize=True)
         return tree, groups, predicted, *assigned
 
+    def test_optional_pairwise_audit_distinguishes_linkage_from_pdist(self):
+        features = np.array([[0., 0.], [0., .1], [2., 2.], [2., 2.1]])
+        from scipy.spatial.distance import pdist
+        condensed = pdist(features)
+        with clustering_cpu_audit(records := [], include_pairwise=True):
+            expected = clustering.linkage(features, method="centroid", metric="euclidean")
+        by_name = {row["operation"]: row for row in records}
+        self.assertEqual(len(by_name), 5)
+        self.assertEqual(by_name["ahc_pairwise_distances"]["calls_started"], 1)
+        self.assertEqual(by_name["ahc_linkage"]["calls_started"], 1)
+        with clustering_cpu_audit(records := [], include_pairwise=True):
+            actual = clustering.linkage(condensed, method="centroid", metric="euclidean")
+        by_name = {row["operation"]: row for row in records}
+        self.assertEqual(by_name["ahc_pairwise_distances"]["calls_started"], 0)
+        self.assertEqual(by_name["ahc_linkage"]["calls_started"], 1)
+        np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+        with self.assertRaisesRegex(ValueError, "pairwise_flag_invalid"):
+            with clustering_cpu_audit([], include_pairwise=1):
+                pass
+        self.assertIsNone(sys.getprofile())
+
     def test_original_results_and_function_identities_preserved(self):
         expected = self.work()
         originals = (clustering.linkage, clustering.fcluster, clustering.KMeans.fit_predict, clustering.linear_sum_assignment)

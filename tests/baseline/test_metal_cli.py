@@ -13,6 +13,35 @@ from tools.metal_cli import main, native_alignment
 
 
 class MetalCLITests(unittest.TestCase):
+    def test_ahc_distances_requires_library(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stderr(io.StringIO()):
+            report = Path(directory) / "report.json"
+            with self.assertRaises(SystemExit) as caught:
+                main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--ahc-euclidean-distances"])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertFalse(report.exists())
+
+    def test_ahc_distances_capability_failure_restores_scope_and_privacy(self):
+        from pyannote.audio.pipelines.clustering import VBxClustering
+        original = VBxClustering.__call__
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with patch("tools.baseline.mps_storage_probe.MPSCTC") as native, patch("tools.baseline.native_double.NativeDoubleNormalization") as double:
+                native.return_value.__enter__.return_value.identity = {}
+                native.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.identity = {}
+                double.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.library = SimpleNamespace()
+                with self.assertRaisesRegex(ValueError, "pdist_abi_unavailable"):
+                    main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--plda-normalization-library", "unused.dylib", "--plda-normalization-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--ahc-euclidean-distances", "--hf_token", "private-secret"])
+            data = json.loads(report.read_text())
+            self.assertTrue(data["ahc_euclidean_distances_requested"])
+            self.assertFalse(data["ahc_euclidean_distances_observed"])
+            self.assertEqual(data["native_ahc_euclidean_distance_calls"], 0)
+            self.assertIs(VBxClustering.__call__, original)
+            self.assertNotIn("private.wav", report.read_text())
+            self.assertNotIn("private-secret", report.read_text())
+
     def test_vbx_resident_assignment_requires_library_and_rejects_standalone_flags(self):
         for extra in ([], ["--vbx-inactive-speaker-mask"], ["--vbx-constrained-nan-cleanup"], ["--vbx-constrained-assignment"], ["--vbx-batched-assignment"]):
             with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stderr(io.StringIO()):
@@ -457,6 +486,31 @@ class MetalCLITests(unittest.TestCase):
                 main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "audio.wav", "--clustering-cpu-audit"])
             self.assertEqual(caught.exception.code, 2)
             self.assertFalse(report.exists())
+
+    def test_pairwise_audit_completion_accepts_five_observations_and_keeps_privacy(self):
+        import numpy as np
+        from scipy.spatial.distance import pdist
+
+        def cli():
+            pdist(np.array([[0., 0.], [3., 4.]]))
+            raise ValueError("private-secret-error")
+
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with patch("tools.baseline.mps_storage_probe.MPSCTC") as native, patch("tools.baseline.native_double.NativeDoubleNormalization") as double, patch("tools.baseline.native_embedding_adapter.native_embedding_normalization", side_effect=lambda *a, **k: contextlib.nullcontext()), patch("tools.metal_cli.native_alignment", side_effect=lambda *a: contextlib.nullcontext()), patch("whisperx.__main__.cli", side_effect=cli):
+                for item in (native, double):
+                    item.return_value.__enter__.return_value.identity = {}
+                    item.return_value.__enter__.return_value.initialization_wall_ns = 1
+                with self.assertRaisesRegex(ValueError, "private-secret-error"):
+                    main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--plda-normalization-library", "unused.dylib", "--plda-normalization-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--clustering-cpu-audit", "--ahc-euclidean-distances", "--hf_token", "private-token"])
+            data = json.loads(report.read_text())
+            self.assertTrue(data["clustering_cpu_audit_complete"])
+            self.assertEqual(len(data["clustering_cpu_api_observations"]), 5)
+            observed = {row["operation"]: row for row in data["clustering_cpu_api_observations"]}
+            self.assertEqual(observed["ahc_pairwise_distances"]["calls_started"], 1)
+            for private in ("private.wav", "private-token", "private-secret-error"):
+                self.assertNotIn(private, report.read_text())
+            self.assertIsNone(sys.getprofile())
 
     def test_clustering_cpu_audit_failure_keeps_observations_private_and_restores(self):
         import numpy as np

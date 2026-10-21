@@ -35,16 +35,26 @@ def targets():
 
 
 @contextlib.contextmanager
-def clustering_cpu_audit(records):
+def clustering_cpu_audit(records, include_pairwise=False):
     if not isinstance(records, list) or records:
         raise ValueError("clustering_cpu_audit_empty_records_required")
+    if type(include_pairwise) is not bool:
+        raise ValueError("clustering_cpu_audit_pairwise_flag_invalid")
     previous = sys.getprofile()
     if previous is not None:
         raise ValueError("clustering_cpu_audit_profiler_already_active")
     codes, solver = targets()
+    hashes = dict(SOURCE_HASHES)
+    if include_pairwise:
+        import pyannote.audio.pipelines.clustering as clustering
+        import scipy.spatial.distance as distance
+        from tools.baseline.native_ahc_distances import PDIST_SHA256, validate_ahc_reference
+        validate_ahc_reference(clustering.VBxClustering.__call__)
+        codes[distance.pdist.__code__] = "ahc_pairwise_distances"
+        hashes["ahc_pairwise_distances"] = PDIST_SHA256
     rows = {}
-    for name in (*SOURCE_HASHES, "linear_sum_assignment"):
-        row = {"operation": name, "scope": "owner_thread_clustering_api", "calls_started": 0, "calls_returned_or_unwound": 0, "c_exceptions": 0, "incomplete_calls": 0, "total_wall_ns": 0, "max_wall_ns": 0, "source_sha256": SOURCE_HASHES.get(name), "inclusive_wall_time": True, "instrumentation_overhead_included": True, "exclusive_cpu_time": False, "gpu_dispatch_verified": False, "python_exception_status_available": False}
+    for name in (*hashes, "linear_sum_assignment"):
+        row = {"operation": name, "scope": "owner_thread_clustering_api", "calls_started": 0, "calls_returned_or_unwound": 0, "c_exceptions": 0, "incomplete_calls": 0, "total_wall_ns": 0, "max_wall_ns": 0, "source_sha256": hashes.get(name), "inclusive_wall_time": True, "instrumentation_overhead_included": True, "exclusive_cpu_time": False, "gpu_dispatch_verified": False, "python_exception_status_available": False}
         records.append(row)
         rows[name] = row
         row["observation_complete"] = False
