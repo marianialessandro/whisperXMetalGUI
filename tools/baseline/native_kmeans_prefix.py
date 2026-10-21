@@ -22,7 +22,7 @@ CLIP_SHA256 = "9a0eb9c2e80a635150f89e1397012b8f775d6abfeebb19e569cede3f23a2f155"
 ARGMIN_SHA256 = "7cfd400e4c8292a14b60ec6628a65256c0c3cd130197eee6e2047daa06b84360"
 
 
-def compile_native_prefix(original, prefix, minimum=None, probabilities=None, search=None, best=None):
+def compile_native_prefix(original, prefix, minimum=None, probabilities=None, search=None, best=None, query_scale=None):
     if not inspect.isfunction(original) or original.__closure__ or inspect.unwrap(original) is not original:
         raise ValueError("kmeans_weighted_prefix_reference_not_supported")
     source = inspect.getsource(original)
@@ -52,6 +52,13 @@ def compile_native_prefix(original, prefix, minimum=None, probabilities=None, se
         if len(probability_matches) != 1:
             raise ValueError("kmeans_seed_probabilities_expression_contract_changed")
     probability_replacement = ast.parse("__wx_native_kmeans_seed_probabilities(sample_weight)", mode="eval").body
+    scale_matches = []
+    if query_scale is not None:
+        expected_scale = ast.parse("random_state.uniform(size=n_local_trials) * current_pot", mode="eval").body
+        scale_matches = [node for node in ast.walk(tree) if isinstance(node, ast.BinOp) and ast.dump(node) == ast.dump(expected_scale)]
+        if len(scale_matches) != 1:
+            raise ValueError("kmeans_query_scaling_expression_contract_changed")
+    scale_replacement = ast.parse("__wx_native_kmeans_query_scale(random_state.uniform(size=n_local_trials), current_pot)", mode="eval").body
     search_matches, clip_matches = [], []
     if search is not None:
         if hashlib.sha256(inspect.getsource(np.searchsorted).encode()).hexdigest() != SEARCHSORTED_SHA256 or hashlib.sha256(inspect.getsource(np.clip).encode()).hexdigest() != CLIP_SHA256:
@@ -75,6 +82,8 @@ def compile_native_prefix(original, prefix, minimum=None, probabilities=None, se
             return ast.copy_location(ast.Pass(), node) if clip_matches and node is clip_matches[0] else self.generic_visit(node)
 
         def visit_BinOp(self, node):
+            if scale_matches and node is scale_matches[0]:
+                return ast.copy_location(scale_replacement, node)
             return ast.copy_location(probability_replacement, node) if probability_matches and node is probability_matches[0] else self.generic_visit(node)
 
         def visit_Call(self, node):
@@ -97,6 +106,7 @@ def compile_native_prefix(original, prefix, minimum=None, probabilities=None, se
     namespace["__wx_native_kmeans_seed_probabilities"] = probabilities
     namespace["__wx_native_kmeans_candidate_search"] = search
     namespace["__wx_native_kmeans_best_candidate"] = best
+    namespace["__wx_native_kmeans_query_scale"] = query_scale
     ast.fix_missing_locations(tree)
     exec(compile(tree, "<WhisperX scoped native KMeans++ weighted prefix>", "exec"), namespace)
     candidate = namespace[tree.body[0].name]
@@ -135,3 +145,18 @@ def best_candidate(context, records, potentials):
     record.update({"adapter_scope": "sklearn_dense_kmeans_plusplus_best_candidate", "original_plusplus_sha256": PLUSPLUS_SHA256, "numpy_argmin_sha256": ARGMIN_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "cpu_residuals": ["rng_and_query_scaling", "distance_and_potential_computation", "candidate_gathering_and_seed_copy", "lloyd_or_elkan", "host_staging_and_control"]})
     records.append(record)
     return result
+
+
+def scale_queries(context, records, random_values, potential):
+    if type(random_values) is not np.ndarray or random_values.dtype != np.float64 or random_values.ndim != 1 or not random_values.flags.c_contiguous or type(potential) is not np.ndarray or potential.dtype != np.float32 or potential.shape != (1,) or not potential.flags.c_contiguous:
+        raise ValueError("kmeans_query_scaling_operand_format_invalid")
+    if not 0 < random_values.size <= 1024:
+        raise ValueError("kmeans_query_scaling_shape_invalid")
+    if not np.isfinite(random_values).all() or np.signbit(random_values).any() or (random_values >= 1).any() or ((random_values != 0) & (random_values < 2. ** -53)).any() or not np.isfinite(potential).all() or np.signbit(potential).any() or (potential > 2. ** 76).any() or ((potential != 0) & (potential < 2. ** -100)).any():
+        raise ValueError("kmeans_query_scaling_value_domain_invalid")
+    promoted = np.ascontiguousarray(potential, dtype=np.float64).reshape(1, 1)
+    output, record = context.matmul(random_values.reshape(-1, 1), promoted)
+    record = dict(record)
+    record.update({"scope": "experimental_native_binary64_kmeans_query_scaling", "adapter_scope": "sklearn_dense_kmeans_plusplus_random_query_scaling", "original_plusplus_sha256": PLUSPLUS_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "one_term_product": True, "host_exact_scalar_promotion_bytes": promoted.nbytes, "host_random_view_copy_bytes": 0, "rng_calls_replaced": False, "cpu_residuals": ["rng_uniform_and_choice", "distance_and_potential_computation", "candidate_gathering_and_seed_copy", "lloyd_or_elkan", "host_staging_and_control"]})
+    records.append(record)
+    return output[:, 0]
