@@ -34,6 +34,7 @@ extern "C" int wxdouble_vbx_kmeans_centroids(void*, const float*, const int32_t*
 extern "C" int wxdouble_float_shift(void*, const float*, const float*, uint32_t, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_tolerance(void*, const float*, uint32_t, uint32_t, float, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_squared_norms(void*, const float*, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_kmeans_weighted_prefix(void*, const float*, const float*, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -49,6 +50,24 @@ int main(int argc, char** argv) {
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    float prefix_weights[] = {1, 2, 3}, prefix_distances[] = {2, 3, 4}, prefix_output[] = {91, 92, 93};
+    assert(wxdouble_kmeans_weighted_prefix(context, prefix_weights, prefix_distances, 3, prefix_output, &metrics, error, sizeof(error)) == 0 && prefix_output[0] == 2 && prefix_output[1] == 8 && prefix_output[2] == 20 && metrics.kernels == 2);
+    prefix_output[0] = 91;
+    assert(wxdouble_kmeans_weighted_prefix(nullptr, prefix_weights, prefix_distances, 3, prefix_output, &metrics, error, sizeof(error)) != 0 && prefix_output[0] == 91);
+    assert(wxdouble_kmeans_weighted_prefix(context, nullptr, prefix_distances, 3, prefix_output, &metrics, error, sizeof(error)) != 0 && prefix_output[0] == 91);
+    assert(wxdouble_kmeans_weighted_prefix(context, prefix_weights, nullptr, 3, prefix_output, &metrics, error, sizeof(error)) != 0 && prefix_output[0] == 91);
+    assert(wxdouble_kmeans_weighted_prefix(context, prefix_weights, prefix_distances, 3, nullptr, &metrics, error, sizeof(error)) != 0 && prefix_output[0] == 91);
+    assert(wxdouble_kmeans_weighted_prefix(context, prefix_weights, prefix_distances, 3, prefix_output, nullptr, error, sizeof(error)) != 0 && prefix_output[0] == 91);
+    assert(wxdouble_kmeans_weighted_prefix(context, prefix_weights, prefix_distances, 0, prefix_output, &metrics, error, sizeof(error)) != 0 && prefix_output[0] == 91);
+    assert(wxdouble_kmeans_weighted_prefix(context, prefix_weights, prefix_distances, 4097, prefix_output, &metrics, error, sizeof(error)) != 0 && prefix_output[0] == 91);
+    for (float invalid : {-1.f, 0x1p-65f, 0x1p33f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+        prefix_weights[0] = invalid;
+        assert(wxdouble_kmeans_weighted_prefix(context, prefix_weights, prefix_distances, 3, prefix_output, &metrics, error, sizeof(error)) != 0 && prefix_output[0] == 91);
+        prefix_weights[0] = 1; prefix_distances[0] = invalid;
+        assert(wxdouble_kmeans_weighted_prefix(context, prefix_weights, prefix_distances, 3, prefix_output, &metrics, error, sizeof(error)) != 0 && prefix_output[0] == 91);
+        prefix_distances[0] = 2;
+    }
+    assert(wxdouble_kmeans_weighted_prefix(context, prefix_weights, prefix_distances, 3, prefix_weights, &metrics, error, sizeof(error)) == 0 && prefix_weights[2] == 20);
     float norm_values[] = {1, 2, 3, 4}, norm_output[] = {91, 92};
     assert(wxdouble_kmeans_squared_norms(context, norm_values, 2, 2, norm_output, &metrics, error, sizeof(error)) == 0 && norm_output[0] == 5 && norm_output[1] == 25 && metrics.kernels == 1);
     norm_output[0] = 91;
@@ -559,6 +578,13 @@ int main(int argc, char** argv) {
     assert(wxdouble_kmeans_tolerance(context, tolerance_values, 2, 2, .5f, &tolerance_output, &metrics, error, sizeof(error)) == 0);
     norm_output[0] = 91;
     assert(wxdouble_kmeans_squared_norms(context, norm_values, 2, 2, norm_output, &metrics, error, sizeof(error)) != 0 && norm_output[0] == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_prefix_shader = shader.substr(0, shader.find("\nstruct KmeansPrefixDimensions"));
+    assert(wxdouble_create(pre_prefix_shader.data(), pre_prefix_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_kmeans_squared_norms(context, norm_values, 2, 2, norm_output, &metrics, error, sizeof(error)) == 0);
+    prefix_output[0] = 91;
+    assert(wxdouble_kmeans_weighted_prefix(context, prefix_weights, prefix_distances, 3, prefix_output, &metrics, error, sizeof(error)) != 0 && prefix_output[0] == 91);
     wxdouble_destroy(context);
 
 }

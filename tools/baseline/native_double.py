@@ -537,6 +537,30 @@ class NativeDoubleNormalization:
             raise ValueError("double_vbx_one_hot_native_result_invalid")
         return output, {"scope": "experimental_native_binary64_vbx_one_hot", "operation": "initial_one_hot", "rows": rows, "columns": columns, "gpu_kernels": ["double_vbx_one_hot"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": labels.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
+    def kmeans_weighted_prefix(self, weights, distances):
+        if type(weights) is not np.ndarray or weights.dtype != np.float32 or weights.ndim != 1 or not weights.flags.c_contiguous or type(distances) is not np.ndarray or distances.dtype != np.float32 or distances.shape not in (weights.shape, (1, weights.size)) or not distances.flags.c_contiguous:
+            raise ValueError("double_kmeans_weighted_prefix_operand_format_invalid")
+        count = weights.size
+        if not 0 < count <= 4096:
+            raise ValueError("double_kmeans_weighted_prefix_shape_invalid")
+        output = np.empty(count, dtype=np.float32)
+        metrics, error = Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_kmeans_weighted_prefix
+            except AttributeError as failure:
+                raise ValueError("double_kmeans_weighted_prefix_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, weights.ctypes.data, distances.ctypes.data, count, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 2 or not np.isfinite(output).all() or (output < 0).any():
+            raise ValueError("double_kmeans_weighted_prefix_native_result_invalid")
+        return output, {"scope": "experimental_native_float32_kmeans_weighted_prefix", "count": count, "distance_rows": 1 if distances.ndim == 2 else None, "arithmetic_policy": "float32_multiply_then_sequential_flat_cumsum", "numpy_bitwise_certified": False, "gpu_kernels": ["float_kmeans_weighted_products", "float_kmeans_weighted_prefix"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": weights.nbytes + distances.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
     def kmeans_squared_norms(self, values):
         if type(values) is not np.ndarray or values.dtype != np.float32 or values.ndim != 2 or not values.flags.c_contiguous:
             raise ValueError("double_kmeans_squared_norms_operand_format_invalid")

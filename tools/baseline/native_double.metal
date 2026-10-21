@@ -713,3 +713,20 @@ kernel void float_kmeans_squared_norms(device const float* values [[buffer(0)]],
     }
     output[row] = 0.0f + ((accum.x + accum.y) + (accum.z + accum.w));
 }
+
+struct KmeansPrefixDimensions { uint count; };
+
+// Store products before accumulation to preserve NumPy's separate float32 multiplication and cumulative addition.
+kernel void float_kmeans_weighted_products(device const float* weights [[buffer(0)]], constant KmeansPrefixDimensions& d [[buffer(1)]], device const float* distances [[buffer(2)]], device float* products [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index < d.count) products[index] = weights[index] * distances[index];
+}
+
+kernel void float_kmeans_weighted_prefix(device const float* products [[buffer(0)]], constant KmeansPrefixDimensions& d [[buffer(1)]], device float* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    if (index != 0) return;
+    float accum = products[0];
+    output[0] = accum;
+    for (uint i = 1; i < d.count; ++i) {
+        accum += products[i];
+        output[i] = accum;
+    }
+}

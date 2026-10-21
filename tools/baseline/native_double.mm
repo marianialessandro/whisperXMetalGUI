@@ -13,6 +13,7 @@ struct KmeansCentroidDimensions { uint32_t rows, features, clusters; };
 struct FloatShiftDimensions { uint32_t rows, columns, add; };
 struct KmeansToleranceDimensions { uint32_t rows, columns, output_offset; float tolerance; };
 struct KmeansNormDimensions { uint32_t rows, columns; };
+struct KmeansPrefixDimensions { uint32_t count; };
 static_assert(sizeof(KmeansToleranceDimensions) == 16);
 struct MatrixDimensions { uint32_t rows, inner, columns; };
 struct ElementDimensions { uint32_t rows, columns, operation, scale_dimension; };
@@ -41,7 +42,7 @@ class DoubleContext {
     id<MTLComputePipelineState> kmeans_centroid_pipeline_;
     id<MTLComputePipelineState> float_shift_pipeline_;
     id<MTLComputePipelineState> tolerance_mean_pipeline_, tolerance_square_pipeline_, tolerance_final_pipeline_;
-    id<MTLComputePipelineState> kmeans_norm_pipeline_;
+    id<MTLComputePipelineState> kmeans_norm_pipeline_, kmeans_weighted_products_pipeline_, kmeans_weighted_prefix_pipeline_;
     id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_, cosine_norm_pipeline_, cosine_distance_pipeline_, cosine_score_pipeline_, argmax_pipeline_, minimum_pipeline_, inactive_pipeline_, nan_minimum_pipeline_, nan_cleanup_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
@@ -110,6 +111,9 @@ public:
         if (tolerance_final_function != nil) tolerance_final_pipeline_ = [device_ newComputePipelineStateWithFunction:tolerance_final_function error:&error];
         id<MTLFunction> kmeans_norm_function = [library newFunctionWithName:@"float_kmeans_squared_norms"];
         if (kmeans_norm_function != nil) kmeans_norm_pipeline_ = [device_ newComputePipelineStateWithFunction:kmeans_norm_function error:&error];
+        id<MTLFunction> weighted_products_function = [library newFunctionWithName:@"float_kmeans_weighted_products"], weighted_prefix_function = [library newFunctionWithName:@"float_kmeans_weighted_prefix"];
+        if (weighted_products_function != nil) kmeans_weighted_products_pipeline_ = [device_ newComputePipelineStateWithFunction:weighted_products_function error:&error];
+        if (weighted_prefix_function != nil) kmeans_weighted_prefix_pipeline_ = [device_ newComputePipelineStateWithFunction:weighted_prefix_function error:&error];
         id<MTLFunction> centroid_function = [library newFunctionWithName:@"double_vbx_centroids"];
         if (centroid_function != nil) centroid_pipeline_ = [device_ newComputePipelineStateWithFunction:centroid_function error:&error];
         id<MTLFunction> qinit_function = [library newFunctionWithName:@"double_vbx_qinit_exp"];
@@ -373,6 +377,33 @@ public:
         [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
         for (uint32_t row = 0; row < d.rows; ++row) require(std::isfinite(static_cast<const double*>(terms_.contents)[row]), "double_vbx_logsumexp_shift_domain_invalid");
         std::memcpy(output, terms_.contents, uint64_t(d.rows) * sizeof(double));
+        return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
+    DoubleMetrics kmeans_weighted_prefix(const float* weights, const float* distances, KmeansPrefixDimensions d, float* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(kmeans_weighted_products_pipeline_ != nil && kmeans_weighted_prefix_pipeline_ != nil, "double_kmeans_weighted_prefix_kernel_unavailable");
+        require(weights != nullptr && distances != nullptr && output != nullptr && d.count > 0 && d.count <= 4096, "double_kmeans_weighted_prefix_shape_or_pointer_invalid");
+        for (uint32_t index = 0; index < d.count; ++index) {
+            require(std::isfinite(weights[index]) && weights[index] >= 0 && weights[index] <= 0x1p32f && (weights[index] == 0 || weights[index] >= 0x1p-32f), "double_kmeans_weighted_prefix_weight_domain_invalid");
+            require(std::isfinite(distances[index]) && distances[index] >= 0 && distances[index] <= 0x1p32f && (distances[index] == 0 || distances[index] >= 0x1p-64f), "double_kmeans_weighted_prefix_distance_domain_invalid");
+        }
+        auto started = std::chrono::steady_clock::now();
+        uint64_t bytes = uint64_t(d.count) * sizeof(float);
+        reserve(input_, bytes); reserve(right_, bytes); reserve(output_, bytes); reserve(terms_, bytes);
+        std::memcpy(input_.contents, weights, bytes); std::memcpy(right_.contents, distances, bytes);
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental KMeans++ weighted prefix";
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:kmeans_weighted_products_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:right_ offset:0 atIndex:2]; [encoder setBuffer:output_ offset:0 atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(d.count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, kmeans_weighted_products_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:kmeans_weighted_prefix_pipeline_]; [encoder setBuffer:output_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:terms_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        const float* result = static_cast<const float*>(terms_.contents);
+        for (uint32_t index = 0; index < d.count; ++index) require(std::isfinite(result[index]) && result[index] >= 0 && result[index] <= 0x1p76f, "double_kmeans_weighted_prefix_result_invalid");
+        std::memcpy(output, result, bytes);
         return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
@@ -938,3 +969,11 @@ extern "C" int wxdouble_kmeans_squared_norms(void* context, const float* values,
     }
 }
 extern "C" void wxdouble_destroy(void* context) { @autoreleasepool { delete static_cast<DoubleContext*>(context); } }
+
+extern "C" int wxdouble_kmeans_weighted_prefix(void* context, const float* weights, const float* distances, uint32_t count, float* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->kmeans_weighted_prefix(weights, distances, {count}, output); return 0; }
+        catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_kmeans_weighted_prefix_failed"); return 1; }
+    }
+}

@@ -89,7 +89,7 @@ def shift_inplace(context, records, values, mean, add, role):
 
 
 @contextlib.contextmanager
-def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None):
+def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None):
     global _ACTIVE
     from sklearn.base import _fit_context
     from sklearn.cluster import KMeans
@@ -109,6 +109,16 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
             if getattr(context.library, "wxdouble_float_shift", None) is None:
                 raise ValueError("kmeans_shift_abi_unavailable")
         original_tolerance = None
+        original_plusplus = None
+        if prefix_records is not None:
+            import sklearn.cluster._kmeans as kmeans_module
+            from tools.baseline.native_kmeans_prefix import compile_native_prefix, weighted_prefix
+            if not isinstance(prefix_records, list):
+                raise ValueError("kmeans_weighted_prefix_records_required")
+            if getattr(context.library, "wxdouble_kmeans_weighted_prefix", None) is None:
+                raise ValueError("kmeans_weighted_prefix_abi_unavailable")
+            original_plusplus = kmeans_module._kmeans_plusplus
+            candidate_plusplus = compile_native_prefix(original_plusplus, lambda weights, distances: weighted_prefix(context, prefix_records, weights, distances))
         if tolerance_records is not None:
             import sklearn.cluster._kmeans as kmeans_module
             from tools.baseline.native_kmeans_tolerance import compile_native_tolerance, tolerance_value
@@ -164,14 +174,24 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
             def wrapped_tolerance(*args, **kwargs):
                 return candidate_tolerance(*args, **kwargs) if threading.get_ident() == owner else original_tolerance(*args, **kwargs)
 
+        if original_plusplus is not None:
+            @functools.wraps(original_plusplus)
+            def wrapped_plusplus(X, *args, **kwargs):
+                from scipy import sparse
+                return candidate_plusplus(X, *args, **kwargs) if threading.get_ident() == owner and not sparse.issparse(X) else original_plusplus(X, *args, **kwargs)
+
         _ACTIVE = True
         KMeans.fit = wrapped
         if original_tolerance is not None:
             kmeans_module._tolerance = wrapped_tolerance
+        if original_plusplus is not None:
+            kmeans_module._kmeans_plusplus = wrapped_plusplus
         try:
             yield
         finally:
             KMeans.fit = original
             if original_tolerance is not None:
                 kmeans_module._tolerance = original_tolerance
+            if original_plusplus is not None:
+                kmeans_module._kmeans_plusplus = original_plusplus
             _ACTIVE = False
