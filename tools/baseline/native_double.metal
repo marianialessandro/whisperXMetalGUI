@@ -780,3 +780,91 @@ kernel void float_kmeans_best_candidate(device const uint* potentials [[buffer(0
     }
     output[0] = long(best);
 }
+
+struct AssignmentDimensions { uint rows, columns; };
+
+ulong assignment_key(ulong value) {
+    ulong sign = 1ul << 63;
+    if ((value << 1) == 0) value = 0;
+    return (value & sign) != 0 ? ~value : value ^ sign;
+}
+
+bool assignment_equal(ulong a, ulong b) { return a == b || ((a | b) << 1) == 0; }
+
+// Shortest augmenting-path adaptation of SciPy 1.15.3 by PM Larsen; see native_assignment_notice.txt for its BSD license.
+kernel void double_linear_assignment_max(device const ulong* scores [[buffer(0)]], constant AssignmentDimensions& d [[buffer(1)]], device long* output [[buffer(2)]], device uint* status [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index != 0) return;
+    status[0] = 1;
+    bool transpose = d.columns < d.rows;
+    uint nr = min(d.rows, d.columns), nc = max(d.rows, d.columns);
+    ulong u[16], v[64], shortest[64];
+    int path[64], col4row[16], row4col[64], remaining[64], order[16];
+    bool seen_rows[16], seen_columns[64];
+    ulong sign = 1ul << 63, infinity = 0x7ff0000000000000ul;
+    for (uint i = 0; i < nr; ++i) { u[i] = 0; col4row[i] = -1; }
+    for (uint j = 0; j < nc; ++j) { v[j] = 0; row4col[j] = -1; path[j] = -1; }
+    for (uint current = 0; current < nr; ++current) {
+        for (uint i = 0; i < nr; ++i) seen_rows[i] = false;
+        for (uint j = 0; j < nc; ++j) { seen_columns[j] = false; shortest[j] = infinity; remaining[j] = int(nc - j - 1); }
+        ulong minimum = 0;
+        int row = int(current), sink = -1, available = int(nc);
+        for (uint step = 0; sink < 0; ++step) {
+            if (step >= nc || row < 0 || row >= int(nr) || available <= 0) return;
+            int selected = -1;
+            ulong lowest = infinity;
+            seen_rows[row] = true;
+            for (int it = 0; it < available; ++it) {
+                int column = remaining[it];
+                uint source = transpose ? uint(column) * d.columns + uint(row) : uint(row) * d.columns + uint(column);
+                ulong cost = scores[source] ^ sign;
+                ulong reduced = matrix_add(matrix_add(matrix_add(minimum, cost), u[row] ^ sign), v[column] ^ sign);
+                if (assignment_key(reduced) < assignment_key(shortest[column])) { path[column] = row; shortest[column] = reduced; }
+                if (assignment_key(shortest[column]) < assignment_key(lowest) || (assignment_equal(shortest[column], lowest) && row4col[column] == -1)) { lowest = shortest[column]; selected = it; }
+            }
+            minimum = lowest;
+            if (minimum == infinity || selected < 0) return;
+            int column = remaining[selected];
+            if (row4col[column] == -1) sink = column;
+            else row = row4col[column];
+            seen_columns[column] = true;
+            --available;
+            remaining[selected] = remaining[available];
+        }
+        u[current] = matrix_add(u[current], minimum);
+        for (uint i = 0; i < nr; ++i) {
+            if (seen_rows[i] && i != current) {
+                if (col4row[i] < 0 || col4row[i] >= int(nc)) return;
+                u[i] = matrix_add(u[i], matrix_add(minimum, shortest[col4row[i]] ^ sign));
+            }
+        }
+        for (uint j = 0; j < nc; ++j) if (seen_columns[j]) v[j] = matrix_add(v[j], matrix_add(minimum, shortest[j] ^ sign) ^ sign);
+        int column = sink;
+        bool augmented = false;
+        for (uint step = 0; step <= nr; ++step) {
+            if (column < 0 || column >= int(nc)) return;
+            int matched_row = path[column];
+            if (matched_row < 0 || matched_row >= int(nr)) return;
+            row4col[column] = matched_row;
+            int previous = col4row[matched_row];
+            col4row[matched_row] = column;
+            column = previous;
+            if (matched_row == int(current)) { augmented = true; break; }
+        }
+        if (!augmented) return;
+    }
+    for (uint i = 0; i < nr; ++i) {
+        order[i] = int(i);
+        if (transpose) {
+            uint position = i;
+            while (position > 0 && col4row[order[position]] < col4row[order[position - 1]]) {
+                int previous = order[position - 1]; order[position - 1] = order[position]; order[position] = previous;
+                --position;
+            }
+        }
+    }
+    for (uint i = 0; i < nr; ++i) {
+        output[i] = transpose ? long(col4row[order[i]]) : long(i);
+        output[nr + i] = transpose ? long(order[i]) : long(col4row[i]);
+    }
+    status[0] = 0;
+}

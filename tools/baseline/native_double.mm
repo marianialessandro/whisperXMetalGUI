@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include "native_checks.hpp"
+#include <algorithm>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -19,6 +20,7 @@ struct KmeansMinimumDimensions { uint32_t rows, columns; };
 struct KmeansProbabilityDimensions { uint32_t count; };
 struct KmeansSearchDimensions { uint32_t count, queries; };
 struct KmeansBestDimensions { uint32_t count; };
+struct AssignmentDimensions { uint32_t rows, columns; };
 static_assert(sizeof(KmeansToleranceDimensions) == 16);
 struct MatrixDimensions { uint32_t rows, inner, columns; };
 struct ElementDimensions { uint32_t rows, columns, operation, scale_dimension; };
@@ -47,7 +49,7 @@ class DoubleContext {
     id<MTLComputePipelineState> kmeans_centroid_pipeline_;
     id<MTLComputePipelineState> float_shift_pipeline_;
     id<MTLComputePipelineState> tolerance_mean_pipeline_, tolerance_square_pipeline_, tolerance_final_pipeline_;
-    id<MTLComputePipelineState> kmeans_best_pipeline_, kmeans_search_pipeline_, kmeans_probability_sum_pipeline_, kmeans_probability_pipeline_, kmeans_minimum_pipeline_, kmeans_norm_pipeline_, kmeans_weighted_products_pipeline_, kmeans_weighted_prefix_pipeline_;
+    id<MTLComputePipelineState> assignment_pipeline_, kmeans_best_pipeline_, kmeans_search_pipeline_, kmeans_probability_sum_pipeline_, kmeans_probability_pipeline_, kmeans_minimum_pipeline_, kmeans_norm_pipeline_, kmeans_weighted_products_pipeline_, kmeans_weighted_prefix_pipeline_;
     id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_, cosine_norm_pipeline_, cosine_distance_pipeline_, cosine_score_pipeline_, argmax_pipeline_, minimum_pipeline_, inactive_pipeline_, nan_minimum_pipeline_, nan_cleanup_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
@@ -128,6 +130,8 @@ public:
         if (candidate_search_function != nil) kmeans_search_pipeline_ = [device_ newComputePipelineStateWithFunction:candidate_search_function error:&error];
         id<MTLFunction> best_candidate_function = [library newFunctionWithName:@"float_kmeans_best_candidate"];
         if (best_candidate_function != nil) kmeans_best_pipeline_ = [device_ newComputePipelineStateWithFunction:best_candidate_function error:&error];
+        id<MTLFunction> assignment_function = [library newFunctionWithName:@"double_linear_assignment_max"];
+        if (assignment_function != nil) assignment_pipeline_ = [device_ newComputePipelineStateWithFunction:assignment_function error:&error];
         id<MTLFunction> centroid_function = [library newFunctionWithName:@"double_vbx_centroids"];
         if (centroid_function != nil) centroid_pipeline_ = [device_ newComputePipelineStateWithFunction:centroid_function error:&error];
         id<MTLFunction> qinit_function = [library newFunctionWithName:@"double_vbx_qinit_exp"];
@@ -392,6 +396,36 @@ public:
         for (uint32_t row = 0; row < d.rows; ++row) require(std::isfinite(static_cast<const double*>(terms_.contents)[row]), "double_vbx_logsumexp_shift_domain_invalid");
         std::memcpy(output, terms_.contents, uint64_t(d.rows) * sizeof(double));
         return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
+    DoubleMetrics linear_assignment_max(const double* scores, AssignmentDimensions d, int64_t* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(assignment_pipeline_ != nil, "double_assignment_kernel_unavailable");
+        require(scores != nullptr && output != nullptr && d.rows > 0 && d.rows <= 64 && d.columns > 0 && d.columns <= 64 && std::min(d.rows, d.columns) <= 16, "double_assignment_shape_or_pointer_invalid");
+        uint64_t count = uint64_t(d.rows) * d.columns, matched = std::min(d.rows, d.columns);
+        for (uint64_t index = 0; index < count; ++index) {
+            uint64_t magnitude = std::bit_cast<uint64_t>(scores[index]) & 0x7ffffffffffffffful;
+            require(magnitude <= std::bit_cast<uint64_t>(0x1p64) && (magnitude == 0 || magnitude >= std::bit_cast<uint64_t>(0x1p-64)), "double_assignment_value_domain_invalid");
+        }
+        auto started = std::chrono::steady_clock::now();
+        reserve(input_, count * sizeof(double)); reserve(output_, 2 * matched * sizeof(int64_t)); reserve(terms_, sizeof(uint32_t));
+        std::memcpy(input_.contents, scores, count * sizeof(double));
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental rectangular assignment maximization";
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:assignment_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:output_ offset:0 atIndex:2]; [encoder setBuffer:terms_ offset:0 atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        require(*static_cast<const uint32_t*>(terms_.contents) == 0, "double_assignment_solver_failed");
+        const int64_t* result = static_cast<const int64_t*>(output_.contents);
+        uint64_t used_columns = 0;
+        for (uint64_t index = 0; index < matched; ++index) {
+            require(result[index] >= 0 && uint64_t(result[index]) < d.rows && (index == 0 || result[index] > result[index - 1]) && result[matched + index] >= 0 && uint64_t(result[matched + index]) < d.columns, "double_assignment_result_invalid");
+            uint64_t bit = uint64_t(1) << result[matched + index];
+            require((used_columns & bit) == 0, "double_assignment_result_invalid"); used_columns |= bit;
+        }
+        std::memcpy(output, result, 2 * matched * sizeof(int64_t));
+        return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
     DoubleMetrics kmeans_best_candidate(const float* potentials, KmeansBestDimensions d, int64_t* output) {
@@ -1120,5 +1154,13 @@ extern "C" int wxdouble_kmeans_best_candidate(void* context, const float* potent
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->kmeans_best_candidate(potentials, {count}, output); return 0; }
         catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_kmeans_best_candidate_failed"); return 1; }
+    }
+}
+
+extern "C" int wxdouble_linear_assignment_max(void* context, const double* scores, uint32_t rows, uint32_t columns, int64_t* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->linear_assignment_max(scores, {rows, columns}, output); return 0; }
+        catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_assignment_failed"); return 1; }
     }
 }

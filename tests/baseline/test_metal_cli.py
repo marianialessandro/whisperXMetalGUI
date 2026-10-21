@@ -13,6 +13,35 @@ from tools.metal_cli import main, native_alignment
 
 
 class MetalCLITests(unittest.TestCase):
+    def test_vbx_constrained_assignment_requires_native_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "audio.wav", "--diarize", "--vbx-constrained-assignment"])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertFalse(report.exists())
+
+    def test_vbx_constrained_assignment_capability_failure_restores_scope_and_privacy(self):
+        from pyannote.audio.pipelines.clustering import BaseClustering
+        original = BaseClustering.constrained_argmax
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with patch("tools.baseline.mps_storage_probe.MPSCTC") as native, patch("tools.baseline.native_double.NativeDoubleNormalization") as double:
+                native.return_value.__enter__.return_value.identity = {}
+                native.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.identity = {}
+                double.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.library = SimpleNamespace(wxdouble_vbx_nan_cleanup=object())
+                with self.assertRaisesRegex(ValueError, "assignment_abi_unavailable"):
+                    main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--plda-normalization-library", "unused.dylib", "--plda-normalization-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--vbx-constrained-nan-cleanup", "--vbx-constrained-assignment", "--hf_token", "private-secret"])
+            data = json.loads(report.read_text())
+            self.assertTrue(data["vbx_constrained_assignment_requested"])
+            self.assertFalse(data["vbx_constrained_assignment_observed"])
+            self.assertEqual(data["native_vbx_constrained_assignment_calls"], 0)
+            self.assertIs(BaseClustering.constrained_argmax, original)
+            self.assertNotIn("private.wav", report.read_text())
+            self.assertNotIn("private-secret", report.read_text())
+
     def test_kmeans_query_scaling_flag_requires_feature_mean(self):
         with tempfile.TemporaryDirectory() as directory:
             report = Path(directory) / "report.json"

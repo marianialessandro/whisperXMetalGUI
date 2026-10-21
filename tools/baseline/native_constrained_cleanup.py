@@ -18,7 +18,7 @@ _HOOK_LOCK = threading.RLock()
 _ACTIVE = False
 
 
-def compile_native_cleanup(original, cleanup):
+def compile_native_cleanup(original, cleanup, assignment=None):
     source = textwrap.dedent(inspect.getsource(original))
     if hashlib.sha256(source.encode()).hexdigest() != CONSTRAINED_SHA256 or original.__closure__ or inspect.unwrap(original) is not original:
         raise ValueError("constrained_cleanup_source_not_supported")
@@ -28,8 +28,16 @@ def compile_native_cleanup(original, cleanup):
     if len(matches) != 1 or len(tree.body) != 1 or not isinstance(tree.body[0], ast.FunctionDef) or tree.body[0].decorator_list:
         raise ValueError("constrained_cleanup_expression_contract_changed")
     matches[0].value = ast.parse("__wx_constrained_cleanup(soft_clusters)").body[0].value
+    if assignment is not None:
+        expected_assignment = ast.parse("linear_sum_assignment(cost, maximize=True)", mode="eval").body
+        assignments = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.dump(node) == ast.dump(expected_assignment)]
+        if len(assignments) != 1:
+            raise ValueError("constrained_assignment_expression_contract_changed")
+        assignments[0].func = ast.Name(id="__wx_constrained_assignment", ctx=ast.Load())
+        assignments[0].keywords = []
     namespace = dict(original.__globals__)
     namespace["__wx_constrained_cleanup"] = cleanup
+    namespace["__wx_constrained_assignment"] = assignment
     ast.fix_missing_locations(tree)
     exec(compile(tree, "<WhisperX scoped native constrained NaN cleanup>", "exec"), namespace)
     candidate = namespace[tree.body[0].name]
@@ -55,7 +63,7 @@ def cleanup_scores(context, records, scores):
 
 
 @contextlib.contextmanager
-def native_constrained_nan_cleanup(context, records):
+def native_constrained_nan_cleanup(context, records, assignment_records=None):
     global _ACTIVE
     from pyannote.audio.pipelines.clustering import BaseClustering
     from scipy.optimize import linear_sum_assignment
@@ -72,12 +80,25 @@ def native_constrained_nan_cleanup(context, records):
         original = BaseClustering.constrained_argmax
         if original.__globals__.get("linear_sum_assignment") is not linear_sum_assignment:
             raise ValueError("constrained_cleanup_solver_reference_changed")
+        if assignment_records is not None:
+            from tools.baseline.native_assignment import assignment_pairs, validate_assignment_reference
+            if not isinstance(assignment_records, list):
+                raise ValueError("constrained_assignment_records_required")
+            if getattr(context.library, "wxdouble_linear_assignment_max", None) is None:
+                raise ValueError("double_assignment_abi_unavailable")
+            validate_assignment_reference(linear_sum_assignment)
         owner_thread = threading.get_ident()
 
         def cleanup(scores):
-            return cleanup_scores(context, records, scores)
+            output = cleanup_scores(context, records, scores)
+            if assignment_records is not None:
+                records[-1]["cpu_residuals"] = [name for name in records[-1]["cpu_residuals"] if name != "linear_sum_assignment"]
+            return output
 
-        candidate = compile_native_cleanup(original, cleanup)
+        def assignment(scores):
+            return assignment_pairs(context, assignment_records, scores)
+
+        candidate = compile_native_cleanup(original, cleanup, assignment=assignment if assignment_records is not None else None)
 
         @functools.wraps(original)
         def wrapped(*args, **kwargs):

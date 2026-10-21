@@ -537,6 +537,30 @@ class NativeDoubleNormalization:
             raise ValueError("double_vbx_one_hot_native_result_invalid")
         return output, {"scope": "experimental_native_binary64_vbx_one_hot", "operation": "initial_one_hot", "rows": rows, "columns": columns, "gpu_kernels": ["double_vbx_one_hot"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": labels.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
+    def linear_assignment_max(self, scores):
+        if type(scores) is not np.ndarray or scores.dtype != np.float64 or scores.ndim != 2 or not scores.flags.c_contiguous:
+            raise ValueError("double_assignment_operand_format_invalid")
+        rows, columns = scores.shape
+        if not 0 < rows <= 64 or not 0 < columns <= 64 or min(rows, columns) > 16:
+            raise ValueError("double_assignment_shape_invalid")
+        output = np.empty((2, min(rows, columns)), dtype=np.int64)
+        metrics, error = Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_linear_assignment_max
+            except AttributeError as failure:
+                raise ValueError("double_assignment_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, scores.ctypes.data, rows, columns, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 1 or (output < 0).any() or (output[0] >= rows).any() or (output[1] >= columns).any():
+            raise ValueError("double_assignment_native_result_invalid")
+        return (output[0], output[1]), {"scope": "experimental_native_binary64_rectangular_assignment", "rows": rows, "columns": columns, "matched_pairs": output.shape[1], "transposed": columns < rows, "arithmetic": "bounded_binary64_integer_emulation", "tie_policy": "pinned_scipy_1_15_3_shortest_augmenting_path", "scipy_assignment_certified": False, "gpu_kernels": ["double_linear_assignment_max"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": scores.nbytes, "logical_result_readback_bytes": output.nbytes + 4, "logical_status_readback_bytes": 4, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
     def kmeans_best_candidate(self, potentials):
         if type(potentials) is not np.ndarray or potentials.dtype != np.float32 or potentials.ndim not in (1, 2) or (potentials.ndim == 2 and potentials.shape[1] != 1) or not potentials.flags.c_contiguous:
             raise ValueError("double_kmeans_best_candidate_operand_format_invalid")

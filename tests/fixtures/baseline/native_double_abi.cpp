@@ -40,6 +40,7 @@ extern "C" int wxdouble_kmeans_candidate_minimum(void*, const float*, const floa
 extern "C" int wxdouble_kmeans_seed_probabilities(void*, const float*, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_candidate_search(void*, const float*, const double*, uint32_t, uint32_t, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_best_candidate(void*, const float*, uint32_t, int64_t*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_linear_assignment_max(void*, const double*, uint32_t, uint32_t, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -55,6 +56,25 @@ int main(int argc, char** argv) {
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    double assignment_scores[] = {1, 2, 3, 3, 2, 1}; int64_t assignment_output[] = {91, 92, 93, 94};
+    assert(wxdouble_linear_assignment_max(context, assignment_scores, 2, 3, assignment_output, &metrics, error, sizeof(error)) == 0 && assignment_output[0] == 0 && assignment_output[1] == 1 && assignment_output[2] == 2 && assignment_output[3] == 0 && metrics.kernels == 1);
+    assignment_output[0] = 91;
+    assert(wxdouble_linear_assignment_max(nullptr, assignment_scores, 2, 3, assignment_output, &metrics, error, sizeof(error)) != 0 && assignment_output[0] == 91);
+    assert(wxdouble_linear_assignment_max(context, nullptr, 2, 3, assignment_output, &metrics, error, sizeof(error)) != 0 && assignment_output[0] == 91);
+    assert(wxdouble_linear_assignment_max(context, assignment_scores, 2, 3, nullptr, &metrics, error, sizeof(error)) != 0 && assignment_output[0] == 91);
+    assert(wxdouble_linear_assignment_max(context, assignment_scores, 2, 3, assignment_output, nullptr, error, sizeof(error)) != 0 && assignment_output[0] == 91);
+    assert(wxdouble_linear_assignment_max(context, assignment_scores, 0, 3, assignment_output, &metrics, error, sizeof(error)) != 0 && assignment_output[0] == 91);
+    assert(wxdouble_linear_assignment_max(context, assignment_scores, 65, 2, assignment_output, &metrics, error, sizeof(error)) != 0 && assignment_output[0] == 91);
+    assert(wxdouble_linear_assignment_max(context, assignment_scores, 2, 65, assignment_output, &metrics, error, sizeof(error)) != 0 && assignment_output[0] == 91);
+    assert(wxdouble_linear_assignment_max(context, assignment_scores, 17, 17, assignment_output, &metrics, error, sizeof(error)) != 0 && assignment_output[0] == 91);
+    for (double invalid : {0x1p-65, -0x1p-65, 0x1p65, -0x1p65, std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) {
+        assignment_scores[0] = invalid;
+        assert(wxdouble_linear_assignment_max(context, assignment_scores, 2, 3, assignment_output, &metrics, error, sizeof(error)) != 0 && assignment_output[0] == 91);
+    }
+    assignment_scores[0] = 1;
+    assert(wxdouble_linear_assignment_max(context, assignment_scores, 2, 3, reinterpret_cast<int64_t*>(assignment_scores), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(assignment_output, assignment_scores, sizeof(assignment_output));
+    assert(assignment_output[0] == 0 && assignment_output[1] == 1 && assignment_output[2] == 2 && assignment_output[3] == 0);
     float best_potentials[] = {3, 1, 1, 2}; int64_t best_output = 91;
     assert(wxdouble_kmeans_best_candidate(context, best_potentials, 4, &best_output, &metrics, error, sizeof(error)) == 0 && best_output == 1 && metrics.kernels == 1);
     best_output = 91;
@@ -697,6 +717,14 @@ int main(int argc, char** argv) {
     assert(wxdouble_kmeans_candidate_search(context, search_cdf, search_queries, 4, 4, search_output, &metrics, error, sizeof(error)) == 0);
     best_output = 91;
     assert(wxdouble_kmeans_best_candidate(context, best_potentials, 4, &best_output, &metrics, error, sizeof(error)) != 0 && best_output == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_assignment_shader = shader.substr(0, shader.find("\nstruct AssignmentDimensions"));
+    assert(wxdouble_create(pre_assignment_shader.data(), pre_assignment_shader.size(), &context, error, sizeof(error)) == 0);
+    best_potentials[0] = 3; best_potentials[1] = 1; best_potentials[2] = 1; best_potentials[3] = 2;
+    assert(wxdouble_kmeans_best_candidate(context, best_potentials, 4, &best_output, &metrics, error, sizeof(error)) == 0 && best_output == 1);
+    assignment_output[0] = 91;
+    assert(wxdouble_linear_assignment_max(context, assignment_scores, 2, 3, assignment_output, &metrics, error, sizeof(error)) != 0 && assignment_output[0] == 91);
     wxdouble_destroy(context);
 
 }
