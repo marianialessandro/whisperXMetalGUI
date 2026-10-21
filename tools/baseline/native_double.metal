@@ -625,3 +625,69 @@ kernel void float_vbx_shift(device const float* values [[buffer(0)]], constant F
     float offset = mean[index % d.columns];
     output[index] = d.add ? values[index] + offset : values[index] - offset;
 }
+
+struct KmeansToleranceDimensions { uint rows, columns, output_offset; float tolerance; };
+
+float kmeans_float_leaf(device const float* values, uint start, uint count) {
+    float result = -0.0f;
+    if (count < 8) {
+        for (uint i = 0; i < count; ++i) result += values[start + i];
+        return result;
+    }
+    float sums[8];
+    for (uint lane = 0; lane < 8; ++lane) sums[lane] = values[start + lane];
+    uint i = 8;
+    for (; i < count - count % 8; i += 8) for (uint lane = 0; lane < 8; ++lane) sums[lane] += values[start + i + lane];
+    result = ((sums[0] + sums[1]) + (sums[2] + sums[3])) + ((sums[4] + sums[5]) + (sums[6] + sums[7]));
+    for (; i < count; ++i) result += values[start + i];
+    return result;
+}
+
+float kmeans_float_sum(device const float* values, uint count) {
+    uint starts[16], lengths[16], states[16], depth = 0;
+    float left[16], result = 0;
+    starts[0] = 0; lengths[0] = count; states[0] = 0;
+    while (true) {
+        uint length = lengths[depth], start = starts[depth];
+        if (length <= 128) result = kmeans_float_leaf(values, start, length);
+        else {
+            uint split = (length / 2) & ~7u;
+            if (states[depth] == 0) {
+                states[depth] = 1; ++depth; starts[depth] = start; lengths[depth] = split; states[depth] = 0;
+                continue;
+            }
+            if (states[depth] == 1) {
+                left[depth] = result; states[depth] = 2; ++depth; starts[depth] = start + split; lengths[depth] = length - split; states[depth] = 0;
+                continue;
+            }
+            result = left[depth] + result;
+        }
+        if (depth == 0) return result;
+        --depth;
+    }
+}
+
+kernel void float_kmeans_tolerance_column_mean(device const float* values [[buffer(0)]], constant KmeansToleranceDimensions& d [[buffer(1)]], device float* output [[buffer(2)]], uint column [[thread_position_in_grid]]) {
+    if (column >= d.columns) return;
+    float sum = 0.0f;
+    for (uint row = 0; row < d.rows; ++row) sum += values[row * d.columns + column];
+    float result = sum / float(d.rows);
+    if ((d.output_offset != 0 && sum > 0 && sum < float(d.rows) * 0x1p-126f) || (sum != 0 && result == 0) || (result != 0 && (as_type<uint>(result) & 0x7f800000u) == 0)) result = as_type<float>(0x7fc00000u);
+    output[d.output_offset + column] = result;
+}
+
+kernel void float_kmeans_tolerance_square(device const float* values [[buffer(0)]], constant KmeansToleranceDimensions& d [[buffer(1)]], device const float* means [[buffer(2)]], device float* output [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index >= d.rows * d.columns) return;
+    float delta = values[index] - means[index % d.columns];
+    float square = delta * delta;
+    if ((delta != 0 && abs(delta) < 0x1p-63f) || (delta != 0 && square == 0) || (square != 0 && (as_type<uint>(square) & 0x7f800000u) == 0)) square = as_type<float>(0x7fc00000u);
+    output[index] = square;
+}
+
+kernel void float_kmeans_tolerance_final(device const float* statistics [[buffer(0)]], constant KmeansToleranceDimensions& d [[buffer(1)]], device float* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    if (index != 0) return;
+    float sum = kmeans_float_sum(statistics + d.columns, d.columns);
+    float mean = sum / float(d.columns), result = mean * d.tolerance;
+    if ((sum > 0 && sum < float(d.columns) * 0x1p-126f) || (sum > 0 && mean == 0) || (mean != 0 && (as_type<uint>(mean) & 0x7f800000u) == 0) || (mean > 0 && result == 0) || (result != 0 && (as_type<uint>(result) & 0x7f800000u) == 0)) result = as_type<float>(0x7fc00000u);
+    output[0] = result;
+}

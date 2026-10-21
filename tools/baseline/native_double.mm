@@ -11,6 +11,8 @@
 struct DoubleDimensions { uint32_t rows, columns, sequential; };
 struct KmeansCentroidDimensions { uint32_t rows, features, clusters; };
 struct FloatShiftDimensions { uint32_t rows, columns, add; };
+struct KmeansToleranceDimensions { uint32_t rows, columns, output_offset; float tolerance; };
+static_assert(sizeof(KmeansToleranceDimensions) == 16);
 struct MatrixDimensions { uint32_t rows, inner, columns; };
 struct ElementDimensions { uint32_t rows, columns, operation, scale_dimension; };
 struct StatisticsDimensions { uint32_t rows, columns, features, operation, sequential, reserved; uint64_t fa, fb; };
@@ -37,6 +39,7 @@ class DoubleContext {
     id<MTLCommandQueue> queue_;
     id<MTLComputePipelineState> kmeans_centroid_pipeline_;
     id<MTLComputePipelineState> float_shift_pipeline_;
+    id<MTLComputePipelineState> tolerance_mean_pipeline_, tolerance_square_pipeline_, tolerance_final_pipeline_;
     id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_, cosine_norm_pipeline_, cosine_distance_pipeline_, cosine_score_pipeline_, argmax_pipeline_, minimum_pipeline_, inactive_pipeline_, nan_minimum_pipeline_, nan_cleanup_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
@@ -99,6 +102,10 @@ public:
         if (kmeans_centroid_function != nil) kmeans_centroid_pipeline_ = [device_ newComputePipelineStateWithFunction:kmeans_centroid_function error:&error];
         id<MTLFunction> float_shift_function = [library newFunctionWithName:@"float_vbx_shift"];
         if (float_shift_function != nil) float_shift_pipeline_ = [device_ newComputePipelineStateWithFunction:float_shift_function error:&error];
+        id<MTLFunction> tolerance_mean_function = [library newFunctionWithName:@"float_kmeans_tolerance_column_mean"], tolerance_square_function = [library newFunctionWithName:@"float_kmeans_tolerance_square"], tolerance_final_function = [library newFunctionWithName:@"float_kmeans_tolerance_final"];
+        if (tolerance_mean_function != nil) tolerance_mean_pipeline_ = [device_ newComputePipelineStateWithFunction:tolerance_mean_function error:&error];
+        if (tolerance_square_function != nil) tolerance_square_pipeline_ = [device_ newComputePipelineStateWithFunction:tolerance_square_function error:&error];
+        if (tolerance_final_function != nil) tolerance_final_pipeline_ = [device_ newComputePipelineStateWithFunction:tolerance_final_function error:&error];
         id<MTLFunction> centroid_function = [library newFunctionWithName:@"double_vbx_centroids"];
         if (centroid_function != nil) centroid_pipeline_ = [device_ newComputePipelineStateWithFunction:centroid_function error:&error];
         id<MTLFunction> qinit_function = [library newFunctionWithName:@"double_vbx_qinit_exp"];
@@ -363,6 +370,38 @@ public:
         for (uint32_t row = 0; row < d.rows; ++row) require(std::isfinite(static_cast<const double*>(terms_.contents)[row]), "double_vbx_logsumexp_shift_domain_invalid");
         std::memcpy(output, terms_.contents, uint64_t(d.rows) * sizeof(double));
         return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
+    DoubleMetrics kmeans_tolerance(const float* values, KmeansToleranceDimensions d, float* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(tolerance_mean_pipeline_ != nil && tolerance_square_pipeline_ != nil && tolerance_final_pipeline_ != nil, "double_kmeans_tolerance_kernel_unavailable");
+        require(values != nullptr && output != nullptr && d.rows > 0 && d.rows <= 4096 && d.columns >= 2 && d.columns <= 1024 && std::isfinite(d.tolerance) && d.tolerance >= 0x1p-32f && d.tolerance <= 0x1p16f, "double_kmeans_tolerance_shape_pointer_or_scalar_invalid");
+        uint64_t count = uint64_t(d.rows) * d.columns;
+        for (uint64_t index = 0; index < count; ++index) require(std::isfinite(values[index]) && std::abs(values[index]) <= 0x1p32f && (values[index] == 0 || std::abs(values[index]) >= 0x1p-32f), "double_kmeans_tolerance_value_domain_invalid");
+        auto started = std::chrono::steady_clock::now();
+        reserve(input_, count * sizeof(float)); reserve(right_, uint64_t(2) * d.columns * sizeof(float)); reserve(output_, count * sizeof(float)); reserve(terms_, sizeof(float));
+        std::memcpy(input_.contents, values, count * sizeof(float));
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental KMeans float32 tolerance";
+        auto encode_mean = [&](id<MTLBuffer> source, const KmeansToleranceDimensions& dimensions) {
+            id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+            [encoder setComputePipelineState:tolerance_mean_pipeline_]; [encoder setBuffer:source offset:0 atIndex:0]; [encoder setBytes:&dimensions length:sizeof(dimensions) atIndex:1]; [encoder setBuffer:right_ offset:0 atIndex:2];
+            [encoder dispatchThreads:MTLSizeMake(d.columns, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, tolerance_mean_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        };
+        encode_mean(input_, d);
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:tolerance_square_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:right_ offset:0 atIndex:2]; [encoder setBuffer:output_ offset:0 atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(256, tolerance_square_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        KmeansToleranceDimensions variance_dimensions = d; variance_dimensions.output_offset = d.columns;
+        encode_mean(output_, variance_dimensions);
+        encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:tolerance_final_pipeline_]; [encoder setBuffer:right_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:terms_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        float result = *static_cast<const float*>(terms_.contents);
+        require(std::isfinite(result) && result >= 0 && result <= 0x1p82f && std::fpclassify(result) != FP_SUBNORMAL, "double_kmeans_tolerance_intermediate_not_supported");
+        std::memcpy(output, &result, sizeof(float));
+        return {1, 4, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
     DoubleMetrics float_shift_vbx(const float* values, const float* mean, FloatShiftDimensions d, float* output) {
@@ -856,6 +895,13 @@ extern "C" int wxdouble_float_shift(void* context, const float* values, const fl
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->float_shift_vbx(values, mean, {rows, columns, add}, output); return 0; }
         catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_float_shift_failed"); return 1; }
+    }
+}
+extern "C" int wxdouble_kmeans_tolerance(void* context, const float* values, uint32_t rows, uint32_t columns, float tolerance, float* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->kmeans_tolerance(values, {rows, columns, 0, tolerance}, output); return 0; }
+        catch (const InventoryError& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_kmeans_tolerance_failed"); return 1; }
     }
 }
 extern "C" void wxdouble_destroy(void* context) { @autoreleasepool { delete static_cast<DoubleContext*>(context); } }

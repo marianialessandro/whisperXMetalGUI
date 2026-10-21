@@ -82,7 +82,7 @@ def shift_inplace(context, records, values, mean, add, role):
 
 
 @contextlib.contextmanager
-def native_kmeans_feature_mean(context, records, shift_records=None):
+def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None):
     global _ACTIVE
     from sklearn.base import _fit_context
     from sklearn.cluster import KMeans
@@ -101,6 +101,16 @@ def native_kmeans_feature_mean(context, records, shift_records=None):
                 raise ValueError("kmeans_shift_records_required")
             if getattr(context.library, "wxdouble_float_shift", None) is None:
                 raise ValueError("kmeans_shift_abi_unavailable")
+        original_tolerance = None
+        if tolerance_records is not None:
+            import sklearn.cluster._kmeans as kmeans_module
+            from tools.baseline.native_kmeans_tolerance import compile_native_tolerance, tolerance_value
+            if not isinstance(tolerance_records, list):
+                raise ValueError("kmeans_tolerance_records_required")
+            if getattr(context.library, "wxdouble_kmeans_tolerance", None) is None:
+                raise ValueError("kmeans_tolerance_abi_unavailable")
+            original_tolerance = kmeans_module._tolerance
+            candidate_tolerance = compile_native_tolerance(original_tolerance, lambda features, tolerance: tolerance_value(context, tolerance_records, features, tolerance))
         original = KMeans.fit
         inner = inspect.unwrap(original)
         if not inspect.isfunction(original) or not inspect.isfunction(inner):
@@ -113,6 +123,8 @@ def native_kmeans_feature_mean(context, records, shift_records=None):
             output = feature_mean(context, records, features)
             if shift_records is not None:
                 records[-1]["cpu_residuals"] = [name for name in records[-1]["cpu_residuals"] if name not in ("feature_subtraction_and_restoration", "final_centroid_translation")]
+            if tolerance_records is not None:
+                records[-1]["cpu_residuals"] = [name for name in records[-1]["cpu_residuals"] if name != "tolerance_variance"]
             return output
 
         def shift(values, offset, add, role):
@@ -125,10 +137,19 @@ def native_kmeans_feature_mean(context, records, shift_records=None):
         def wrapped(*args, **kwargs):
             return candidate(*args, **kwargs) if threading.get_ident() == owner else original(*args, **kwargs)
 
+        if original_tolerance is not None:
+            @functools.wraps(original_tolerance)
+            def wrapped_tolerance(*args, **kwargs):
+                return candidate_tolerance(*args, **kwargs) if threading.get_ident() == owner else original_tolerance(*args, **kwargs)
+
         _ACTIVE = True
         KMeans.fit = wrapped
+        if original_tolerance is not None:
+            kmeans_module._tolerance = wrapped_tolerance
         try:
             yield
         finally:
             KMeans.fit = original
+            if original_tolerance is not None:
+                kmeans_module._tolerance = original_tolerance
             _ACTIVE = False

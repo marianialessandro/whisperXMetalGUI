@@ -32,6 +32,7 @@ extern "C" int wxdouble_vbx_inactive_mask(void*, const double*, const double*, u
 extern "C" int wxdouble_vbx_nan_cleanup(void*, const double*, uint32_t, uint32_t, double*, uint32_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_vbx_kmeans_centroids(void*, const float*, const int32_t*, uint32_t, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_float_shift(void*, const float*, const float*, uint32_t, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_kmeans_tolerance(void*, const float*, uint32_t, uint32_t, float, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -47,6 +48,19 @@ int main(int argc, char** argv) {
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    float tolerance_values[] = {1, 2, 3, 4}, tolerance_output = 91;
+    assert(wxdouble_kmeans_tolerance(context, tolerance_values, 2, 2, .5f, &tolerance_output, &metrics, error, sizeof(error)) == 0 && tolerance_output == .5f && metrics.kernels == 4);
+    tolerance_output = 91;
+    assert(wxdouble_kmeans_tolerance(context, nullptr, 2, 2, .5f, &tolerance_output, &metrics, error, sizeof(error)) != 0 && tolerance_output == 91);
+    assert(wxdouble_kmeans_tolerance(context, tolerance_values, 2, 2, .5f, nullptr, &metrics, error, sizeof(error)) != 0 && tolerance_output == 91);
+    assert(wxdouble_kmeans_tolerance(context, tolerance_values, 4097, 2, .5f, &tolerance_output, &metrics, error, sizeof(error)) != 0 && tolerance_output == 91);
+    assert(wxdouble_kmeans_tolerance(context, tolerance_values, 2, 1, .5f, &tolerance_output, &metrics, error, sizeof(error)) != 0 && tolerance_output == 91);
+    assert(wxdouble_kmeans_tolerance(context, tolerance_values, 2, 2, 0, &tolerance_output, &metrics, error, sizeof(error)) != 0 && tolerance_output == 91);
+    assert(wxdouble_kmeans_tolerance(context, tolerance_values, 2, 2, std::numeric_limits<float>::infinity(), &tolerance_output, &metrics, error, sizeof(error)) != 0 && tolerance_output == 91);
+    tolerance_values[0] = std::numeric_limits<float>::quiet_NaN();
+    assert(wxdouble_kmeans_tolerance(context, tolerance_values, 2, 2, .5f, &tolerance_output, &metrics, error, sizeof(error)) != 0 && tolerance_output == 91);
+    tolerance_values[0] = 1;
+    assert(wxdouble_kmeans_tolerance(context, tolerance_values, 2, 2, .5f, tolerance_values, &metrics, error, sizeof(error)) == 0 && tolerance_values[0] == .5f);
     float shift_values[] = {1, 2, 3, 4}, shift_mean[] = {.5f, 1}, shift_output[] = {91, 92, 93, 94};
     assert(wxdouble_float_shift(context, shift_values, shift_mean, 2, 2, 0, shift_output, &metrics, error, sizeof(error)) == 0 && shift_output[0] == .5f && shift_output[3] == 3);
     assert(wxdouble_float_shift(context, shift_values, shift_mean, 2, 2, 1, shift_output, &metrics, error, sizeof(error)) == 0 && shift_output[0] == 1.5f && shift_output[3] == 5);
@@ -514,6 +528,13 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_kmeans_centroids(context, km_features, km_labels, 4, 2, 2, km_output, &metrics, error, sizeof(error)) == 0);
     shift_output[0] = 91;
     assert(wxdouble_float_shift(context, shift_values, shift_mean, 2, 2, 0, shift_output, &metrics, error, sizeof(error)) != 0 && shift_output[0] == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_tolerance_shader = shader.substr(0, shader.find("\nstruct KmeansToleranceDimensions"));
+    assert(wxdouble_create(pre_tolerance_shader.data(), pre_tolerance_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_float_shift(context, shift_values, shift_mean, 2, 2, 0, shift_output, &metrics, error, sizeof(error)) == 0);
+    tolerance_output = 91;
+    assert(wxdouble_kmeans_tolerance(context, tolerance_values, 2, 2, .5f, &tolerance_output, &metrics, error, sizeof(error)) != 0 && tolerance_output == 91);
     wxdouble_destroy(context);
 
 }

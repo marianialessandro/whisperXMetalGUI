@@ -537,6 +537,29 @@ class NativeDoubleNormalization:
             raise ValueError("double_vbx_one_hot_native_result_invalid")
         return output, {"scope": "experimental_native_binary64_vbx_one_hot", "operation": "initial_one_hot", "rows": rows, "columns": columns, "gpu_kernels": ["double_vbx_one_hot"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": labels.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
+    def kmeans_tolerance(self, values, tolerance):
+        if type(values) is not np.ndarray or values.dtype != np.float32 or values.ndim != 2 or not values.flags.c_contiguous or type(tolerance) not in (float, int, np.float32):
+            raise ValueError("double_kmeans_tolerance_operand_format_invalid")
+        rows, columns = values.shape
+        if not 0 < rows <= 4096 or not 2 <= columns <= 1024 or not 2. ** -32 <= tolerance <= 2. ** 16:
+            raise ValueError("double_kmeans_tolerance_shape_or_scalar_invalid")
+        output, metrics, error = np.empty(1, np.float32), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_kmeans_tolerance
+            except AttributeError as failure:
+                raise ValueError("double_kmeans_tolerance_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_float, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, values.ctypes.data, rows, columns, tolerance, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 4 or not np.isfinite(output).all():
+            raise ValueError("double_kmeans_tolerance_native_result_invalid")
+        return output[0], {"scope": "experimental_native_float32_kmeans_tolerance", "rows": rows, "columns": columns, "tolerance_parameter": float(tolerance), "tolerance_float32": float(np.float32(tolerance)), "arithmetic_policy": "float32_variance_ddof0_then_pairwise_feature_mean_and_float32_scale", "numpy_bitwise_certified": False, "gpu_kernels": ["float_kmeans_tolerance_column_mean", "float_kmeans_tolerance_square", "float_kmeans_tolerance_column_mean", "float_kmeans_tolerance_final"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
     def float_shift_vbx(self, values, mean, add=False):
         if type(values) is not np.ndarray or values.dtype != np.float32 or values.ndim != 2 or not values.flags.c_contiguous or type(mean) is not np.ndarray or mean.dtype != np.float32 or mean.ndim != 1 or not mean.flags.c_contiguous or type(add) is not bool:
             raise ValueError("double_float_shift_operand_format_invalid")
