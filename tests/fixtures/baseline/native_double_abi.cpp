@@ -41,6 +41,7 @@ extern "C" int wxdouble_kmeans_seed_probabilities(void*, const float*, uint32_t,
 extern "C" int wxdouble_kmeans_candidate_search(void*, const float*, const double*, uint32_t, uint32_t, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_best_candidate(void*, const float*, uint32_t, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_linear_assignment_max(void*, const double*, uint32_t, uint32_t, int64_t*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_assignment_batch(void*, const double*, uint32_t, uint32_t, uint32_t, int8_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -56,8 +57,37 @@ int main(int argc, char** argv) {
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    double batch_scores[] = {1, 2, 0, 2, 1, 0, std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN()};
+    int8_t batch_labels[] = {91, 92, 93, 94};
+    assert(wxdouble_assignment_batch(context, batch_scores, 2, 2, 3, batch_labels, &metrics, error, sizeof(error)) == 0 && batch_labels[0] == 1 && batch_labels[1] == 0 && batch_labels[2] == 0 && batch_labels[3] == 1 && metrics.kernels == 3);
+    batch_labels[0] = 91;
+    assert(wxdouble_assignment_batch(nullptr, batch_scores, 2, 2, 3, batch_labels, &metrics, error, sizeof(error)) != 0 && batch_labels[0] == 91);
+    assert(wxdouble_assignment_batch(context, nullptr, 2, 2, 3, batch_labels, &metrics, error, sizeof(error)) != 0 && batch_labels[0] == 91);
+    assert(wxdouble_assignment_batch(context, batch_scores, 2, 2, 3, nullptr, &metrics, error, sizeof(error)) != 0 && batch_labels[0] == 91);
+    assert(wxdouble_assignment_batch(context, batch_scores, 2, 2, 3, batch_labels, nullptr, error, sizeof(error)) != 0 && batch_labels[0] == 91);
+    assert(wxdouble_assignment_batch(context, batch_scores, 0, 2, 3, batch_labels, &metrics, error, sizeof(error)) != 0 && batch_labels[0] == 91);
+    assert(wxdouble_assignment_batch(context, batch_scores, 4097, 1, 1, batch_labels, &metrics, error, sizeof(error)) != 0 && batch_labels[0] == 91);
+    assert(wxdouble_assignment_batch(context, batch_scores, 2049, 2, 1, batch_labels, &metrics, error, sizeof(error)) != 0 && batch_labels[0] == 91);
+    assert(wxdouble_assignment_batch(context, batch_scores, 1, 65, 2, batch_labels, &metrics, error, sizeof(error)) != 0 && batch_labels[0] == 91);
+    assert(wxdouble_assignment_batch(context, batch_scores, 1, 2, 65, batch_labels, &metrics, error, sizeof(error)) != 0 && batch_labels[0] == 91);
+    assert(wxdouble_assignment_batch(context, batch_scores, 1, 17, 17, batch_labels, &metrics, error, sizeof(error)) != 0 && batch_labels[0] == 91);
+    for (double invalid : {-1.01, 2.01, 0x1p-65, -0x1p-65, std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()}) {
+        batch_scores[0] = invalid;
+        assert(wxdouble_assignment_batch(context, batch_scores, 2, 2, 3, batch_labels, &metrics, error, sizeof(error)) != 0 && batch_labels[0] == 91);
+    }
+    double all_nan_batch[12]; for (double& value : all_nan_batch) value = std::numeric_limits<double>::quiet_NaN();
+    assert(wxdouble_assignment_batch(context, all_nan_batch, 2, 2, 3, batch_labels, &metrics, error, sizeof(error)) != 0 && batch_labels[0] == 91);
+    batch_scores[0] = 1;
+    alignas(double) unsigned char batch_unaligned[sizeof(batch_scores) + 1];
+    std::memcpy(batch_unaligned + 1, batch_scores, sizeof(batch_scores));
+    assert(wxdouble_assignment_batch(context, reinterpret_cast<const double*>(batch_unaligned + 1), 2, 2, 3, batch_labels, &metrics, error, sizeof(error)) == 0 && batch_labels[3] == 1);
+    assert(wxdouble_assignment_batch(context, batch_scores, 2, 2, 3, reinterpret_cast<int8_t*>(batch_scores), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(batch_labels, batch_scores, sizeof(batch_labels)); assert(batch_labels[0] == 1 && batch_labels[3] == 1);
     double assignment_scores[] = {1, 2, 3, 3, 2, 1}; int64_t assignment_output[] = {91, 92, 93, 94};
     assert(wxdouble_linear_assignment_max(context, assignment_scores, 2, 3, assignment_output, &metrics, error, sizeof(error)) == 0 && assignment_output[0] == 0 && assignment_output[1] == 1 && assignment_output[2] == 2 && assignment_output[3] == 0 && metrics.kernels == 1);
+    alignas(double) unsigned char assignment_unaligned[sizeof(assignment_scores) + 1];
+    std::memcpy(assignment_unaligned + 1, assignment_scores, sizeof(assignment_scores));
+    assert(wxdouble_linear_assignment_max(context, reinterpret_cast<const double*>(assignment_unaligned + 1), 2, 3, assignment_output, &metrics, error, sizeof(error)) == 0 && assignment_output[2] == 2);
     assignment_output[0] = 91;
     assert(wxdouble_linear_assignment_max(nullptr, assignment_scores, 2, 3, assignment_output, &metrics, error, sizeof(error)) != 0 && assignment_output[0] == 91);
     assert(wxdouble_linear_assignment_max(context, nullptr, 2, 3, assignment_output, &metrics, error, sizeof(error)) != 0 && assignment_output[0] == 91);
@@ -725,6 +755,14 @@ int main(int argc, char** argv) {
     assert(wxdouble_kmeans_best_candidate(context, best_potentials, 4, &best_output, &metrics, error, sizeof(error)) == 0 && best_output == 1);
     assignment_output[0] = 91;
     assert(wxdouble_linear_assignment_max(context, assignment_scores, 2, 3, assignment_output, &metrics, error, sizeof(error)) != 0 && assignment_output[0] == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_batch_shader = shader.substr(0, shader.find("\nstruct AssignmentBatchDimensions"));
+    assert(wxdouble_create(pre_batch_shader.data(), pre_batch_shader.size(), &context, error, sizeof(error)) == 0);
+    double legacy_assignment_scores[] = {1, 2, 3, 3, 2, 1};
+    assert(wxdouble_linear_assignment_max(context, legacy_assignment_scores, 2, 3, assignment_output, &metrics, error, sizeof(error)) == 0 && assignment_output[2] == 2);
+    batch_labels[0] = 91;
+    assert(wxdouble_assignment_batch(context, batch_scores, 2, 2, 3, batch_labels, &metrics, error, sizeof(error)) != 0 && batch_labels[0] == 91);
     wxdouble_destroy(context);
 
 }

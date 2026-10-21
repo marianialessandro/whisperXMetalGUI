@@ -18,7 +18,7 @@ _HOOK_LOCK = threading.RLock()
 _ACTIVE = False
 
 
-def compile_native_cleanup(original, cleanup, assignment=None):
+def compile_native_cleanup(original, cleanup, assignment=None, batch=None):
     source = textwrap.dedent(inspect.getsource(original))
     if hashlib.sha256(source.encode()).hexdigest() != CONSTRAINED_SHA256 or original.__closure__ or inspect.unwrap(original) is not original:
         raise ValueError("constrained_cleanup_source_not_supported")
@@ -35,9 +35,17 @@ def compile_native_cleanup(original, cleanup, assignment=None):
             raise ValueError("constrained_assignment_expression_contract_changed")
         assignments[0].func = ast.Name(id="__wx_constrained_assignment", ctx=ast.Load())
         assignments[0].keywords = []
+    if batch is not None:
+        if assignment is not None:
+            raise ValueError("constrained_batch_configuration_invalid")
+        expected_nodes = [ast.parse("num_chunks, num_speakers, num_clusters = soft_clusters.shape").body[0], ast.parse("hard_clusters = -2 * np.ones((num_chunks, num_speakers), dtype=np.int8)").body[0], ast.parse("for c, cost in enumerate(soft_clusters):\n    speakers, clusters = linear_sum_assignment(cost, maximize=True)\n    for s, k in zip(speakers, clusters):\n        hard_clusters[c, s] = k").body[0], ast.parse("return hard_clusters").body[0]]
+        if len(tree.body[0].body) != 5 or any(sum(ast.dump(node) == ast.dump(expected) for node in ast.walk(tree)) != 1 for expected in expected_nodes):
+            raise ValueError("constrained_batch_expression_contract_changed")
+        tree.body[0].body = [ast.Return(value=ast.parse("__wx_constrained_batch(soft_clusters)", mode="eval").body)]
     namespace = dict(original.__globals__)
     namespace["__wx_constrained_cleanup"] = cleanup
     namespace["__wx_constrained_assignment"] = assignment
+    namespace["__wx_constrained_batch"] = batch
     ast.fix_missing_locations(tree)
     exec(compile(tree, "<WhisperX scoped native constrained NaN cleanup>", "exec"), namespace)
     candidate = namespace[tree.body[0].name]
@@ -63,7 +71,7 @@ def cleanup_scores(context, records, scores):
 
 
 @contextlib.contextmanager
-def native_constrained_nan_cleanup(context, records, assignment_records=None):
+def native_constrained_nan_cleanup(context, records, assignment_records=None, batch_records=None):
     global _ACTIVE
     from pyannote.audio.pipelines.clustering import BaseClustering
     from scipy.optimize import linear_sum_assignment
@@ -87,6 +95,17 @@ def native_constrained_nan_cleanup(context, records, assignment_records=None):
             if getattr(context.library, "wxdouble_linear_assignment_max", None) is None:
                 raise ValueError("double_assignment_abi_unavailable")
             validate_assignment_reference(linear_sum_assignment)
+        if batch_records is not None:
+            from tools.baseline.native_assignment import batch_labels, validate_assignment_reference
+            if assignment_records is not None:
+                raise ValueError("constrained_batch_configuration_invalid")
+            if not isinstance(batch_records, list):
+                raise ValueError("constrained_batch_records_required")
+            if getattr(context.library, "wxdouble_assignment_batch", None) is None:
+                raise ValueError("double_assignment_batch_abi_unavailable")
+            if original.__globals__.get("np") is not np:
+                raise ValueError("constrained_batch_numpy_reference_changed")
+            validate_assignment_reference(linear_sum_assignment)
         owner_thread = threading.get_ident()
 
         def cleanup(scores):
@@ -98,7 +117,10 @@ def native_constrained_nan_cleanup(context, records, assignment_records=None):
         def assignment(scores):
             return assignment_pairs(context, assignment_records, scores)
 
-        candidate = compile_native_cleanup(original, cleanup, assignment=assignment if assignment_records is not None else None)
+        def batch(scores):
+            return batch_labels(context, batch_records, scores)
+
+        candidate = compile_native_cleanup(original, cleanup, assignment=assignment if assignment_records is not None else None, batch=batch if batch_records is not None else None)
 
         @functools.wraps(original)
         def wrapped(*args, **kwargs):

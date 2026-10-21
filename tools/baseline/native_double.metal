@@ -792,9 +792,7 @@ ulong assignment_key(ulong value) {
 bool assignment_equal(ulong a, ulong b) { return a == b || ((a | b) << 1) == 0; }
 
 // Shortest augmenting-path adaptation of SciPy 1.15.3 by PM Larsen; see native_assignment_notice.txt for its BSD license.
-kernel void double_linear_assignment_max(device const ulong* scores [[buffer(0)]], constant AssignmentDimensions& d [[buffer(1)]], device long* output [[buffer(2)]], device uint* status [[buffer(3)]], uint index [[thread_position_in_grid]]) {
-    if (index != 0) return;
-    status[0] = 1;
+bool assignment_solve(device const ulong* scores, AssignmentDimensions d, thread long* output) {
     bool transpose = d.columns < d.rows;
     uint nr = min(d.rows, d.columns), nc = max(d.rows, d.columns);
     ulong u[16], v[64], shortest[64];
@@ -809,7 +807,7 @@ kernel void double_linear_assignment_max(device const ulong* scores [[buffer(0)]
         ulong minimum = 0;
         int row = int(current), sink = -1, available = int(nc);
         for (uint step = 0; sink < 0; ++step) {
-            if (step >= nc || row < 0 || row >= int(nr) || available <= 0) return;
+            if (step >= nc || row < 0 || row >= int(nr) || available <= 0) return false;
             int selected = -1;
             ulong lowest = infinity;
             seen_rows[row] = true;
@@ -822,7 +820,7 @@ kernel void double_linear_assignment_max(device const ulong* scores [[buffer(0)]
                 if (assignment_key(shortest[column]) < assignment_key(lowest) || (assignment_equal(shortest[column], lowest) && row4col[column] == -1)) { lowest = shortest[column]; selected = it; }
             }
             minimum = lowest;
-            if (minimum == infinity || selected < 0) return;
+            if (minimum == infinity || selected < 0) return false;
             int column = remaining[selected];
             if (row4col[column] == -1) sink = column;
             else row = row4col[column];
@@ -833,7 +831,7 @@ kernel void double_linear_assignment_max(device const ulong* scores [[buffer(0)]
         u[current] = matrix_add(u[current], minimum);
         for (uint i = 0; i < nr; ++i) {
             if (seen_rows[i] && i != current) {
-                if (col4row[i] < 0 || col4row[i] >= int(nc)) return;
+                if (col4row[i] < 0 || col4row[i] >= int(nc)) return false;
                 u[i] = matrix_add(u[i], matrix_add(minimum, shortest[col4row[i]] ^ sign));
             }
         }
@@ -841,16 +839,16 @@ kernel void double_linear_assignment_max(device const ulong* scores [[buffer(0)]
         int column = sink;
         bool augmented = false;
         for (uint step = 0; step <= nr; ++step) {
-            if (column < 0 || column >= int(nc)) return;
+            if (column < 0 || column >= int(nc)) return false;
             int matched_row = path[column];
-            if (matched_row < 0 || matched_row >= int(nr)) return;
+            if (matched_row < 0 || matched_row >= int(nr)) return false;
             row4col[column] = matched_row;
             int previous = col4row[matched_row];
             col4row[matched_row] = column;
             column = previous;
             if (matched_row == int(current)) { augmented = true; break; }
         }
-        if (!augmented) return;
+        if (!augmented) return false;
     }
     for (uint i = 0; i < nr; ++i) {
         order[i] = int(i);
@@ -866,5 +864,27 @@ kernel void double_linear_assignment_max(device const ulong* scores [[buffer(0)]
         output[i] = transpose ? long(col4row[order[i]]) : long(i);
         output[nr + i] = transpose ? long(order[i]) : long(col4row[i]);
     }
-    status[0] = 0;
+    return true;
+}
+
+kernel void double_linear_assignment_max(device const ulong* scores [[buffer(0)]], constant AssignmentDimensions& d [[buffer(1)]], device long* output [[buffer(2)]], device uint* status [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index != 0) return;
+    long pairs[32];
+    bool solved = assignment_solve(scores, d, pairs);
+    status[0] = solved ? 0u : 1u;
+    if (solved) for (uint i = 0; i < 2 * min(d.rows, d.columns); ++i) output[i] = pairs[i];
+}
+
+struct AssignmentBatchDimensions { uint chunks, rows, columns; };
+
+kernel void double_assignment_batch(device const ulong* scores [[buffer(0)]], constant AssignmentBatchDimensions& d [[buffer(1)]], device char* hard_labels [[buffer(2)]], device uint* status [[buffer(3)]], uint chunk [[thread_position_in_grid]]) {
+    if (chunk >= d.chunks) return;
+    long pairs[32];
+    AssignmentDimensions matrix = {d.rows, d.columns};
+    bool solved = assignment_solve(scores + ulong(chunk) * d.rows * d.columns, matrix, pairs);
+    status[chunk] = solved ? 0u : 1u;
+    if (!solved) return;
+    for (uint row = 0; row < d.rows; ++row) hard_labels[chunk * d.rows + row] = char(-2);
+    uint matched = min(d.rows, d.columns);
+    for (uint i = 0; i < matched; ++i) hard_labels[chunk * d.rows + uint(pairs[i])] = char(pairs[matched + i]);
 }

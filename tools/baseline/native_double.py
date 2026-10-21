@@ -537,6 +537,30 @@ class NativeDoubleNormalization:
             raise ValueError("double_vbx_one_hot_native_result_invalid")
         return output, {"scope": "experimental_native_binary64_vbx_one_hot", "operation": "initial_one_hot", "rows": rows, "columns": columns, "gpu_kernels": ["double_vbx_one_hot"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": labels.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
+    def assignment_batch(self, scores):
+        if type(scores) is not np.ndarray or scores.dtype != np.float64 or scores.ndim != 3 or not scores.flags.c_contiguous:
+            raise ValueError("double_assignment_batch_operand_format_invalid")
+        chunks, rows, columns = scores.shape
+        if not 0 < chunks <= 4096 or not 0 < rows <= 64 or not 0 < columns <= 64 or min(rows, columns) > 16 or chunks * rows > 4096:
+            raise ValueError("double_assignment_batch_shape_invalid")
+        output = np.empty((chunks, rows), dtype=np.int8)
+        metrics, error = Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_assignment_batch
+            except AttributeError as failure:
+                raise ValueError("double_assignment_batch_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, scores.ctypes.data, chunks, rows, columns, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 3 or ((output != -2) & ((output < 0) | (output >= columns))).any():
+            raise ValueError("double_assignment_batch_native_result_invalid")
+        return output, {"scope": "experimental_native_resident_constrained_assignment_batch", "chunks": chunks, "rows": rows, "columns": columns, "logical_assignment_matrices": chunks, "arithmetic": "bounded_binary64_integer_emulation", "tie_policy": "pinned_scipy_1_15_3_shortest_augmenting_path", "scipy_assignment_certified": False, "gpu_kernels": ["double_vbx_nan_min_partials", "double_vbx_nan_cleanup", "double_assignment_batch"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": scores.nbytes, "logical_result_readback_bytes": output.nbytes + chunks * 4, "logical_status_readback_bytes": chunks * 4, "intermediate_score_readback_bytes": 0, "assignment_pair_readback_bytes": 0, "host_numeric_label_scatter": False, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
     def linear_assignment_max(self, scores):
         if type(scores) is not np.ndarray or scores.dtype != np.float64 or scores.ndim != 2 or not scores.flags.c_contiguous:
             raise ValueError("double_assignment_operand_format_invalid")
