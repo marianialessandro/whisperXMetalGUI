@@ -18,6 +18,7 @@ struct KmeansPrefixDimensions { uint32_t count; };
 struct KmeansMinimumDimensions { uint32_t rows, columns; };
 struct KmeansProbabilityDimensions { uint32_t count; };
 struct KmeansSearchDimensions { uint32_t count, queries; };
+struct KmeansBestDimensions { uint32_t count; };
 static_assert(sizeof(KmeansToleranceDimensions) == 16);
 struct MatrixDimensions { uint32_t rows, inner, columns; };
 struct ElementDimensions { uint32_t rows, columns, operation, scale_dimension; };
@@ -46,7 +47,7 @@ class DoubleContext {
     id<MTLComputePipelineState> kmeans_centroid_pipeline_;
     id<MTLComputePipelineState> float_shift_pipeline_;
     id<MTLComputePipelineState> tolerance_mean_pipeline_, tolerance_square_pipeline_, tolerance_final_pipeline_;
-    id<MTLComputePipelineState> kmeans_search_pipeline_, kmeans_probability_sum_pipeline_, kmeans_probability_pipeline_, kmeans_minimum_pipeline_, kmeans_norm_pipeline_, kmeans_weighted_products_pipeline_, kmeans_weighted_prefix_pipeline_;
+    id<MTLComputePipelineState> kmeans_best_pipeline_, kmeans_search_pipeline_, kmeans_probability_sum_pipeline_, kmeans_probability_pipeline_, kmeans_minimum_pipeline_, kmeans_norm_pipeline_, kmeans_weighted_products_pipeline_, kmeans_weighted_prefix_pipeline_;
     id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_, cosine_norm_pipeline_, cosine_distance_pipeline_, cosine_score_pipeline_, argmax_pipeline_, minimum_pipeline_, inactive_pipeline_, nan_minimum_pipeline_, nan_cleanup_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
     std::mutex mutex_;
@@ -125,6 +126,8 @@ public:
         if (seed_probability_function != nil) kmeans_probability_pipeline_ = [device_ newComputePipelineStateWithFunction:seed_probability_function error:&error];
         id<MTLFunction> candidate_search_function = [library newFunctionWithName:@"float_kmeans_candidate_search"];
         if (candidate_search_function != nil) kmeans_search_pipeline_ = [device_ newComputePipelineStateWithFunction:candidate_search_function error:&error];
+        id<MTLFunction> best_candidate_function = [library newFunctionWithName:@"float_kmeans_best_candidate"];
+        if (best_candidate_function != nil) kmeans_best_pipeline_ = [device_ newComputePipelineStateWithFunction:best_candidate_function error:&error];
         id<MTLFunction> centroid_function = [library newFunctionWithName:@"double_vbx_centroids"];
         if (centroid_function != nil) centroid_pipeline_ = [device_ newComputePipelineStateWithFunction:centroid_function error:&error];
         id<MTLFunction> qinit_function = [library newFunctionWithName:@"double_vbx_qinit_exp"];
@@ -389,6 +392,29 @@ public:
         for (uint32_t row = 0; row < d.rows; ++row) require(std::isfinite(static_cast<const double*>(terms_.contents)[row]), "double_vbx_logsumexp_shift_domain_invalid");
         std::memcpy(output, terms_.contents, uint64_t(d.rows) * sizeof(double));
         return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
+    DoubleMetrics kmeans_best_candidate(const float* potentials, KmeansBestDimensions d, int64_t* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(kmeans_best_pipeline_ != nil, "double_kmeans_best_candidate_kernel_unavailable");
+        require(potentials != nullptr && output != nullptr && d.count > 0 && d.count <= 1024, "double_kmeans_best_candidate_shape_or_pointer_invalid");
+        for (uint32_t index = 0; index < d.count; ++index) {
+            uint32_t bits = std::bit_cast<uint32_t>(potentials[index]), magnitude = bits & 0x7fffffffu;
+            require((bits == magnitude || magnitude == 0) && magnitude <= std::bit_cast<uint32_t>(0x1p76f) && (magnitude == 0 || magnitude >= std::bit_cast<uint32_t>(0x1p-100f)), "double_kmeans_best_candidate_value_domain_invalid");
+        }
+        auto started = std::chrono::steady_clock::now();
+        reserve(input_, uint64_t(d.count) * sizeof(float)); reserve(output_, sizeof(int64_t));
+        std::memcpy(input_.contents, potentials, uint64_t(d.count) * sizeof(float));
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental KMeans++ best candidate";
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:kmeans_best_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:output_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        int64_t result = *static_cast<const int64_t*>(output_.contents);
+        require(result >= 0 && uint64_t(result) < d.count, "double_kmeans_best_candidate_result_invalid");
+        std::memcpy(output, &result, sizeof(result));
+        return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
     DoubleMetrics kmeans_candidate_search(const float* cdf, const double* queries, KmeansSearchDimensions d, int64_t* output) {
@@ -1086,5 +1112,13 @@ extern "C" int wxdouble_kmeans_candidate_search(void* context, const float* cdf,
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->kmeans_candidate_search(cdf, queries, {count, query_count}, output); return 0; }
         catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_kmeans_candidate_search_failed"); return 1; }
+    }
+}
+
+extern "C" int wxdouble_kmeans_best_candidate(void* context, const float* potentials, uint32_t count, int64_t* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->kmeans_best_candidate(potentials, {count}, output); return 0; }
+        catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_kmeans_best_candidate_failed"); return 1; }
     }
 }

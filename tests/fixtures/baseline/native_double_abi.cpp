@@ -39,6 +39,7 @@ extern "C" int wxdouble_kmeans_weighted_prefix(void*, const float*, const float*
 extern "C" int wxdouble_kmeans_candidate_minimum(void*, const float*, const float*, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_seed_probabilities(void*, const float*, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_candidate_search(void*, const float*, const double*, uint32_t, uint32_t, int64_t*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_kmeans_best_candidate(void*, const float*, uint32_t, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -54,6 +55,22 @@ int main(int argc, char** argv) {
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    float best_potentials[] = {3, 1, 1, 2}; int64_t best_output = 91;
+    assert(wxdouble_kmeans_best_candidate(context, best_potentials, 4, &best_output, &metrics, error, sizeof(error)) == 0 && best_output == 1 && metrics.kernels == 1);
+    best_output = 91;
+    assert(wxdouble_kmeans_best_candidate(nullptr, best_potentials, 4, &best_output, &metrics, error, sizeof(error)) != 0 && best_output == 91);
+    assert(wxdouble_kmeans_best_candidate(context, nullptr, 4, &best_output, &metrics, error, sizeof(error)) != 0 && best_output == 91);
+    assert(wxdouble_kmeans_best_candidate(context, best_potentials, 4, nullptr, &metrics, error, sizeof(error)) != 0 && best_output == 91);
+    assert(wxdouble_kmeans_best_candidate(context, best_potentials, 4, &best_output, nullptr, error, sizeof(error)) != 0 && best_output == 91);
+    assert(wxdouble_kmeans_best_candidate(context, best_potentials, 0, &best_output, &metrics, error, sizeof(error)) != 0 && best_output == 91);
+    assert(wxdouble_kmeans_best_candidate(context, best_potentials, 1025, &best_output, &metrics, error, sizeof(error)) != 0 && best_output == 91);
+    for (float invalid : {-1.f, 0x1p-101f, 0x1p77f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+        best_potentials[0] = invalid;
+        assert(wxdouble_kmeans_best_candidate(context, best_potentials, 4, &best_output, &metrics, error, sizeof(error)) != 0 && best_output == 91);
+    }
+    best_potentials[0] = 3;
+    assert(wxdouble_kmeans_best_candidate(context, best_potentials, 4, reinterpret_cast<int64_t*>(best_potentials), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(&best_output, best_potentials, sizeof(best_output)); assert(best_output == 1);
     float search_cdf[] = {0, 1, 1, 3}; double search_queries[] = {0, 1, 2, 9}; int64_t search_output[] = {91, 92, 93, 94};
     assert(wxdouble_kmeans_candidate_search(context, search_cdf, search_queries, 4, 4, search_output, &metrics, error, sizeof(error)) == 0 && search_output[0] == 0 && search_output[1] == 1 && search_output[2] == 3 && search_output[3] == 3 && metrics.kernels == 1);
     search_output[0] = 91;
@@ -673,6 +690,13 @@ int main(int argc, char** argv) {
     assert(wxdouble_kmeans_seed_probabilities(context, probability_weights, 2, probability_output, &metrics, error, sizeof(error)) == 0);
     search_output[0] = 91;
     assert(wxdouble_kmeans_candidate_search(context, search_cdf, search_queries, 4, 4, search_output, &metrics, error, sizeof(error)) != 0 && search_output[0] == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_best_shader = shader.substr(0, shader.find("\nstruct KmeansBestDimensions"));
+    assert(wxdouble_create(pre_best_shader.data(), pre_best_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_kmeans_candidate_search(context, search_cdf, search_queries, 4, 4, search_output, &metrics, error, sizeof(error)) == 0);
+    best_output = 91;
+    assert(wxdouble_kmeans_best_candidate(context, best_potentials, 4, &best_output, &metrics, error, sizeof(error)) != 0 && best_output == 91);
     wxdouble_destroy(context);
 
 }

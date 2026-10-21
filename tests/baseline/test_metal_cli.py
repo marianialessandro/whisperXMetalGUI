@@ -13,6 +13,38 @@ from tools.metal_cli import main, native_alignment
 
 
 class MetalCLITests(unittest.TestCase):
+    def test_kmeans_best_candidate_flag_requires_feature_mean(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "audio.wav", "--diarize", "--kmeans-best-candidate"])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertFalse(report.exists())
+
+    def test_kmeans_best_candidate_capability_failure_restores_bindings_and_privacy(self):
+        from sklearn.cluster import KMeans
+        import sklearn.cluster._kmeans as kmeans_module
+        original_fit, original_tolerance = KMeans.fit, kmeans_module._tolerance
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with patch("tools.baseline.mps_storage_probe.MPSCTC") as native, patch("tools.baseline.native_double.NativeDoubleNormalization") as double:
+                native.return_value.__enter__.return_value.identity = {}
+                native.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.identity = {}
+                double.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.library = SimpleNamespace(wxdouble_vbx_kmeans_centroids=object())
+                with self.assertRaisesRegex(ValueError, "kmeans_best_candidate_abi_unavailable"):
+                    main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--plda-normalization-library", "unused.dylib", "--plda-normalization-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--kmeans-feature-mean", "--kmeans-best-candidate", "--hf_token", "private-secret"])
+            data = json.loads(report.read_text())
+            self.assertEqual(data["status"], "failed")
+            self.assertTrue(data["kmeans_best_candidate_requested"])
+            self.assertFalse(data["kmeans_best_candidate_observed"])
+            self.assertEqual(data["native_kmeans_best_candidate_calls"], 0)
+            self.assertIs(KMeans.fit, original_fit)
+            self.assertIs(kmeans_module._tolerance, original_tolerance)
+            self.assertNotIn("private.wav", report.read_text())
+            self.assertNotIn("private-secret", report.read_text())
+
     def test_kmeans_candidate_search_flag_requires_feature_mean(self):
         with tempfile.TemporaryDirectory() as directory:
             report = Path(directory) / "report.json"

@@ -768,3 +768,15 @@ kernel void float_kmeans_candidate_search(device const float* cdf [[buffer(0)]],
     }
     output[index] = long(min(left, d.count - 1));
 }
+
+struct KmeansBestDimensions { uint count; };
+
+kernel void float_kmeans_best_candidate(device const uint* potentials [[buffer(0)]], constant KmeansBestDimensions& d [[buffer(1)]], device long* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    if (index != 0) return;
+    uint best = 0, minimum = potentials[0] & 0x7fffffffu;
+    for (uint i = 1; i < d.count; ++i) {
+        uint value = potentials[i] & 0x7fffffffu;
+        if (value < minimum) { minimum = value; best = i; }
+    }
+    output[0] = long(best);
+}
