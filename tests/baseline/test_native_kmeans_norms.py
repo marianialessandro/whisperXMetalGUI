@@ -58,6 +58,30 @@ class NativeKmeansNormsTests(unittest.TestCase):
             np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
             self.assertLessEqual(record["allocated_shared_buffer_bytes"], 72 * 1024 * 1024 + 40 * 1024)
 
+    def test_extended_normal_square_domain_preserves_einsum_rounding(self):
+        rng = np.random.default_rng(2027)
+        minimum = np.float32(2. ** -60)
+        with self.context() as context:
+            for columns in (1, 2, 3, 4, 7, 15, 16, 17, 31, 32, 33, 127, 128, 129, 255, 256, 257, 1023, 1024):
+                mantissas = rng.uniform(1., 2., (29, columns)).astype(np.float32)
+                exponents = rng.integers(-60, 32, (29, columns))
+                values = np.ldexp(mantissas, exponents).astype(np.float32)
+                values *= rng.choice(np.array([-1., 1.], np.float32), values.shape)
+                values[0] = minimum
+                values[1] = -minimum
+                values[2] = np.nextafter(minimum, np.float32(np.inf))
+                values[3] = np.float32(2. ** -33)
+                values[4] = -0.
+                values[5] = np.float32(2. ** 32)
+                values.flags.writeable = False
+                expected = np.einsum("ij,ij->i", values, values)
+                for unused in range(3):
+                    actual, record = context.kmeans_squared_norms(values)
+                    np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+                    self.assertGreater(record["computation_gpu_seconds"], 0)
+                self.assertEqual(expected[0], np.float32(columns) * np.float32(2. ** -120))
+                self.assertFalse(np.signbit(actual[4]))
+
     def test_domains_and_closed_context_fail_without_replacement(self):
         with self.context() as context:
             for values in (np.ones((3, 2), np.float64), np.ones((3, 4), np.float32)[:, ::2], np.ones(2, np.float32)):
@@ -66,7 +90,7 @@ class NativeKmeansNormsTests(unittest.TestCase):
             for shape in ((0, 2), (4097, 2), (2, 0), (2, 1025)):
                 with self.assertRaisesRegex(ValueError, "shape_invalid"):
                     context.kmeans_squared_norms(np.ones(shape, np.float32))
-            for value in (np.nan, np.inf, 2. ** -33, 2. ** 33):
+            for value in (np.nan, np.inf, 2. ** -61, np.nextafter(np.float32(2. ** -60), np.float32(0)), 2. ** 33):
                 with self.assertRaisesRegex(ValueError, "value_domain_invalid"):
                     context.kmeans_squared_norms(np.full((3, 2), value, np.float32))
             result, _ = context.kmeans_squared_norms(np.ones((3, 2), np.float32))

@@ -1047,7 +1047,7 @@ public:
         require(kmeans_norm_pipeline_ != nil, "double_kmeans_squared_norms_kernel_unavailable");
         require(values != nullptr && output != nullptr && d.rows > 0 && d.rows <= 4096 && d.columns > 0 && d.columns <= 1024, "double_kmeans_squared_norms_shape_or_pointer_invalid");
         uint64_t count = uint64_t(d.rows) * d.columns;
-        for (uint64_t index = 0; index < count; ++index) require(std::isfinite(values[index]) && std::abs(values[index]) <= 0x1p32f && (values[index] == 0 || std::abs(values[index]) >= 0x1p-32f), "double_kmeans_squared_norms_value_domain_invalid");
+        for (uint64_t index = 0; index < count; ++index) require(std::isfinite(values[index]) && std::abs(values[index]) <= 0x1p32f && (values[index] == 0 || std::abs(values[index]) >= 0x1p-60f), "double_kmeans_squared_norms_value_domain_invalid");
         auto started = std::chrono::steady_clock::now();
         reserve(input_, count * sizeof(float)); reserve(output_, uint64_t(d.rows) * sizeof(float));
         std::memcpy(input_.contents, values, count * sizeof(float));

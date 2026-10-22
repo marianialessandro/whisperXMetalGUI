@@ -582,10 +582,13 @@ int main(int argc, char** argv) {
     assert(wxdouble_kmeans_squared_norms(context, norm_values, 4097, 2, norm_output, &metrics, error, sizeof(error)) != 0 && norm_output[0] == 91);
     assert(wxdouble_kmeans_squared_norms(context, norm_values, 2, 0, norm_output, &metrics, error, sizeof(error)) != 0 && norm_output[0] == 91);
     assert(wxdouble_kmeans_squared_norms(context, norm_values, 2, 1025, norm_output, &metrics, error, sizeof(error)) != 0 && norm_output[0] == 91);
-    for (float invalid : {0x1p-33f, 0x1p33f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+    for (float invalid : {0x1p-61f, std::nextafter(0x1p-60f, 0.0f), -std::nextafter(0x1p-60f, 0.0f), 0x1p33f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
         norm_values[0] = invalid;
         assert(wxdouble_kmeans_squared_norms(context, norm_values, 2, 2, norm_output, &metrics, error, sizeof(error)) != 0 && norm_output[0] == 91);
     }
+    float tiny_norm_values[] = {0x1p-60f, -0x1p-60f, 0x1p-33f, -0x1p-33f};
+    assert(wxdouble_kmeans_squared_norms(context, tiny_norm_values, 2, 2, norm_output, &metrics, error, sizeof(error)) == 0 && norm_output[0] == 0x1p-119f && norm_output[1] == 0x1p-65f && metrics.kernels == 1);
+    assert(wxdouble_kmeans_squared_norms(context, tiny_norm_values, 2, 2, tiny_norm_values, &metrics, error, sizeof(error)) == 0 && tiny_norm_values[0] == 0x1p-119f && tiny_norm_values[1] == 0x1p-65f);
     norm_values[0] = 1;
     assert(wxdouble_kmeans_squared_norms(context, norm_values, 2, 2, norm_values, &metrics, error, sizeof(error)) == 0 && norm_values[0] == 5 && norm_values[1] == 25);
     float tolerance_values[] = {1, 2, 3, 4}, tolerance_output = 91;
