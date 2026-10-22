@@ -17,7 +17,7 @@ THREADPOOL_DECORATOR_SHA256 = "ec72498b68ea605724643838a8bc4c343ef6d150f8d09fd8b
 ARRAY_EQUAL_SHA256 = "be4f8df0142c72cbd63a30ed74a48129155a6aa845e5e6d2f2898a2a59d35be6"
 
 
-def compile_native_lloyd(original, shift_total=None, labels_equal=None):
+def compile_native_lloyd(original, shift_total=None, labels_equal=None, dense_iteration=None):
     from sklearn.cluster import _kmeans
     from sklearn.utils.parallel import _threadpool_controller_decorator
     inner = inspect.unwrap(original)
@@ -46,6 +46,11 @@ def compile_native_lloyd(original, shift_total=None, labels_equal=None):
         found[0].func = ast.Name(id="__wx_lloyd_labels_equal", ctx=ast.Load())
     namespace = dict(inner.__globals__); namespace["__wx_lloyd_shift_total"] = shift_total
     namespace["__wx_lloyd_labels_equal"] = labels_equal
+    if dense_iteration is not None:
+        from sklearn.cluster._k_means_lloyd import lloyd_iter_chunked_dense
+        if namespace.get("lloyd_iter_chunked_dense") is not lloyd_iter_chunked_dense:
+            raise ValueError("kmeans_lloyd_norm_iteration_binding_changed")
+        namespace["lloyd_iter_chunked_dense"] = dense_iteration
     ast.fix_missing_locations(tree)
     exec(compile(tree, "<WhisperX scoped native Lloyd shift reduction>", "exec"), namespace)
     candidate = namespace[inner.__name__]

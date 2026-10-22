@@ -97,7 +97,7 @@ def shift_inplace(context, records, values, mean, add, role):
 
 
 @contextlib.contextmanager
-def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None, product_records=None, chunk_records=None, lloyd_shift_records=None, lloyd_label_records=None, equivalence_records=None):
+def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None, product_records=None, chunk_records=None, lloyd_shift_records=None, lloyd_label_records=None, equivalence_records=None, lloyd_norm_records=None):
     global _ACTIVE
     from sklearn.base import _fit_context
     from sklearn.cluster import KMeans
@@ -165,12 +165,16 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
             from scipy import sparse
             original_equivalence = inspect.unwrap(KMeans.fit).__globals__.get("_is_same_clustering")
             validate_equivalence(original_equivalence)
+        lloyd_norm_scope = None
+        if lloyd_norm_records is not None:
+            from tools.baseline.native_kmeans_lloyd_norms import LloydNormScope
+            lloyd_norm_scope = LloydNormScope(context, lloyd_norm_records)
         original_lloyd = candidate_lloyd = None
-        if lloyd_shift_records is not None or lloyd_label_records is not None:
+        if lloyd_shift_records is not None or lloyd_label_records is not None or lloyd_norm_scope is not None:
             import sklearn.cluster._kmeans as kmeans_module
             from tools.baseline.native_kmeans_lloyd import compile_native_lloyd, shift_total, labels_equal
             from tools.baseline.native_kmeans_norms import validate_reference
-            if potential_context is None or (lloyd_shift_records is not None and not isinstance(lloyd_shift_records, list)) or (lloyd_label_records is not None and not isinstance(lloyd_label_records, list)):
+            if ((lloyd_shift_records is not None or lloyd_label_records is not None) and potential_context is None) or (lloyd_shift_records is not None and not isinstance(lloyd_shift_records, list)) or (lloyd_label_records is not None and not isinstance(lloyd_label_records, list)):
                 raise ValueError("kmeans_lloyd_shift_configuration_invalid")
             if lloyd_shift_records is not None and getattr(potential_context.library, "wxkmeans_lloyd_shift_total", None) is None:
                 raise ValueError("kmeans_lloyd_shift_abi_unavailable")
@@ -178,7 +182,7 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
                 raise ValueError("kmeans_lloyd_labels_abi_unavailable")
             validate_reference(kmeans_module._kmeans_plusplus.__globals__["row_norms"])
             original_lloyd = kmeans_module._kmeans_single_lloyd
-            candidate_lloyd = compile_native_lloyd(original_lloyd, (lambda values: shift_total(potential_context, lloyd_shift_records, values)) if lloyd_shift_records is not None else None, labels_equal=(lambda values, previous: labels_equal(potential_context, lloyd_label_records, values, previous)) if lloyd_label_records is not None else None)
+            candidate_lloyd = compile_native_lloyd(original_lloyd, (lambda values: shift_total(potential_context, lloyd_shift_records, values)) if lloyd_shift_records is not None else None, labels_equal=(lambda values, previous: labels_equal(potential_context, lloyd_label_records, values, previous)) if lloyd_label_records is not None else None, dense_iteration=lloyd_norm_scope.iteration if lloyd_norm_scope is not None else None)
         resident_pipeline = None
         original_tolerance = None
         original_plusplus = None
@@ -333,6 +337,8 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
                 from scipy import sparse
                 return candidate_plusplus(X, *args, **kwargs) if threading.get_ident() == owner and not sparse.issparse(X) else original_plusplus(X, *args, **kwargs)
 
+        if lloyd_norm_scope is not None:
+            lloyd_norm_scope.__enter__()
         _ACTIVE = True
         KMeans.fit = wrapped
         if original_tolerance is not None:
@@ -342,6 +348,8 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
         try:
             yield
         finally:
+            if lloyd_norm_scope is not None:
+                lloyd_norm_scope.__exit__()
             KMeans.fit = original
             if original_tolerance is not None:
                 kmeans_module._tolerance = original_tolerance
