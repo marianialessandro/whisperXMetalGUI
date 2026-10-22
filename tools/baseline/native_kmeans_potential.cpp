@@ -177,3 +177,26 @@ extern "C" int wxkmeans_lloyd_labels_equal(const int32_t* labels, const int32_t*
         if (error != nullptr && capacity > 0) { std::strncpy(error, "kmeans_lloyd_labels_failed", capacity - 1); error[capacity - 1] = 0; } return 1;
     }
 }
+
+// The directed mapping preserves scikit-learn semantics under native_sklearn_notice.txt.
+extern "C" int wxkmeans_same_clustering(const int32_t* labels, const int32_t* previous, uint32_t count, uint32_t clusters, uint32_t* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity) {
+    try {
+        require(labels != nullptr && previous != nullptr && output != nullptr && metrics != nullptr, "kmeans_same_clustering_pointer_missing");
+        require(count > 0 && count <= 4096 && clusters > 0 && clusters <= 4096, "kmeans_same_clustering_shape_invalid");
+        auto started = std::chrono::steady_clock::now();
+        std::vector<int32_t> a(count), b(count), mapping(clusters, -1);
+        std::memcpy(a.data(), reinterpret_cast<const unsigned char*>(labels), count * sizeof(int32_t)); std::memcpy(b.data(), reinterpret_cast<const unsigned char*>(previous), count * sizeof(int32_t));
+        for (uint32_t index = 0; index < count; ++index) require(a[index] >= 0 && uint32_t(a[index]) < clusters && b[index] >= 0 && uint32_t(b[index]) < clusters, "kmeans_same_clustering_label_domain_invalid");
+        uint32_t result = 1;
+        for (uint32_t index = 0; index < count; ++index) {
+            if (mapping[a[index]] == -1) mapping[a[index]] = b[index];
+            else if (mapping[a[index]] != b[index]) { result = 0; break; }
+        }
+        std::memcpy(reinterpret_cast<unsigned char*>(output), &result, sizeof(result));
+        *metrics = {1, 0, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count())}; return 0;
+    } catch (const std::exception& failure) {
+        if (error != nullptr && capacity > 0) { std::strncpy(error, failure.what(), capacity - 1); error[capacity - 1] = 0; } return 1;
+    } catch (...) {
+        if (error != nullptr && capacity > 0) { std::strncpy(error, "kmeans_same_clustering_failed", capacity - 1); error[capacity - 1] = 0; } return 1;
+    }
+}

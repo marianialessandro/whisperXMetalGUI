@@ -55,6 +55,27 @@ class NativeKMeansPotentials:
         with self.lock:
             self.closed = True
 
+    def same_clustering(self, labels, previous, clusters):
+        if any(type(value) is not np.ndarray or value.dtype != np.int32 or value.ndim != 1 or not value.flags.c_contiguous for value in (labels, previous)):
+            raise ValueError("kmeans_same_clustering_operand_format_invalid")
+        if type(clusters) is not int or not 0 < clusters <= 4096 or not 0 < labels.size <= 4096 or previous.shape != labels.shape:
+            raise ValueError("kmeans_same_clustering_shape_invalid")
+        output, metrics, error = np.empty(1, dtype=np.uint32), PotentialMetrics(), ct.create_string_buffer(128)
+        started = time.perf_counter_ns()
+        with self.lock:
+            if self.closed:
+                raise ValueError("kmeans_potential_context_closed")
+            try:
+                native = self.library.wxkmeans_same_clustering
+            except AttributeError as failure:
+                raise ValueError("kmeans_same_clustering_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(PotentialMetrics), ct.c_char_p, ct.c_uint32]; native.restype = ct.c_int
+            if native(labels.ctypes.data, previous.ctypes.data, labels.size, clusters, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.blas_calls != 0 or output[0] > 1:
+            raise ValueError("kmeans_same_clustering_native_result_invalid")
+        return bool(output[0]), {"scope": "experimental_native_cpu_kmeans_same_clustering", "execution_device": "cpu", "backend": "cpp_directed_label_mapping", "samples": labels.size, "clusters": clusters, "native_blas_calls": 0, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": labels.nbytes + previous.nbytes, "host_result_bytes": 4, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_clustering_equivalence": False, "lloyd_iteration_replaced": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+
     def lloyd_labels_equal(self, labels, previous):
         if any(type(value) is not np.ndarray or value.dtype != np.int32 or value.ndim != 1 or not value.flags.c_contiguous for value in (labels, previous)):
             raise ValueError("kmeans_lloyd_labels_operand_format_invalid")

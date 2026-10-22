@@ -18,7 +18,7 @@ _LOCK = threading.RLock()
 _ACTIVE = False
 
 
-def compile_native_mean(original, mean, shift=None, norms=None):
+def compile_native_mean(original, mean, shift=None, norms=None, equivalence=None):
     inner = inspect.unwrap(original)
     source = inspect.getsource(inner)
     if hashlib.sha256(source.encode()).hexdigest() != FIT_SHA256 or inner.__closure__:
@@ -49,7 +49,15 @@ def compile_native_mean(original, mean, shift=None, norms=None):
             def visit_AugAssign(self, node):
                 return replacements.get(id(node), node)
         tree = ReplaceShifts().visit(tree)
+    if equivalence is not None:
+        target = ast.parse("_is_same_clustering(labels, best_labels, self.n_clusters)", mode="eval").body
+        found = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.dump(node) == ast.dump(target)]
+        if len(found) != 1:
+            raise ValueError("kmeans_same_clustering_expression_contract_changed")
+        found[0].func = ast.Name(id="__wx_same_clustering", ctx=ast.Load())
+        found[0].args.insert(0, ast.Name(id="X", ctx=ast.Load()))
     namespace = dict(inner.__globals__)
+    namespace["__wx_same_clustering"] = equivalence
     namespace["__wx_native_kmeans_mean"] = mean
     namespace["__wx_native_kmeans_shift"] = shift
     namespace["__wx_native_kmeans_squared_norms"] = norms
@@ -89,7 +97,7 @@ def shift_inplace(context, records, values, mean, add, role):
 
 
 @contextlib.contextmanager
-def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None, product_records=None, chunk_records=None, lloyd_shift_records=None, lloyd_label_records=None):
+def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None, product_records=None, chunk_records=None, lloyd_shift_records=None, lloyd_label_records=None, equivalence_records=None):
     global _ACTIVE
     from sklearn.base import _fit_context
     from sklearn.cluster import KMeans
@@ -148,6 +156,15 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
                 raise ValueError("kmeans_upcast_chunk_configuration_invalid")
             if getattr(potential_context.library, "wxkmeans_upcast_chunk", None) is None:
                 raise ValueError("kmeans_upcast_chunk_abi_unavailable")
+        if equivalence_records is not None:
+            from tools.baseline.native_kmeans_equivalence import same_clustering, validate_reference as validate_equivalence
+            if potential_context is None or not isinstance(equivalence_records, list):
+                raise ValueError("kmeans_same_clustering_configuration_invalid")
+            if getattr(potential_context.library, "wxkmeans_same_clustering", None) is None:
+                raise ValueError("kmeans_same_clustering_abi_unavailable")
+            from scipy import sparse
+            original_equivalence = inspect.unwrap(KMeans.fit).__globals__.get("_is_same_clustering")
+            validate_equivalence(original_equivalence)
         original_lloyd = candidate_lloyd = None
         if lloyd_shift_records is not None or lloyd_label_records is not None:
             import sklearn.cluster._kmeans as kmeans_module
@@ -284,7 +301,7 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
             from scipy import sparse
             return original_norms(features, squared=True) if sparse.issparse(features) else squared_norms(context, norm_records, features)
 
-        candidate = compile_native_mean(original, mean, shift=shift if shift_records is not None else None, norms=norms if norm_records is not None else None)
+        candidate = compile_native_mean(original, mean, shift=shift if shift_records is not None else None, norms=norms if norm_records is not None else None, equivalence=(lambda X, labels, previous, clusters: original_equivalence(labels, previous, clusters) if sparse.issparse(X) else same_clustering(potential_context, equivalence_records, labels, previous, clusters)) if equivalence_records is not None else None)
         owner = threading.get_ident()
 
         if candidate_lloyd is not None:

@@ -16,6 +16,8 @@ extern "C" int wxkmeans_lloyd_shift_total(const float*, uint32_t, float*, Kmeans
 
 extern "C" int wxkmeans_lloyd_labels_equal(const int32_t*, const int32_t*, uint32_t, uint32_t*, KmeansPotentialMetrics*, char*, uint32_t);
 
+extern "C" int wxkmeans_same_clustering(const int32_t*, const int32_t*, uint32_t, uint32_t, uint32_t*, KmeansPotentialMetrics*, char*, uint32_t);
+
 int main() {
     float left[] = {1, 2, 3, 4}, weights[] = {2, 3}, output[] = {91, 92};
     KmeansPotentialMetrics metrics = {}; char error[128] = {};
@@ -141,5 +143,27 @@ int main() {
     std::memcpy(&equal, unaligned_equal + 1, sizeof(equal)); assert(equal == 1);
     assert(wxkmeans_lloyd_labels_equal(labels, labels, 3, reinterpret_cast<uint32_t*>(labels), &metrics, error, sizeof(error)) == 0 && labels[0] == 1);
     assert(wxkmeans_lloyd_labels_equal(nullptr, nullptr, 0, nullptr, nullptr, nullptr, 0) != 0);
+
+    int32_t map_a[] = {0, 1, 0}, map_b[] = {1, 0, 1}; uint32_t equivalent = 91;
+    assert(wxkmeans_same_clustering(map_a, map_b, 3, 2, &equivalent, &metrics, error, sizeof(error)) == 0 && equivalent == 1);
+    map_b[2] = 0;
+    assert(wxkmeans_same_clustering(map_a, map_b, 3, 2, &equivalent, &metrics, error, sizeof(error)) == 0 && equivalent == 0);
+    equivalent = 91;
+    assert(wxkmeans_same_clustering(nullptr, map_b, 3, 2, &equivalent, &metrics, error, sizeof(error)) != 0 && equivalent == 91);
+    assert(wxkmeans_same_clustering(map_a, nullptr, 3, 2, &equivalent, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_same_clustering(map_a, map_b, 3, 2, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_same_clustering(map_a, map_b, 3, 2, &equivalent, nullptr, error, sizeof(error)) != 0);
+    for (uint32_t count : {0u, 4097u}) assert(wxkmeans_same_clustering(map_a, map_b, count, 2, &equivalent, &metrics, error, sizeof(error)) != 0 && equivalent == 91);
+    for (uint32_t clusters : {0u, 4097u}) assert(wxkmeans_same_clustering(map_a, map_b, 3, clusters, &equivalent, &metrics, error, sizeof(error)) != 0 && equivalent == 91);
+    for (int32_t value : {-1, 2, std::numeric_limits<int32_t>::max()}) {
+        map_b[2] = value;
+        assert(wxkmeans_same_clustering(map_a, map_b, 3, 2, &equivalent, &metrics, error, sizeof(error)) != 0 && equivalent == 91);
+    }
+    map_b[2] = 1;
+    unsigned char unaligned_map[sizeof(map_a) + 1], unaligned_equivalent[sizeof(equivalent) + 1]; std::memcpy(unaligned_map + 1, map_a, sizeof(map_a));
+    assert(wxkmeans_same_clustering(reinterpret_cast<int32_t*>(unaligned_map + 1), map_b, 3, 2, reinterpret_cast<uint32_t*>(unaligned_equivalent + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(&equivalent, unaligned_equivalent + 1, sizeof(equivalent)); assert(equivalent == 1);
+    assert(wxkmeans_same_clustering(map_a, map_b, 3, 2, reinterpret_cast<uint32_t*>(map_a), &metrics, error, sizeof(error)) == 0 && map_a[0] == 1);
+    assert(wxkmeans_same_clustering(nullptr, nullptr, 0, 0, nullptr, nullptr, nullptr, 0) != 0);
 
 }
