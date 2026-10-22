@@ -1,4 +1,4 @@
-"""Bounded CPU Accelerate bridge for pinned KMeans++ operations and Lloyd final assignment."""
+"""Bounded CPU Accelerate bridge for pinned KMeans++ operations and Lloyd assignment/centroid updates."""
 
 import argparse
 import ctypes as ct
@@ -54,6 +54,29 @@ class NativeKMeansPotentials:
     def close(self):
         with self.lock:
             self.closed = True
+
+    def lloyd_centroids(self, values, weights, labels, clusters):
+        if type(values) is not np.ndarray or values.dtype != np.float32 or values.ndim != 2 or not values.flags.c_contiguous or type(weights) is not np.ndarray or weights.dtype != np.float32 or weights.ndim != 1 or not weights.flags.c_contiguous or type(labels) is not np.ndarray or labels.dtype != np.int32 or labels.ndim != 1 or not labels.flags.c_contiguous:
+            raise ValueError("kmeans_lloyd_centroids_operand_format_invalid")
+        rows, features = values.shape
+        if type(clusters) is not int or not 0 < rows <= 256 or not 0 < clusters <= 256 or not 0 < features <= 1024 or weights.shape != (rows,) or labels.shape != (rows,):
+            raise ValueError("kmeans_lloyd_centroids_shape_invalid")
+        centers, totals = np.empty((clusters, features), np.float32), np.empty(clusters, np.float32)
+        metrics, error = PotentialMetrics(), ct.create_string_buffer(128)
+        started = time.perf_counter_ns()
+        with self.lock:
+            if self.closed:
+                raise ValueError("kmeans_potential_context_closed")
+            try:
+                native = self.library.wxkmeans_lloyd_centroids
+            except AttributeError as failure:
+                raise ValueError("kmeans_lloyd_centroids_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.c_void_p, ct.POINTER(PotentialMetrics), ct.c_char_p, ct.c_uint32]; native.restype = ct.c_int
+            if native(values.ctypes.data, weights.ctypes.data, labels.ctypes.data, rows, clusters, features, centers.ctypes.data, totals.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.blas_calls != 0 or not np.isfinite(centers).all() or not np.isfinite(totals).all() or (totals <= 0).any():
+            raise ValueError("kmeans_lloyd_centroids_native_result_invalid")
+        return centers, totals, {"scope": "experimental_native_cpu_lloyd_weighted_centroids", "execution_device": "cpu", "backend": "cpp_float32_fma_double_reciprocal", "samples": rows, "clusters": clusters, "features": features, "native_blas_calls": 0, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": values.nbytes + weights.nbytes + labels.nbytes, "host_result_bytes": centers.nbytes + totals.nbytes, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_numeric_centroid_update": False, "centroid_updates_replaced": True, "empty_cluster_relocation_replaced": False, "lloyd_iteration_replaced": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
 
     def lloyd_assignment(self, values, centers, norms):
         if any(type(value) is not np.ndarray or value.dtype != np.float32 or not value.flags.c_contiguous for value in (values, centers, norms)) or values.ndim != 2 or centers.ndim != 2 or norms.ndim != 1:

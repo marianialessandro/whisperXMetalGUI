@@ -20,9 +20,44 @@ extern "C" int wxkmeans_same_clustering(const int32_t*, const int32_t*, uint32_t
 
 extern "C" int wxkmeans_lloyd_assignment(const float*, const float*, const float*, uint32_t, uint32_t, uint32_t, int32_t*, float*, KmeansPotentialMetrics*, char*, uint32_t);
 
+extern "C" int wxkmeans_lloyd_centroids(const float*, const float*, const int32_t*, uint32_t, uint32_t, uint32_t, float*, float*, KmeansPotentialMetrics*, char*, uint32_t);
+
 int main() {
     float left[] = {1, 2, 3, 4}, weights[] = {2, 3}, output[] = {91, 92};
     KmeansPotentialMetrics metrics = {}; char error[128] = {};
+    float cx[] = {1, 2, 3, 4}, cw[] = {1, 3}, cc[] = {91, 92}, ct[] = {93}; int32_t cl[] = {0, 0};
+    assert(wxkmeans_lloyd_centroids(cx, cw, cl, 2, 1, 2, cc, ct, &metrics, error, sizeof(error)) == 0 && cc[0] == 2.5f && cc[1] == 3.5f && ct[0] == 4 && metrics.blas_calls == 0);
+    cc[0] = 91; ct[0] = 93;
+    assert(wxkmeans_lloyd_centroids(nullptr, cw, cl, 2, 1, 2, cc, ct, &metrics, error, sizeof(error)) != 0 && cc[0] == 91 && ct[0] == 93);
+    assert(wxkmeans_lloyd_centroids(cx, nullptr, cl, 2, 1, 2, cc, ct, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_lloyd_centroids(cx, cw, nullptr, 2, 1, 2, cc, ct, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_lloyd_centroids(cx, cw, cl, 2, 1, 2, nullptr, ct, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_lloyd_centroids(cx, cw, cl, 2, 1, 2, cc, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_lloyd_centroids(cx, cw, cl, 2, 1, 2, cc, ct, nullptr, error, sizeof(error)) != 0);
+    assert(wxkmeans_lloyd_centroids(cx, cw, cl, 2, 1, 2, cc, cc, &metrics, error, sizeof(error)) != 0 && cc[0] == 91);
+    for (uint32_t size : {0u, 257u}) {
+        assert(wxkmeans_lloyd_centroids(cx, cw, cl, size, 1, 2, cc, ct, &metrics, error, sizeof(error)) != 0);
+        assert(wxkmeans_lloyd_centroids(cx, cw, cl, 2, size, 2, cc, ct, &metrics, error, sizeof(error)) != 0);
+    }
+    for (uint32_t size : {0u, 1025u}) assert(wxkmeans_lloyd_centroids(cx, cw, cl, 2, 1, size, cc, ct, &metrics, error, sizeof(error)) != 0);
+    for (float invalid : {0x1p-61f, 0x1p33f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+        cx[3] = invalid;
+        assert(wxkmeans_lloyd_centroids(cx, cw, cl, 2, 1, 2, cc, ct, &metrics, error, sizeof(error)) != 0 && cc[0] == 91 && ct[0] == 93);
+    }
+    cx[3] = 4;
+    for (float invalid : {-1.0f, 0x1p-33f, 0x1p33f, std::numeric_limits<float>::quiet_NaN()}) {
+        cw[1] = invalid;
+        assert(wxkmeans_lloyd_centroids(cx, cw, cl, 2, 1, 2, cc, ct, &metrics, error, sizeof(error)) != 0 && cc[0] == 91 && ct[0] == 93);
+    }
+    cw[1] = 3; cl[1] = 1;
+    assert(wxkmeans_lloyd_centroids(cx, cw, cl, 2, 1, 2, cc, ct, &metrics, error, sizeof(error)) != 0 && cc[0] == 91);
+    cl[1] = 0;
+    float empty_centers[] = {91, 92, 93, 94}, empty_weights[] = {95, 96};
+    assert(wxkmeans_lloyd_centroids(cx, cw, cl, 2, 2, 2, empty_centers, empty_weights, &metrics, error, sizeof(error)) != 0 && empty_centers[0] == 91 && empty_weights[0] == 95);
+    unsigned char cu[sizeof(cx) + 1], co[sizeof(cc) + 1]; std::memcpy(cu + 1, cx, sizeof(cx));
+    assert(wxkmeans_lloyd_centroids(reinterpret_cast<float*>(cu + 1), cw, cl, 2, 1, 2, reinterpret_cast<float*>(co + 1), ct, &metrics, error, sizeof(error)) == 0);
+    std::memcpy(cc, co + 1, sizeof(cc)); assert(cc[0] == 2.5f && cc[1] == 3.5f);
+    assert(wxkmeans_lloyd_centroids(cx, cw, cl, 2, 1, 2, cx, cw, &metrics, error, sizeof(error)) == 0 && cx[0] == 2.5f && cx[1] == 3.5f && cw[0] == 4);
     float samples[] = {1, 2, 3, 4}, centers[] = {1, 2, 3, 4}, norms[] = {5, 25}, distances[] = {91, 92, 93, 94};
     int32_t assignments[] = {91, 92};
     assert(wxkmeans_lloyd_assignment(samples, centers, norms, 2, 2, 2, assignments, distances, &metrics, error, sizeof(error)) == 0 && assignments[0] == 0 && assignments[1] == 1 && distances[0] == -5 && distances[1] == 3 && distances[2] == -17 && distances[3] == -25 && metrics.blas_calls == 1);

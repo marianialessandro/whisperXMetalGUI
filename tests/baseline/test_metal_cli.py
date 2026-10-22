@@ -487,6 +487,41 @@ class MetalCLITests(unittest.TestCase):
             self.assertNotIn("private.wav", report.read_text())
             self.assertNotIn("private-secret", report.read_text())
 
+    def test_kmeans_lloyd_centroid_updates_requires_final_assignment(self):
+        for extra in ([], ["--kmeans-upcast-norms"]):
+            with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stderr(io.StringIO()):
+                report = Path(directory) / "report.json"
+                with self.assertRaises(SystemExit) as caught:
+                    main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--kmeans-lloyd-centroid-updates", *extra])
+                self.assertEqual(caught.exception.code, 2)
+                self.assertFalse(report.exists())
+
+    def test_kmeans_lloyd_centroid_updates_capability_failure_restores_privacy(self):
+        from sklearn.cluster import KMeans
+        import sklearn.cluster._kmeans as kmeans_module
+        original_fit, original_plus = KMeans.fit, kmeans_module._kmeans_plusplus
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with patch("tools.baseline.mps_storage_probe.MPSCTC") as native, patch("tools.baseline.native_double.NativeDoubleNormalization") as double, patch("tools.baseline.native_kmeans_potential.NativeKMeansPotentials") as potential:
+                native.return_value.__enter__.return_value.identity = {}
+                native.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.identity = {}
+                double.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.library = SimpleNamespace(wxdouble_vbx_kmeans_centroids=object(), wxdouble_kmeans_squared_norms=object())
+                potential.return_value.__enter__.return_value.identity = {}
+                potential.return_value.__enter__.return_value.library = SimpleNamespace(wxkmeans_weighted_potentials=object(), wxkmeans_lloyd_assignment=object())
+                with self.assertRaisesRegex(ValueError, "lloyd_centroids_abi_unavailable"):
+                    main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--plda-normalization-library", "unused.dylib", "--plda-normalization-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--kmeans-feature-mean", "--kmeans-upcast-norms", "--kmeans-lloyd-centroid-norms", "--kmeans-lloyd-final-assignment", "--kmeans-lloyd-centroid-updates", "--kmeans-potential-library", "unused.dylib", "--kmeans-potential-library-sha256", "0" * 64, "--hf_token", "private-secret"])
+            data = json.loads(report.read_text())
+            self.assertEqual(data["status"], "failed")
+            self.assertTrue(data["kmeans_lloyd_centroid_updates_requested"])
+            self.assertFalse(data["kmeans_lloyd_centroid_updates_observed"])
+            self.assertEqual(data["native_cpu_kmeans_lloyd_centroid_update_calls"], 0)
+            self.assertIs(KMeans.fit, original_fit)
+            self.assertIs(kmeans_module._kmeans_plusplus, original_plus)
+            self.assertNotIn("private.wav", report.read_text())
+            self.assertNotIn("private-secret", report.read_text())
+
     def test_kmeans_lloyd_final_assignment_requires_norms_and_cpu_library(self):
         for extra in ([], ["--kmeans-upcast-norms"]):
             with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stderr(io.StringIO()):

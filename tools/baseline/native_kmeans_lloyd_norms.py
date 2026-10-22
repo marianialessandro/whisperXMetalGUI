@@ -4,6 +4,7 @@ import hashlib
 import inspect
 from pathlib import Path
 import threading
+import time
 
 import numpy as np
 
@@ -14,7 +15,7 @@ LLOYD_BINARY_SHA256 = "865e1791855baec7f4a8233cc5792a13a04efcdb4daef57d986c10fe2
 
 
 class LloydNormScope:
-    def __init__(self, context, records, assignment_context=None, assignment_records=None):
+    def __init__(self, context, records, assignment_context=None, assignment_records=None, centroid_records=None):
         import sklearn.cluster._k_means_lloyd as module
         if not isinstance(records, list):
             raise ValueError("kmeans_lloyd_norm_records_required")
@@ -32,6 +33,16 @@ class LloydNormScope:
                 raise ValueError("kmeans_lloyd_assignment_abi_unavailable")
             if hashlib.sha256(Path(sklearn_blas.__file__).read_bytes()).hexdigest() != "3c553a603c9249bfc27ce0c56cd0898609430f46284ea97d605c745e451c902d" or hashlib.sha256(Path(scipy_blas.__file__).read_bytes()).hexdigest() != "e4b6dbd1ae7cdf31b01aecc6320cfa7a6f788ade4f2ec1b4e465adcfe62ab809":
                 raise ValueError("kmeans_lloyd_assignment_blas_reference_not_supported")
+        if centroid_records is not None:
+            import sklearn.cluster._k_means_common as common
+            if assignment_context is None or not isinstance(centroid_records, list):
+                raise ValueError("kmeans_lloyd_centroids_configuration_invalid")
+            if getattr(assignment_context.library, "wxkmeans_lloyd_centroids", None) is None:
+                raise ValueError("kmeans_lloyd_centroids_abi_unavailable")
+            if hashlib.sha256(Path(common.__file__).read_bytes()).hexdigest() != "793cb26715cc85762eb460e29cce45a4a40584ddcaba761bfd69adafd080f3cf" or "float" not in getattr(common._euclidean_dense_dense_wrapper, "__signatures__", {}):
+                raise ValueError("kmeans_lloyd_centroids_shift_reference_not_supported")
+            self.original_shift = common._euclidean_dense_dense_wrapper["float"]
+        self.centroid_records = centroid_records
         self.assignment_context, self.assignment_records = assignment_context, assignment_records
         self.iteration_signature = inspect.signature(module.lloyd_iter_chunked_dense)
         self.context, self.records, self.module = context, records, module
@@ -66,6 +77,28 @@ class LloydNormScope:
                 raise ValueError("kmeans_lloyd_assignment_single_chunk_required")
         self.centers = np.asarray(centers_old)
         try:
+            if bound is not None and bound.arguments["update_centers"] is True and self.centroid_records is not None:
+                arguments = bound.arguments
+                clusters, features = self.centers.shape
+                outputs = [(np.asarray(arguments[name]), shape, dtype) for name, shape, dtype in (("labels", (X.shape[0],), np.int32), ("centers_new", (clusters, features), np.float32), ("weight_in_clusters", (clusters,), np.float32), ("center_shift", (clusters,), np.float32))]
+                if any(array.dtype != dtype or array.shape != shape or not array.flags.c_contiguous or not array.flags.writeable for array, shape, dtype in outputs):
+                    raise ValueError("kmeans_lloyd_centroids_output_invalid")
+                if any(np.shares_memory(left[0], right[0]) for index, left in enumerate(outputs) for right in outputs[index + 1:]):
+                    raise ValueError("kmeans_lloyd_centroids_outputs_overlap")
+                norms = self.row_norms(centers_old, squared=True)
+                started = time.perf_counter_ns()
+                assigned, distances, assignment_record = self.assignment_context.lloyd_assignment(np.asarray(X), self.centers, norms)
+                updated, totals, record = self.assignment_context.lloyd_centroids(np.asarray(X), np.asarray(sample_weight), assigned, clusters)
+                shifts = np.empty(clusters, np.float32)
+                for cluster in range(clusters):
+                    shifts[cluster] = self.original_shift(updated[cluster], self.centers[cluster], False)
+                if not np.isfinite(shifts).all():
+                    raise ValueError("kmeans_lloyd_centroids_shift_result_invalid")
+                for (output, shape, dtype), result in zip(outputs, (assigned, updated, totals, shifts)):
+                    np.copyto(output, result, casting="no")
+                record.update({"adapter_scope": "sklearn_dense_float32_lloyd_regular_assignment_and_centroids", "original_lloyd_binary_sha256": LLOYD_BINARY_SHA256, "assignment_backend": assignment_record["backend"], "assignment_native_wall_ns": assignment_record["native_wall_ns"], "centroid_completion_and_bridge_wall_ns": record["completion_and_bridge_wall_ns"], "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "centroid_host_input_snapshot_bytes": record["host_input_snapshot_bytes"], "host_input_snapshot_bytes": assignment_record["host_input_snapshot_bytes"] + record["host_input_snapshot_bytes"], "centroid_host_result_bytes": record["host_result_bytes"], "host_result_bytes": assignment_record["host_result_bytes"] + record["host_result_bytes"], "centroid_native_wall_ns": record["native_wall_ns"], "native_wall_ns": assignment_record["native_wall_ns"] + record["native_wall_ns"], "native_blas_calls": 1, "assignment_host_input_snapshot_bytes": assignment_record["host_input_snapshot_bytes"], "assignment_host_result_bytes": assignment_record["host_result_bytes"], "center_shift_backend": "original_cython_euclidean_dense_dense_float", "center_shift_calls": clusters, "host_output_copy_bytes": sum(output.nbytes for output, shape, dtype in outputs), "centroid_norms_device": "gpu", "cpu_residuals": ["cython_center_shift", "inertia", "convergence_control", "host_staging_and_control"], "unsupported_operations": ["empty_cluster_relocation", "multiple_chunk_merge"]})
+                self.centroid_records.append(record)
+                return None
             if bound is not None and bound.arguments["update_centers"] is False:
                 labels = np.asarray(bound.arguments["labels"])
                 if labels.dtype != np.int32 or labels.shape != (X.shape[0],) or not labels.flags.c_contiguous or not labels.flags.writeable:

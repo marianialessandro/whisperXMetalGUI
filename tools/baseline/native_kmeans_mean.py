@@ -97,7 +97,7 @@ def shift_inplace(context, records, values, mean, add, role):
 
 
 @contextlib.contextmanager
-def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None, product_records=None, chunk_records=None, lloyd_shift_records=None, lloyd_label_records=None, equivalence_records=None, lloyd_norm_records=None, assignment_records=None):
+def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None, product_records=None, chunk_records=None, lloyd_shift_records=None, lloyd_label_records=None, equivalence_records=None, lloyd_norm_records=None, assignment_records=None, centroid_records=None):
     global _ACTIVE
     from sklearn.base import _fit_context
     from sklearn.cluster import KMeans
@@ -165,12 +165,14 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
             from scipy import sparse
             original_equivalence = inspect.unwrap(KMeans.fit).__globals__.get("_is_same_clustering")
             validate_equivalence(original_equivalence)
+        if centroid_records is not None and (assignment_records is None or not isinstance(centroid_records, list)):
+            raise ValueError("kmeans_lloyd_centroids_configuration_invalid")
         if assignment_records is not None and (potential_context is None or lloyd_norm_records is None or not isinstance(assignment_records, list)):
             raise ValueError("kmeans_lloyd_assignment_configuration_invalid")
         lloyd_norm_scope = None
         if lloyd_norm_records is not None:
             from tools.baseline.native_kmeans_lloyd_norms import LloydNormScope
-            lloyd_norm_scope = LloydNormScope(context, lloyd_norm_records, assignment_context=potential_context if assignment_records is not None else None, assignment_records=assignment_records)
+            lloyd_norm_scope = LloydNormScope(context, lloyd_norm_records, assignment_context=potential_context if assignment_records is not None else None, assignment_records=assignment_records, centroid_records=centroid_records)
         original_lloyd = candidate_lloyd = None
         if lloyd_shift_records is not None or lloyd_label_records is not None or lloyd_norm_scope is not None:
             import sklearn.cluster._kmeans as kmeans_module

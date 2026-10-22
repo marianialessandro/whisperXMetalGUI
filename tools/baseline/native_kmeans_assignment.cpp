@@ -51,3 +51,49 @@ extern "C" int wxkmeans_lloyd_assignment(const float* values, const float* cente
         return 1;
     }
 }
+
+// Match the single-chunk float32 FMA accumulation and double-literal reciprocal in sklearn's dense centroid update.
+extern "C" int wxkmeans_lloyd_centroids(const float* values, const float* weights, const int32_t* labels, uint32_t rows, uint32_t clusters, uint32_t features, float* centers, float* cluster_weights, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity) {
+    try {
+        require(values != nullptr && weights != nullptr && labels != nullptr && centers != nullptr && cluster_weights != nullptr && metrics != nullptr, "kmeans_lloyd_centroids_pointer_missing");
+        require(rows > 0 && rows <= 256 && clusters > 0 && clusters <= 256 && features > 0 && features <= 1024, "kmeans_lloyd_centroids_shape_invalid");
+        uintptr_t a = reinterpret_cast<uintptr_t>(centers), b = reinterpret_cast<uintptr_t>(cluster_weights);
+        require(a <= b ? b - a >= uint64_t(clusters) * features * sizeof(float) : a - b >= uint64_t(clusters) * sizeof(float), "kmeans_lloyd_centroids_outputs_overlap");
+        auto started = std::chrono::steady_clock::now();
+        std::vector<float> x(uint64_t(rows) * features), w(rows), result(uint64_t(clusters) * features, 0.0f), totals(clusters, 0.0f);
+        std::vector<int32_t> assigned(rows);
+        std::memcpy(x.data(), values, x.size() * sizeof(float));
+        std::memcpy(w.data(), weights, w.size() * sizeof(float));
+        std::memcpy(assigned.data(), labels, assigned.size() * sizeof(int32_t));
+        for (float value : x) require(std::isfinite(value) && std::abs(value) <= 0x1p32f && (value == 0 || std::abs(value) >= 0x1p-60f), "kmeans_lloyd_centroids_value_domain_invalid");
+        for (float value : w) require(std::isfinite(value) && value >= 0 && value <= 0x1p32f && (value == 0 || value >= 0x1p-32f), "kmeans_lloyd_centroids_weight_domain_invalid");
+        for (int32_t label : assigned) require(label >= 0 && uint32_t(label) < clusters, "kmeans_lloyd_centroids_label_domain_invalid");
+        for (uint32_t row = 0; row < rows; ++row) {
+            uint32_t label = uint32_t(assigned[row]); totals[label] += w[row];
+            for (uint32_t feature = 0; feature < features; ++feature) {
+                uint64_t index = uint64_t(label) * features + feature;
+                result[index] = std::fma(x[uint64_t(row) * features + feature], w[row], result[index]);
+            }
+        }
+        for (uint32_t cluster = 0; cluster < clusters; ++cluster) {
+            require(totals[cluster] > 0 && std::isfinite(totals[cluster]), "kmeans_lloyd_centroids_empty_cluster_not_supported");
+            totals[cluster] = 0.0f + totals[cluster];
+            float alpha = static_cast<float>(1.0 / static_cast<double>(totals[cluster]));
+            for (uint32_t feature = 0; feature < features; ++feature) {
+                uint64_t index = uint64_t(cluster) * features + feature;
+                result[index] = (0.0f + result[index]) * alpha;
+                require(std::isfinite(result[index]), "kmeans_lloyd_centroids_result_invalid");
+            }
+        }
+        std::memcpy(centers, result.data(), result.size() * sizeof(float));
+        std::memcpy(cluster_weights, totals.data(), totals.size() * sizeof(float));
+        *metrics = {1, 0, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count())};
+        return 0;
+    } catch (const std::exception& failure) {
+        if (error != nullptr && capacity > 0) { std::strncpy(error, failure.what(), capacity - 1); error[capacity - 1] = 0; }
+        return 1;
+    } catch (...) {
+        if (error != nullptr && capacity > 0) { std::strncpy(error, "kmeans_lloyd_centroids_failed", capacity - 1); error[capacity - 1] = 0; }
+        return 1;
+    }
+}
