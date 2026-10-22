@@ -947,8 +947,7 @@ uint fcluster_child(ulong bits) {
 }
 
 // Adapted from SciPy cluster_monocrit; copyright and BSD terms are retained in native_fcluster_notice.txt.
-kernel void double_fcluster_distance(device const ulong* tree [[buffer(0)]], constant FclusterDimensions& d [[buffer(1)]], device int* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
-    if (index != 0) return;
+void fcluster_distance_body(device const ulong* tree, constant FclusterDimensions& d, device int* output) {
     ulong maxima[256];
     uint stack[256];
     uchar visited[512];
@@ -975,6 +974,11 @@ kernel void double_fcluster_distance(device const ulong* tree [[buffer(0)]], con
         if (leader == int(root)) leader = -1;
         --depth;
     }
+}
+
+
+kernel void double_fcluster_distance(device const ulong* tree [[buffer(0)]], constant FclusterDimensions& d [[buffer(1)]], device int* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    if (index == 0) fcluster_distance_body(tree, d, output);
 }
 
 
@@ -1068,8 +1072,7 @@ CentroidPair centroid_find(uint n, device const ulong* distances, thread const u
 }
 
 // Adapted from SciPy fast_linkage and Heap; BSD attribution is retained in native_linkage_notice.txt.
-kernel void double_centroid_linkage(device ulong* distances [[buffer(0)]], constant CentroidLinkageDimensions& d [[buffer(1)]], device ulong* tree [[buffer(2)]], device uint* status [[buffer(3)]], uint index [[thread_position_in_grid]]) {
-    if (index != 0) return;
+void centroid_linkage_body(device ulong* distances, constant CentroidLinkageDimensions& d, device ulong* tree, device uint* status) {
     status[0] = 0;
     uint sizes[256], ids[256]; int neighbors[256]; ulong minimum[256]; CentroidHeap heap;
     heap.count = d.leaves - 1;
@@ -1122,4 +1125,48 @@ kernel void double_centroid_linkage(device ulong* distances [[buffer(0)]], const
             if (pair.key >= 0) { neighbors[y] = pair.key; minimum[y] = pair.value; centroid_heap_change(heap, y, pair.value); }
         }
     }
+}
+
+
+kernel void double_centroid_linkage(device ulong* distances [[buffer(0)]], constant CentroidLinkageDimensions& d [[buffer(1)]], device ulong* tree [[buffer(2)]], device uint* status [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index == 0) centroid_linkage_body(distances, d, tree, status);
+}
+
+// Check GPU-produced distances before the bounded centroid algorithm consumes them.
+kernel void double_resident_centroid_linkage(device ulong* distances [[buffer(0)]], constant CentroidLinkageDimensions& d [[buffer(1)]], device ulong* tree [[buffer(2)]], device uint* status [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index != 0) return;
+    status[0] = 0;
+    for (uint pair = 0; pair < d.leaves * (d.leaves - 1) / 2; ++pair) {
+        ulong value = distances[pair], magnitude = value & 0x7ffffffffffffffful;
+        if (magnitude != 0 && ((value >> 63) || magnitude < 0x3df0000000000000ul || magnitude > 0x41f0000000000000ul)) { status[0] = 4; return; }
+    }
+    centroid_linkage_body(distances, d, tree, status);
+}
+
+// Validate the resident tree before traversal and propagate failures without reading intermediate arrays on the host.
+kernel void double_resident_fcluster(device const ulong* tree [[buffer(0)]], constant FclusterDimensions& d [[buffer(1)]], device int* output [[buffer(2)]], device uint* status [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index != 0 || status[0] != 0) return;
+    bool used[512]; uint sizes[512];
+    for (uint i = 0; i < 512; ++i) { used[i] = false; sizes[i] = uint(i < d.leaves); }
+    for (uint row = 0; row < d.leaves - 1; ++row) {
+        uint children[2];
+        for (uint side = 0; side < 2; ++side) {
+            ulong value = tree[row * 4 + side], magnitude = value & 0x7ffffffffffffffful;
+            if (magnitude != 0 && ((value >> 63) || magnitude < 0x3ff0000000000000ul || magnitude > df_integer(int(d.leaves + row - 1)))) { status[0] = 5; return; }
+            uint child = fcluster_child(value);
+            if (df_integer(int(child)) != magnitude || used[child]) { status[0] = 5; return; }
+            used[child] = true; children[side] = child;
+        }
+        uint size = sizes[children[0]] + sizes[children[1]];
+        ulong height = tree[row * 4 + 2], magnitude = height & 0x7ffffffffffffffful;
+        if ((magnitude != 0 && ((height >> 63) || magnitude < 0x39b0000000000000ul)) || magnitude > 0x4270000000000000ul || tree[row * 4 + 3] != df_integer(int(size))) { status[0] = 5; return; }
+        sizes[d.leaves + row] = size;
+    }
+    if (sizes[2 * d.leaves - 2] != d.leaves) { status[0] = 5; return; }
+    fcluster_distance_body(tree, d, output);
+    for (uint leaf = 0; leaf < d.leaves; ++leaf) if (output[leaf] < 0 || output[leaf] >= int(d.leaves)) { status[0] = 6; return; }
+}
+
+kernel void integer_resident_cut_labels_i64(device const int* labels [[buffer(0)]], constant CutLabelDimensions& d [[buffer(1)]], device long* output [[buffer(2)]], device const uint* status [[buffer(3)]], uint row [[thread_position_in_grid]]) {
+    if (row < d.count && status[0] == 0) output[row] = long(labels[row]);
 }

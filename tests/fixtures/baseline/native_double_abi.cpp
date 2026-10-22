@@ -48,6 +48,7 @@ extern "C" int wxdouble_ahc_reindex(void*, const int64_t*, uint32_t, int64_t*, D
 extern "C" int wxdouble_fcluster_distance(void*, const double*, uint32_t, double, uint32_t, int32_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_fcluster_reindex(void*, const double*, uint32_t, double, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_positive_fma(void*, const double*, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_ahc_resident(void*, const double*, uint32_t, uint32_t, double, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_centroid_linkage(void*, const double*, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
@@ -64,6 +65,30 @@ int main(int argc, char** argv) {
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    double ahc_values[] = {0, 0, 3, 4}; int64_t ahc_output[] = {91, 92};
+    assert(wxdouble_ahc_resident(context, ahc_values, 2, 2, 5., ahc_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 4 && ahc_output[0] == 0 && ahc_output[1] == 0);
+    ahc_output[0] = 91;
+    assert(wxdouble_ahc_resident(nullptr, ahc_values, 2, 2, 5., ahc_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_ahc_resident(context, nullptr, 2, 2, 5., ahc_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_ahc_resident(context, ahc_values, 2, 2, 5., nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_ahc_resident(context, ahc_values, 2, 2, 5., ahc_output, nullptr, error, sizeof(error)) != 0);
+    for (uint32_t rows : {0u, 1u, 257u}) assert(wxdouble_ahc_resident(context, ahc_values, rows, 2, 5., ahc_output, &metrics, error, sizeof(error)) != 0 && ahc_output[0] == 91);
+    for (uint32_t columns : {0u, 1025u}) assert(wxdouble_ahc_resident(context, ahc_values, 2, columns, 5., ahc_output, &metrics, error, sizeof(error)) != 0 && ahc_output[0] == 91);
+    for (double value : {double(INFINITY), double(NAN), 0x1p-65, 0x1p33}) {
+        ahc_values[0] = value;
+        assert(wxdouble_ahc_resident(context, ahc_values, 2, 2, 5., ahc_output, &metrics, error, sizeof(error)) != 0 && ahc_output[0] == 91);
+    }
+    ahc_values[0] = 0;
+    for (double cutoff : {double(INFINITY), double(NAN), 0x1p-101, 0x1p65}) assert(wxdouble_ahc_resident(context, ahc_values, 2, 2, cutoff, ahc_output, &metrics, error, sizeof(error)) != 0 && ahc_output[0] == 91);
+    double ahc_tiny[] = {0, 0x1p-33};
+    assert(wxdouble_ahc_resident(context, ahc_tiny, 2, 1, 1., ahc_output, &metrics, error, sizeof(error)) != 0 && ahc_output[0] == 91 && std::string(error) == "double_ahc_resident_distance_domain_invalid");
+    unsigned char ahc_unaligned_input[sizeof(ahc_values) + 1], ahc_unaligned_output[sizeof(ahc_output) + 1];
+    std::memcpy(ahc_unaligned_input + 1, ahc_values, sizeof(ahc_values));
+    assert(wxdouble_ahc_resident(context, reinterpret_cast<double*>(ahc_unaligned_input + 1), 2, 2, 4., reinterpret_cast<int64_t*>(ahc_unaligned_output + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(ahc_output, ahc_unaligned_output + 1, sizeof(ahc_output));
+    assert(ahc_output[0] == 0 && ahc_output[1] == 1);
+    assert(wxdouble_ahc_resident(context, ahc_values, 2, 2, 5., reinterpret_cast<int64_t*>(ahc_values), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(ahc_output, ahc_values, sizeof(ahc_output)); assert(ahc_output[0] == 0 && ahc_output[1] == 0);
     double fma_values[] = {1. + 0x1p-52, 1. + 0x1p-52, 0x1p-53}, fma_output[] = {91};
     assert(wxdouble_positive_fma(context, fma_values, 1, fma_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 1 && fma_output[0] == std::fma(fma_values[0], fma_values[1], fma_values[2]));
     fma_output[0] = 91;
@@ -1001,6 +1026,14 @@ int main(int argc, char** argv) {
     fma_values[0] = 1; fma_values[1] = 2; fma_values[2] = 3;
     assert(wxdouble_positive_fma(context, fma_values, 1, fma_output, &metrics, error, sizeof(error)) == 0 && fma_output[0] == 5);
     assert(wxdouble_centroid_linkage(context, linkage_values, 3, linkage_output, &metrics, error, sizeof(error)) != 0 && linkage_output[0] == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_resident_pipeline_shader = shader.substr(0, shader.find("\n// Check GPU-produced distances"));
+    assert(wxdouble_create(pre_resident_pipeline_shader.data(), pre_resident_pipeline_shader.size(), &context, error, sizeof(error)) == 0);
+    double ahc_legacy_distances[] = {1};
+    assert(wxdouble_centroid_linkage(context, ahc_legacy_distances, 2, linkage_output, &metrics, error, sizeof(error)) == 0 && linkage_output[2] == 1);
+    ahc_output[0] = 91;
+    assert(wxdouble_ahc_resident(context, input, 2, 1, 1., ahc_output, &metrics, error, sizeof(error)) != 0 && ahc_output[0] == 91);
     wxdouble_destroy(context);
 
 }

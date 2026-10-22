@@ -19,7 +19,7 @@ _HOOK_LOCK = threading.RLock()
 _ACTIVE = False
 
 
-def compile_native_normalization(original, normalize, centroid=None, distance=None, soft_scores=False, argmax=None, resident_argmax=False, inactive=None, kmeans_centroid=None, resident_assignment=None, ahc_distance=None, ahc_reindex=None, ahc_cut=None, resident_cut=False, ahc_linkage=None):
+def compile_native_normalization(original, normalize, centroid=None, distance=None, soft_scores=False, argmax=None, resident_argmax=False, inactive=None, kmeans_centroid=None, resident_assignment=None, ahc_distance=None, ahc_reindex=None, ahc_cut=None, resident_cut=False, ahc_linkage=None, ahc_resident=None):
     source = textwrap.dedent(inspect.getsource(original))
     if hashlib.sha256(source.encode()).hexdigest() != VBX_CALL_SHA256 or original.__closure__:
         raise ValueError("embedding_vbx_source_not_supported")
@@ -29,6 +29,8 @@ def compile_native_normalization(original, normalize, centroid=None, distance=No
         raise ValueError("ahc_resident_cut_configuration_invalid")
     if ahc_linkage is not None and ahc_distance is None:
         raise ValueError("ahc_linkage_requires_native_distances")
+    if ahc_resident is not None and (not resident_cut or ahc_linkage is None or ahc_distance is None):
+        raise ValueError("ahc_resident_pipeline_configuration_invalid")
     tree = ast.parse(source)
     expected = ast.parse("train_embeddings_normed = train_embeddings / np.linalg.norm(train_embeddings, axis=1, keepdims=True)").body[0]
     matches = [node for node in ast.walk(tree) if isinstance(node, ast.Assign) and ast.dump(node) == ast.dump(expected)]
@@ -61,6 +63,16 @@ def compile_native_normalization(original, normalize, centroid=None, distance=No
         linkage_matches[0].args[0] = ast.Call(func=ast.Name(id="__wx_ahc_distances", ctx=ast.Load()), args=[linkage_matches[0].args[0]], keywords=[])
         if ahc_linkage is not None:
             linkage_matches[0].func = ast.Name(id="__wx_ahc_linkage", ctx=ast.Load())
+    if ahc_resident is not None:
+        assignments = [node for node in ast.walk(tree) if isinstance(node, ast.Assign) and node.value is linkage_matches[0]]
+        if len(assignments) != 1 or len([node for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id == "dendrogram" and isinstance(node.ctx, ast.Load)]) != 1:
+            raise ValueError("ahc_resident_pipeline_expression_contract_changed")
+        assignments[0].targets = [ast.Name(id="ahc_clusters", ctx=ast.Store())]
+        assignments[0].value = ast.parse("__wx_ahc_resident(train_embeddings_normed, self.threshold)", mode="eval").body
+        class RemoveResidentCut(ast.NodeTransformer):
+            def visit_Assign(self, node):
+                return None if node is cut_matches[0] else self.generic_visit(node)
+        tree = RemoveResidentCut().visit(tree)
     if centroid is not None:
         centroid_expected = ast.parse("centroids = W.T @ train_embeddings.reshape(-1, dimension) / W.sum(0, keepdims=True).T").body[0]
         centroid_matches = [node for node in ast.walk(tree) if isinstance(node, ast.Assign) and ast.dump(node) == ast.dump(centroid_expected)]
@@ -120,6 +132,7 @@ def compile_native_normalization(original, normalize, centroid=None, distance=No
         matches[0].value = ast.copy_location(ast.parse("__wx_native_embedding_normalize(train_embeddings)").body[0].value, matches[0].value)
     namespace = dict(original.__globals__)
     namespace["__wx_native_embedding_normalize"] = normalize
+    namespace["__wx_ahc_resident"] = ahc_resident
     namespace["__wx_ahc_linkage"] = ahc_linkage
     namespace["__wx_ahc_cut"] = ahc_cut
     namespace["__wx_ahc_reindex"] = ahc_reindex
@@ -220,7 +233,7 @@ def inactive_speaker_mask(context, records, scores, segments):
 
 
 @contextlib.contextmanager
-def native_embedding_normalization(context, records, centroid_context=None, centroid_records=None, distance_context=None, distance_records=None, soft_scores=False, argmax_context=None, argmax_records=None, resident_argmax=False, inactive_context=None, inactive_records=None, kmeans_context=None, kmeans_records=None, resident_assignment_context=None, resident_assignment_records=None, ahc_context=None, ahc_records=None, reindex_context=None, reindex_records=None, cut_context=None, cut_records=None, resident_cut=False, linkage_context=None, linkage_records=None):
+def native_embedding_normalization(context, records, centroid_context=None, centroid_records=None, distance_context=None, distance_records=None, soft_scores=False, argmax_context=None, argmax_records=None, resident_argmax=False, inactive_context=None, inactive_records=None, kmeans_context=None, kmeans_records=None, resident_assignment_context=None, resident_assignment_records=None, ahc_context=None, ahc_records=None, reindex_context=None, reindex_records=None, cut_context=None, cut_records=None, resident_cut=False, linkage_context=None, linkage_records=None, resident_pipeline=False, pipeline_records=None):
     global _ACTIVE
     from pyannote.audio.pipelines.clustering import VBxClustering
 
@@ -246,6 +259,10 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
                 raise ValueError("vbx_centroid_numpy_not_supported")
             if getattr(centroid_context.library, "wxdouble_vbx_centroids", None) is None:
                 raise ValueError("double_vbx_centroid_abi_unavailable")
+        if type(resident_pipeline) is not bool or (resident_pipeline and (not resident_cut or ahc_context is None or ahc_context is not linkage_context or ahc_context is not cut_context or ahc_context is not reindex_context or not isinstance(pipeline_records, list))):
+            raise ValueError("ahc_resident_pipeline_configuration_invalid")
+        if resident_pipeline and getattr(ahc_context.library, "wxdouble_ahc_resident", None) is None:
+            raise ValueError("double_ahc_resident_abi_unavailable")
         if linkage_context is not None:
             from tools.baseline.native_ahc_linkage import validate_linkage_reference
             if ahc_context is None or not isinstance(linkage_records, list):
@@ -422,7 +439,11 @@ def native_embedding_normalization(context, records, centroid_context=None, cent
             linkage_records[-1]["original_call_sha256"] = VBX_CALL_SHA256
             return output
 
-        candidate = compile_native_normalization(original, normalize if context is not None else None, centroids if centroid_context is not None else None, distances if distance_context is not None else None, soft_scores=soft_scores, argmax=assign if argmax_context is not None else None, resident_argmax=resident_argmax, inactive=mask_inactive if inactive_context is not None else None, kmeans_centroid=forced_centroids if kmeans_context is not None else None, resident_assignment=assign_resident if resident_assignment_context is not None else None, ahc_distance=ahc_distances if ahc_context is not None else None, ahc_reindex=ahc_reindex if reindex_context is not None else None, ahc_cut=ahc_cut if cut_context is not None else None, resident_cut=resident_cut, ahc_linkage=ahc_linkage if linkage_context is not None else None)
+        def resident_ahc(values, cutoff):
+            from tools.baseline.native_ahc_resident import resident_pipeline_labels
+            return resident_pipeline_labels(ahc_context, pipeline_records, ahc_records, linkage_records, cut_records, reindex_records, values, cutoff)
+
+        candidate = compile_native_normalization(original, normalize if context is not None else None, centroids if centroid_context is not None else None, distances if distance_context is not None else None, soft_scores=soft_scores, argmax=assign if argmax_context is not None else None, resident_argmax=resident_argmax, inactive=mask_inactive if inactive_context is not None else None, kmeans_centroid=forced_centroids if kmeans_context is not None else None, resident_assignment=assign_resident if resident_assignment_context is not None else None, ahc_distance=ahc_distances if ahc_context is not None else None, ahc_reindex=ahc_reindex if reindex_context is not None else None, ahc_cut=ahc_cut if cut_context is not None else None, resident_cut=resident_cut, ahc_linkage=ahc_linkage if linkage_context is not None else None, ahc_resident=resident_ahc if resident_pipeline else None)
 
         @functools.wraps(original)
         def wrapped(*args, **kwargs):

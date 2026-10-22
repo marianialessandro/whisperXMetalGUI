@@ -61,6 +61,7 @@ class DoubleContext {
     id<MTLComputePipelineState> kmeans_centroid_pipeline_;
     id<MTLComputePipelineState> float_shift_pipeline_;
     id<MTLComputePipelineState> tolerance_mean_pipeline_, tolerance_square_pipeline_, tolerance_final_pipeline_;
+    id<MTLComputePipelineState> resident_linkage_pipeline_, resident_cut_pipeline_, resident_labels_pipeline_;
     id<MTLComputePipelineState> centroid_linkage_pipeline_, positive_fma_pipeline_, cut_labels_pipeline_, fcluster_pipeline_, reindex_pipeline_, pdist_pipeline_, inactive_assignment_pipeline_, assignment_batch_pipeline_, assignment_pipeline_, kmeans_best_pipeline_, kmeans_search_pipeline_, kmeans_probability_sum_pipeline_, kmeans_probability_pipeline_, kmeans_minimum_pipeline_, kmeans_norm_pipeline_, kmeans_weighted_products_pipeline_, kmeans_weighted_prefix_pipeline_;
     id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_, cosine_norm_pipeline_, cosine_distance_pipeline_, cosine_score_pipeline_, argmax_pipeline_, minimum_pipeline_, inactive_pipeline_, nan_minimum_pipeline_, nan_cleanup_pipeline_;
     id<MTLBuffer> input_, output_, right_, terms_;
@@ -144,6 +145,10 @@ public:
         if (best_candidate_function != nil) kmeans_best_pipeline_ = [device_ newComputePipelineStateWithFunction:best_candidate_function error:&error];
         id<MTLFunction> assignment_function = [library newFunctionWithName:@"double_linear_assignment_max"];
         if (assignment_function != nil) assignment_pipeline_ = [device_ newComputePipelineStateWithFunction:assignment_function error:&error];
+        id<MTLFunction> resident_linkage_function = [library newFunctionWithName:@"double_resident_centroid_linkage"], resident_cut_function = [library newFunctionWithName:@"double_resident_fcluster"], resident_labels_function = [library newFunctionWithName:@"integer_resident_cut_labels_i64"];
+        if (resident_linkage_function != nil) resident_linkage_pipeline_ = [device_ newComputePipelineStateWithFunction:resident_linkage_function error:&error];
+        if (resident_cut_function != nil) resident_cut_pipeline_ = [device_ newComputePipelineStateWithFunction:resident_cut_function error:&error];
+        if (resident_labels_function != nil) resident_labels_pipeline_ = [device_ newComputePipelineStateWithFunction:resident_labels_function error:&error];
         id<MTLFunction> centroid_linkage_function = [library newFunctionWithName:@"double_centroid_linkage"];
         if (centroid_linkage_function != nil) centroid_linkage_pipeline_ = [device_ newComputePipelineStateWithFunction:centroid_linkage_function error:&error];
         id<MTLFunction> positive_fma_function = [library newFunctionWithName:@"double_positive_fma"];
@@ -424,6 +429,46 @@ public:
         for (uint32_t row = 0; row < d.rows; ++row) require(std::isfinite(static_cast<const double*>(terms_.contents)[row]), "double_vbx_logsumexp_shift_domain_invalid");
         std::memcpy(output, terms_.contents, uint64_t(d.rows) * sizeof(double));
         return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
+    DoubleMetrics ahc_resident(const double* values, PdistDimensions d, double cutoff, int64_t* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(pdist_pipeline_ != nil && resident_linkage_pipeline_ != nil && resident_cut_pipeline_ != nil && resident_labels_pipeline_ != nil, "double_ahc_resident_kernel_unavailable");
+        require(values != nullptr && output != nullptr && d.rows >= 2 && d.rows <= 256 && d.features > 0 && d.features <= 1024, "double_ahc_resident_shape_or_pointer_invalid");
+        uint64_t pairs = uint64_t(d.rows) * (d.rows - 1) / 2;
+        require(pairs * d.features <= 32 * 1024 * 1024, "double_ahc_resident_work_budget_invalid");
+        for (uint64_t index = 0; index < uint64_t(d.rows) * d.features; ++index) {
+            uint64_t magnitude = assignment_input_bits(values, index) & 0x7ffffffffffffffful;
+            require(magnitude == 0 || (magnitude >= std::bit_cast<uint64_t>(0x1p-64) && magnitude <= std::bit_cast<uint64_t>(0x1p32)), "double_ahc_resident_value_domain_invalid");
+        }
+        uint64_t cutoff_bits = std::bit_cast<uint64_t>(cutoff), cutoff_magnitude = cutoff_bits & 0x7ffffffffffffffful;
+        require(cutoff_magnitude <= std::bit_cast<uint64_t>(0x1p64) && (cutoff_magnitude == 0 || cutoff_magnitude >= std::bit_cast<uint64_t>(0x1p-100)), "double_ahc_resident_cutoff_domain_invalid");
+        auto started = std::chrono::steady_clock::now();
+        uint64_t bytes = uint64_t(d.rows) * d.features * sizeof(double);
+        reserve(input_, std::max(bytes, uint64_t(d.rows) * sizeof(int64_t))); reserve(output_, std::max(pairs * sizeof(double), uint64_t(d.rows) * sizeof(int32_t))); reserve(right_, uint64_t(d.rows - 1) * 4 * sizeof(double)); reserve(terms_, sizeof(uint32_t));
+        std::memcpy(input_.contents, reinterpret_cast<const unsigned char*>(values), bytes);
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed");
+        command.label = @"WhisperX experimental resident bounded AHC";
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:pdist_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:output_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(pairs, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, pdist_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        ReindexDimensions leaves = {d.rows}; FclusterDimensions cut = {d.rows, 1, cutoff_bits};
+        encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:resident_linkage_pipeline_]; [encoder setBuffer:output_ offset:0 atIndex:0]; [encoder setBytes:&leaves length:sizeof(leaves) atIndex:1]; [encoder setBuffer:right_ offset:0 atIndex:2]; [encoder setBuffer:terms_ offset:0 atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)]; [encoder endEncoding];
+        encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:resident_cut_pipeline_]; [encoder setBuffer:right_ offset:0 atIndex:0]; [encoder setBytes:&cut length:sizeof(cut) atIndex:1]; [encoder setBuffer:output_ offset:0 atIndex:2]; [encoder setBuffer:terms_ offset:0 atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)]; [encoder endEncoding];
+        encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:resident_labels_pipeline_]; [encoder setBuffer:output_ offset:0 atIndex:0]; [encoder setBytes:&leaves length:sizeof(leaves) atIndex:1]; [encoder setBuffer:input_ offset:0 atIndex:2]; [encoder setBuffer:terms_ offset:0 atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(d.rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(32, resident_labels_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        uint32_t status = *static_cast<const uint32_t*>(terms_.contents);
+        require(status != 1, "double_ahc_resident_neighbor_not_found"); require(status != 2, "double_ahc_resident_intermediate_domain_invalid"); require(status != 3, "double_ahc_resident_negative_variance"); require(status != 4, "double_ahc_resident_distance_domain_invalid"); require(status != 5, "double_ahc_resident_tree_invalid"); require(status != 6, "double_ahc_resident_labels_invalid"); require(status == 0, "double_ahc_resident_status_invalid");
+        const int64_t* result = static_cast<const int64_t*>(input_.contents);
+        for (uint32_t leaf = 0; leaf < d.rows; ++leaf) require(result[leaf] >= 0 && result[leaf] < d.rows, "double_ahc_resident_result_invalid");
+        std::memcpy(reinterpret_cast<unsigned char*>(output), result, uint64_t(d.rows) * sizeof(int64_t));
+        return {1, 4, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
     DoubleMetrics centroid_linkage(const double* distances, uint32_t leaves, double* output) {
@@ -1529,5 +1574,13 @@ extern "C" int wxdouble_centroid_linkage(void* context, const double* distances,
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->centroid_linkage(distances, leaves, output); return 0; }
         catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_centroid_linkage_failed"); return 1; }
+    }
+}
+
+extern "C" int wxdouble_ahc_resident(void* context, const double* values, uint32_t rows, uint32_t features, double cutoff, int64_t* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->ahc_resident(values, {rows, features}, cutoff, output); return 0; }
+        catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_ahc_resident_failed"); return 1; }
     }
 }
