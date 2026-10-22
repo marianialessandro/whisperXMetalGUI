@@ -102,7 +102,9 @@ class NativeKMeansDistanceClampTests(unittest.TestCase):
             candidate = compile_upcast_distances(original, norms, finish=finish, clamp=clamp)
             for other in (X, X.copy(), Y):
                 expected = original(X, other, squared=True)
-                with patch.object(pairwise, "_modify_in_place_if_numpy", side_effect=AssertionError("CPU maximum")), patch.object(pairwise, "_fill_diagonal", side_effect=AssertionError("CPU diagonal")):
+                def reject_cpu_postprocess(*args, **kwargs):
+                    raise AssertionError("CPU maximum or diagonal")
+                with patch.dict(candidate.__globals__, {"_modify_in_place_if_numpy": reject_cpu_postprocess, "_fill_diagonal": reject_cpu_postprocess}):
                     actual = candidate(X, other, squared=True)
                 np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
                 self.assertEqual(records[-1]["zero_diagonal"], X is other)

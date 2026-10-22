@@ -63,7 +63,7 @@ class DoubleContext {
     id<MTLComputePipelineState> kmeans_centroid_pipeline_;
     id<MTLComputePipelineState> float_shift_pipeline_;
     id<MTLComputePipelineState> tolerance_mean_pipeline_, tolerance_square_pipeline_, tolerance_final_pipeline_;
-    id<MTLComputePipelineState> distance_clamp_pipeline_, distance_finish_pipeline_, upcast_norms_pipeline_;
+    id<MTLComputePipelineState> resident_distance_pipeline_, distance_clamp_pipeline_, distance_finish_pipeline_, upcast_norms_pipeline_;
     id<MTLComputePipelineState> resident_linkage_pipeline_, resident_cut_pipeline_, resident_labels_pipeline_;
     id<MTLComputePipelineState> centroid_linkage_pipeline_, positive_fma_pipeline_, cut_labels_pipeline_, fcluster_pipeline_, reindex_pipeline_, pdist_pipeline_, inactive_assignment_pipeline_, assignment_batch_pipeline_, assignment_pipeline_, kmeans_best_pipeline_, kmeans_search_pipeline_, kmeans_probability_sum_pipeline_, kmeans_probability_pipeline_, kmeans_minimum_pipeline_, kmeans_norm_pipeline_, kmeans_weighted_products_pipeline_, kmeans_weighted_prefix_pipeline_;
     id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_, cosine_norm_pipeline_, cosine_distance_pipeline_, cosine_score_pipeline_, argmax_pipeline_, minimum_pipeline_, inactive_pipeline_, nan_minimum_pipeline_, nan_cleanup_pipeline_;
@@ -148,6 +148,8 @@ public:
         if (best_candidate_function != nil) kmeans_best_pipeline_ = [device_ newComputePipelineStateWithFunction:best_candidate_function error:&error];
         id<MTLFunction> assignment_function = [library newFunctionWithName:@"double_linear_assignment_max"];
         if (assignment_function != nil) assignment_pipeline_ = [device_ newComputePipelineStateWithFunction:assignment_function error:&error];
+        id<MTLFunction> resident_distance_function = [library newFunctionWithName:@"double_kmeans_resident_distance_finish"];
+        if (resident_distance_function != nil) resident_distance_pipeline_ = [device_ newComputePipelineStateWithFunction:resident_distance_function error:&error];
         id<MTLFunction> distance_clamp_function = [library newFunctionWithName:@"float_kmeans_distance_clamp"];
         if (distance_clamp_function != nil) distance_clamp_pipeline_ = [device_ newComputePipelineStateWithFunction:distance_clamp_function error:&error];
         id<MTLFunction> distance_finish_function = [library newFunctionWithName:@"double_kmeans_distance_finish"];
@@ -463,10 +465,12 @@ public:
         return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
-    DoubleMetrics kmeans_distance_finish(const double* products, const double* left_norms, const double* right_norms, MatrixDimensions d, float* output) {
+    DoubleMetrics kmeans_distance_finish(const double* products, const double* left_norms, const double* right_norms, MatrixDimensions d, float* output, bool resident = false, uint32_t zero_diagonal = 0) {
         std::lock_guard<std::mutex> guard(mutex_);
-        require(distance_finish_pipeline_ != nil, "double_kmeans_distance_finish_kernel_unavailable");
+        id<MTLComputePipelineState> selected = resident ? resident_distance_pipeline_ : distance_finish_pipeline_;
+        require(selected != nil, resident ? "double_kmeans_resident_distances_kernel_unavailable" : "double_kmeans_distance_finish_kernel_unavailable");
         require(products != nullptr && left_norms != nullptr && right_norms != nullptr && output != nullptr && d.rows > 0 && d.rows <= 4096 && d.columns > 0 && d.columns <= 4096 && uint64_t(d.rows) * d.columns <= 1024 * 1024, "double_kmeans_distance_finish_shape_or_pointer_invalid");
+        require(!resident || (d.rows <= 256 && d.columns <= 256 && zero_diagonal <= 1 && (zero_diagonal == 0 || d.rows == d.columns)), "double_kmeans_resident_distances_shape_or_policy_invalid");
         uint64_t count = uint64_t(d.rows) * d.columns;
         auto validate = [&](const double* values, uint64_t length, bool nonnegative) {
             for (uint64_t index = 0; index < length; ++index) {
@@ -483,11 +487,17 @@ public:
         AssignmentDimensions dimensions = {d.rows, d.columns};
         id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed"); command.label = @"WhisperX experimental KMeans distance finish";
         id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
-        [encoder setComputePipelineState:distance_finish_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&dimensions length:sizeof(dimensions) atIndex:1]; [encoder setBuffer:right_ offset:0 atIndex:2]; [encoder setBuffer:output_ offset:0 atIndex:3];
-        [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, distance_finish_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        [encoder setComputePipelineState:selected]; [encoder setBuffer:input_ offset:0 atIndex:0];
+        if (resident) { DistanceClampDimensions fused = {d.rows, d.columns, zero_diagonal}; [encoder setBytes:&fused length:sizeof(fused) atIndex:1]; }
+        else [encoder setBytes:&dimensions length:sizeof(dimensions) atIndex:1];
+        [encoder setBuffer:right_ offset:0 atIndex:2]; [encoder setBuffer:output_ offset:0 atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, selected.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
         [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
         const float* result = static_cast<const float*>(output_.contents);
-        for (uint64_t index = 0; index < count; ++index) require(std::isfinite(result[index]), "double_kmeans_distance_finish_output_overflow");
+        for (uint64_t index = 0; index < count; ++index) {
+            require(std::isfinite(result[index]), "double_kmeans_distance_finish_output_overflow");
+            if (resident) { uint32_t bits = 0; std::memcpy(&bits, result + index, sizeof(bits)); require(bits < 0x7f800000u, "double_kmeans_resident_distances_result_invalid"); }
+        }
         std::memcpy(reinterpret_cast<unsigned char*>(output), result, count * sizeof(float));
         return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
@@ -1690,5 +1700,13 @@ extern "C" int wxdouble_kmeans_distance_clamp(void* context, const float* values
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->kmeans_distance_clamp(values, {rows, columns, zero_diagonal}, output); return 0; }
         catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_kmeans_distance_clamp_failed"); return 1; }
+    }
+}
+
+extern "C" int wxdouble_kmeans_resident_distances(void* context, const double* products, const double* left_norms, const double* right_norms, uint32_t rows, uint32_t columns, uint32_t zero_diagonal, float* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->kmeans_distance_finish(products, left_norms, right_norms, {rows, 0, columns}, output, true, zero_diagonal); return 0; }
+        catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_kmeans_resident_distances_failed"); return 1; }
     }
 }

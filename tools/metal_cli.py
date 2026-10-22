@@ -85,6 +85,7 @@ def main(argv=None):
     parser.add_argument("--kmeans-seed-probabilities", action="store_true", help="Compute dense float32 KMeans++ first-seed normalized weights on Metal; requires --kmeans-feature-mean and seed-probability ABI. Keeps RandomState.choice and RNG state handling original.")
     parser.add_argument("--kmeans-candidate-minimum", action="store_true", help="Compute dense float32 KMeans++ in-place broadcast candidate minima on Metal; requires --kmeans-feature-mean and candidate-minimum ABI. Keeps RNG, distances, potentials and candidate decisions original.")
     parser.add_argument("--kmeans-weighted-prefix", action="store_true", help="Compute dense float32 KMeans++ weighted cumulative candidate distributions on Metal; requires --kmeans-feature-mean and weighted-prefix ABI. Keeps RNG, distances, potentials and candidate decisions original.")
+    parser.add_argument("--kmeans-resident-distances", action="store_true", help="Fuse distance finishing and squared clamp/diagonal in one Metal kernel with no float32 bridge; requires --kmeans-distance-clamp and resident-distance ABI. Restricts dense distance inputs to 1-256 rows each and 1-1024 features, guaranteeing a single pinned helper chunk.")
     parser.add_argument("--kmeans-distance-clamp", action="store_true", help="Clamp finite float32 KMeans++ squared distances to positive zero and fill same-dataset diagonals on Metal; requires --kmeans-distance-finish and clamp ABI. Restricts this optional path to squared float32 distances; BLAS products, weighted potentials and Lloyd/Elkan remain original.")
     parser.add_argument("--kmeans-distance-finish", action="store_true", help="Scale binary64 KMeans++ BLAS distance products, add both norms and convert exactly to float32 on Metal; requires --kmeans-upcast-norms and distance-finish ABI. BLAS products, outer clamping, weighted potentials and Lloyd/Elkan remain original.")
     parser.add_argument("--kmeans-upcast-norms", action="store_true", help="Compute binary64 row norms inside pinned dense KMeans++ distance chunks on Metal; requires --kmeans-feature-mean and upcast-norm ABI. Distance BLAS products, weighted potentials and Lloyd/Elkan remain original.")
@@ -146,6 +147,8 @@ def main(argv=None):
         parser.error("--kmeans-candidate-minimum requires --kmeans-feature-mean.")
     if args.kmeans_weighted_prefix and not args.kmeans_feature_mean:
         parser.error("--kmeans-weighted-prefix requires --kmeans-feature-mean.")
+    if args.kmeans_resident_distances and not args.kmeans_distance_clamp:
+        parser.error("--kmeans-resident-distances requires --kmeans-distance-clamp.")
     if args.kmeans_distance_clamp and not args.kmeans_distance_finish:
         parser.error("--kmeans-distance-clamp requires --kmeans-distance-finish.")
     if args.kmeans_distance_finish and not args.kmeans_upcast_norms:
@@ -249,6 +252,7 @@ def main(argv=None):
     report["kmeans_seed_probabilities_requested"] = args.kmeans_seed_probabilities
     report["kmeans_candidate_minimum_requested"] = args.kmeans_candidate_minimum
     report["kmeans_weighted_prefix_requested"] = args.kmeans_weighted_prefix
+    report["kmeans_resident_distances_requested"] = args.kmeans_resident_distances
     report["kmeans_distance_clamp_requested"] = args.kmeans_distance_clamp
     report["kmeans_distance_finish_requested"] = args.kmeans_distance_finish
     report["kmeans_upcast_norms_requested"] = args.kmeans_upcast_norms
@@ -306,7 +310,7 @@ def main(argv=None):
                                 scopes.enter_context(native_vbx_matrix_products(plda_context, records["vbx_matrix_products"], vbx_calls, precompute=args.vbx_precomputed_terms, precompute_records=records["vbx_precomputed_terms"], statistics=args.vbx_statistics, statistics_records=records["vbx_statistics"], scores=args.vbx_score_arithmetic, score_records=records["vbx_score_arithmetic"], prior=args.vbx_prior_updates, prior_records=records["vbx_prior_updates"], posterior=args.vbx_posterior_arithmetic, posterior_records=records["vbx_posterior_arithmetic"], elbo=args.vbx_elbo_arithmetic, elbo_records=records["vbx_elbo_arithmetic"], transcendentals=args.vbx_transcendentals, transcendental_records=records["vbx_transcendentals"], logsumexp=args.vbx_logsumexp, logsumexp_records=records["vbx_logsumexp"], scalars=args.vbx_scalar_arithmetic, scalar_records=records["vbx_scalar_arithmetic"], initialization=args.vbx_initialization, initialization_records=records["vbx_initialization"]))
                         if args.kmeans_feature_mean:
                             from tools.baseline.native_kmeans_mean import native_kmeans_feature_mean
-                            scopes.enter_context(native_kmeans_feature_mean(plda_context, records["kmeans_feature_mean"], shift_records=records["kmeans_centering"] if args.kmeans_centering else None, tolerance_records=records["kmeans_tolerance"] if args.kmeans_tolerance else None, norm_records=records["kmeans_squared_norms"] if args.kmeans_squared_norms else None, prefix_records=records["kmeans_weighted_prefix"] if args.kmeans_weighted_prefix else None, minimum_records=records["kmeans_candidate_minimum"] if args.kmeans_candidate_minimum else None, probability_records=records["kmeans_seed_probabilities"] if args.kmeans_seed_probabilities else None, search_records=records["kmeans_candidate_search"] if args.kmeans_candidate_search else None, best_records=records["kmeans_best_candidate"] if args.kmeans_best_candidate else None, query_records=records["kmeans_query_scaling"] if args.kmeans_query_scaling else None, upcast_norm_records=records["kmeans_upcast_norms"] if args.kmeans_upcast_norms else None, distance_finish_records=records["kmeans_distance_finish"] if args.kmeans_distance_finish else None, distance_clamp_records=records["kmeans_distance_clamp"] if args.kmeans_distance_clamp else None))
+                            scopes.enter_context(native_kmeans_feature_mean(plda_context, records["kmeans_feature_mean"], shift_records=records["kmeans_centering"] if args.kmeans_centering else None, tolerance_records=records["kmeans_tolerance"] if args.kmeans_tolerance else None, norm_records=records["kmeans_squared_norms"] if args.kmeans_squared_norms else None, prefix_records=records["kmeans_weighted_prefix"] if args.kmeans_weighted_prefix else None, minimum_records=records["kmeans_candidate_minimum"] if args.kmeans_candidate_minimum else None, probability_records=records["kmeans_seed_probabilities"] if args.kmeans_seed_probabilities else None, search_records=records["kmeans_candidate_search"] if args.kmeans_candidate_search else None, best_records=records["kmeans_best_candidate"] if args.kmeans_best_candidate else None, query_records=records["kmeans_query_scaling"] if args.kmeans_query_scaling else None, upcast_norm_records=records["kmeans_upcast_norms"] if args.kmeans_upcast_norms else None, distance_finish_records=records["kmeans_distance_finish"] if args.kmeans_distance_finish else None, distance_clamp_records=records["kmeans_distance_clamp"] if args.kmeans_distance_clamp else None, resident_distances=args.kmeans_resident_distances))
                         embedding_context = None
                         if args.embedding_library:
                             from tools.baseline.native_embedding import NativeEmbeddingNormalization
@@ -345,6 +349,9 @@ def main(argv=None):
             report["kmeans_candidate_minimum_observed"] = bool(records["kmeans_candidate_minimum"])
             report["native_kmeans_weighted_prefix_calls"] = len(records["kmeans_weighted_prefix"])
             report["kmeans_weighted_prefix_observed"] = bool(records["kmeans_weighted_prefix"])
+            report["native_kmeans_resident_distance_calls"] = sum(row.get("resident_clamp", False) for row in records["kmeans_distance_finish"])
+            report["kmeans_resident_distances_observed"] = bool(report["native_kmeans_resident_distance_calls"])
+            report["native_kmeans_clamp_separate_dispatches"] = sum(not row.get("resident_clamp_reuse", False) for row in records["kmeans_distance_clamp"])
             report["native_kmeans_distance_clamp_calls"] = len(records["kmeans_distance_clamp"])
             report["kmeans_distance_clamp_observed"] = bool(records["kmeans_distance_clamp"])
             report["native_kmeans_distance_finish_calls"] = len(records["kmeans_distance_finish"])

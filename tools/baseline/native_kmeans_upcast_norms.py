@@ -27,9 +27,11 @@ def squared_upcast_norms(context, records, values, squared=False):
     return result
 
 
-def compile_upcast_distances(original, norms, finish=None, clamp=None):
+def compile_upcast_distances(original, norms, finish=None, clamp=None, resident=False):
     import sklearn.metrics.pairwise as pairwise
 
+    if type(resident) is not bool or (resident and (finish is None or clamp is None)):
+        raise ValueError("kmeans_resident_distances_configuration_invalid")
     upcast = pairwise._euclidean_distances_upcast
     if original is not pairwise._euclidean_distances or original.__closure__ or upcast.__closure__ or inspect.unwrap(original) is not original or inspect.unwrap(upcast) is not upcast or hashlib.sha256(inspect.getsource(original).encode()).hexdigest() != EUCLIDEAN_SHA256 or hashlib.sha256(inspect.getsource(upcast).encode()).hexdigest() != UPCAST_SHA256 or original.__globals__.get("_euclidean_distances_upcast") is not upcast or importlib.metadata.version("scikit-learn") != "1.9.1":
         raise ValueError("kmeans_upcast_norms_reference_not_supported")
@@ -51,13 +53,33 @@ def compile_upcast_distances(original, norms, finish=None, clamp=None):
             if len(found) != 1:
                 raise ValueError("kmeans_distance_finish_expression_contract_changed")
             matches.append(found[0])
-        matches[0].value = ast.parse("__wx_distance_finish(safe_sparse_dot(X_chunk, Y_chunk.T, dense_output=True), XX_chunk, YY_chunk)", mode="eval").body
+        matches[0].value = ast.parse("__wx_distance_finish(safe_sparse_dot(X_chunk, Y_chunk.T, dense_output=True), XX_chunk, YY_chunk" + (", X is Y)" if resident else ")"), mode="eval").body
         class RemoveNormAdditions(ast.NodeTransformer):
             def visit_AugAssign(self, node):
                 return None if node in matches[1:] else self.generic_visit(node)
         tree = RemoveNormAdditions().visit(tree)
         ast.fix_missing_locations(tree)
+    if resident:
+        expressions = ("distances = xp.empty((n_samples_X, n_samples_Y), dtype=xp.float32, device=device_)", "distances[x_slice, y_slice] = xp.astype(d, xp.float32, copy=False)")
+        matches = []
+        for expression in expressions:
+            target = ast.parse(expression).body[0]
+            found = [node for node in ast.walk(tree) if ast.dump(node) == ast.dump(target)]
+            if len(found) != 1:
+                raise ValueError("kmeans_resident_distances_expression_contract_changed")
+            matches.append(found[0])
+        matches[1].targets = [ast.Name(id="distances", ctx=ast.Store())]
+        matches[1].value = ast.Name(id="d", ctx=ast.Load())
+        class RemoveResidentAllocation(ast.NodeTransformer):
+            def visit_Assign(self, node):
+                return None if node is matches[0] else self.generic_visit(node)
+        tree = RemoveResidentAllocation().visit(tree)
+        tree.body[0].body.insert(1, ast.parse("__wx_squared_distance_guard(X, Y, True)").body[0])
+        tree.body[0].body.insert(2, ast.parse("__wx_resident_batch_guard(X, Y, batch_size)").body[0])
+        ast.fix_missing_locations(tree)
     namespace = dict(upcast.__globals__)
+    namespace["__wx_squared_distance_guard"] = validate_resident_distance_inputs if resident else validate_squared_distance_inputs
+    namespace["__wx_resident_batch_guard"] = validate_resident_batch
     namespace["__wx_distance_finish"] = finish
     namespace["row_norms"] = norms
     exec(compile(tree, "<WhisperX scoped native KMeans upcast norms>", "exec"), namespace)
@@ -87,7 +109,7 @@ def compile_upcast_distances(original, norms, finish=None, clamp=None):
     namespace = dict(original.__globals__)
     namespace["_euclidean_distances_upcast"] = candidate_upcast
     namespace["__wx_distance_clamp"] = clamp
-    namespace["__wx_squared_distance_guard"] = validate_squared_distance_inputs
+    namespace["__wx_squared_distance_guard"] = validate_resident_distance_inputs if resident else validate_squared_distance_inputs
     exec(compile(outer, "<WhisperX scoped KMeans Euclidean distance>", "exec"), namespace)
     candidate = namespace[original.__name__]
     if inspect.signature(candidate_upcast) != inspect.signature(upcast) or inspect.signature(candidate) != inspect.signature(original):
@@ -120,3 +142,48 @@ def clamp_distances(context, records, values, zero_diagonal):
     record.update({"adapter_scope": "sklearn_kmeans_plusplus_squared_distance_clamp", "original_euclidean_sha256": EUCLIDEAN_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "host_input_staging_copy_bytes": 0 if np.shares_memory(staged, values) else staged.nbytes, "cpu_residuals": ["float32_to_float64_chunk_conversion", "distance_blas_products", "weighted_potentials", "rng_and_seed_control", "lloyd_or_elkan", "host_staging_and_control"]})
     records.append(record)
     return result
+
+
+def validate_resident_distance_inputs(X, Y, squared):
+    validate_squared_distance_inputs(X, Y, squared)
+    if not 0 < X.shape[0] <= 256 or not 0 < Y.shape[0] <= 256 or not 0 < X.shape[1] <= 1024 or X.shape[1] != Y.shape[1]:
+        raise ValueError("kmeans_resident_distances_single_chunk_shape_required")
+
+
+def resident_finish_distances(context, records, products, left_norms, right_norms, zero_diagonal):
+    if any(type(value) is not np.ndarray or value.dtype != np.float64 or value.ndim != 2 for value in (products, left_norms, right_norms)) or left_norms.shape != (products.shape[0], 1) or right_norms.shape != (1, products.shape[1]):
+        raise ValueError("kmeans_resident_distances_operand_not_supported")
+    staged = tuple(np.ascontiguousarray(value) for value in (products, left_norms, right_norms))
+    result, record = context.kmeans_resident_distances(staged[0], staged[1].reshape(-1), staged[2].reshape(-1), zero_diagonal)
+    record = dict(record)
+    record.update({"adapter_scope": "sklearn_kmeans_plusplus_resident_distance_finish", "original_euclidean_sha256": EUCLIDEAN_SHA256, "original_upcast_sha256": UPCAST_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "host_input_staging_copy_bytes": sum(value.nbytes for value, original in zip(staged, (products, left_norms, right_norms)) if not np.shares_memory(value, original)), "cpu_residuals": ["float32_to_float64_chunk_conversion", "distance_blas_products", "weighted_potentials", "rng_and_seed_control", "lloyd_or_elkan", "host_staging_and_control"]})
+    records.append(record)
+    return result
+
+
+class ResidentDistancePipeline:
+    def __init__(self, context, finish_records, clamp_records):
+        self.context, self.finish_records, self.clamp_records = context, finish_records, clamp_records
+        self.pending = None
+
+    def reset(self):
+        self.pending = None
+
+    def finish(self, products, left, right, diagonal):
+        if self.pending is not None:
+            raise ValueError("kmeans_resident_distances_previous_result_not_consumed")
+        output = resident_finish_distances(self.context, self.finish_records, products, left, right, diagonal)
+        self.pending = (output, diagonal, len(self.finish_records) - 1)
+        return output
+
+    def clamp(self, values, diagonal):
+        pending, self.pending = self.pending, None
+        if pending is None or values is not pending[0] or diagonal is not pending[1]:
+            raise ValueError("kmeans_resident_distances_result_reuse_mismatch")
+        self.clamp_records.append({"adapter_scope": "sklearn_kmeans_plusplus_squared_distance_clamp", "original_euclidean_sha256": EUCLIDEAN_SHA256, "resident_clamp_reuse": True, "shared_finish_dispatch_index": pending[2], "zero_diagonal": diagonal, "squared_only": True, "rows": values.shape[0], "columns": values.shape[1], "gpu_kernels": ["double_kmeans_resident_distance_finish"], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "host_input_staging_copy_bytes": 0, "cpu_residuals": ["host_staging_and_control"], "quality_certified": False, "full_pipeline_gpu_certified": False})
+        return values
+
+
+def validate_resident_batch(X, Y, batch_size):
+    if batch_size is not None and (type(batch_size) is not int or batch_size < max(X.shape[0], Y.shape[0])):
+        raise ValueError("kmeans_resident_distances_single_chunk_batch_required")

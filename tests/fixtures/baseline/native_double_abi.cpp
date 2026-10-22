@@ -48,6 +48,7 @@ extern "C" int wxdouble_ahc_reindex(void*, const int64_t*, uint32_t, int64_t*, D
 extern "C" int wxdouble_fcluster_distance(void*, const double*, uint32_t, double, uint32_t, int32_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_fcluster_reindex(void*, const double*, uint32_t, double, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_positive_fma(void*, const double*, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_kmeans_resident_distances(void*, const double*, const double*, const double*, uint32_t, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_distance_clamp(void*, const float*, uint32_t, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_distance_finish(void*, const double*, const double*, const double*, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_upcast_norms(void*, const double*, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
@@ -68,6 +69,35 @@ int main(int argc, char** argv) {
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    double resident_products[] = {1, 2, 3, 4}, resident_left[] = {10, 20}, resident_right[] = {1, 2}; float resident_output[] = {91, 92, 93, 94};
+    assert(wxdouble_kmeans_resident_distances(context, resident_products, resident_left, resident_right, 2, 2, 1, resident_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 1 && resident_output[0] == 0 && resident_output[1] == 8 && resident_output[3] == 0);
+    resident_output[0] = 91;
+    assert(wxdouble_kmeans_resident_distances(nullptr, resident_products, resident_left, resident_right, 2, 2, 0, resident_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_resident_distances(context, nullptr, resident_left, resident_right, 2, 2, 0, resident_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_resident_distances(context, resident_products, nullptr, resident_right, 2, 2, 0, resident_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_resident_distances(context, resident_products, resident_left, nullptr, 2, 2, 0, resident_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_resident_distances(context, resident_products, resident_left, resident_right, 2, 2, 0, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_resident_distances(context, resident_products, resident_left, resident_right, 2, 2, 0, resident_output, nullptr, error, sizeof(error)) != 0);
+    for (uint32_t size : {0u, 257u}) {
+        assert(wxdouble_kmeans_resident_distances(context, resident_products, resident_left, resident_right, size, 2, 0, resident_output, &metrics, error, sizeof(error)) != 0 && resident_output[0] == 91);
+        assert(wxdouble_kmeans_resident_distances(context, resident_products, resident_left, resident_right, 2, size, 0, resident_output, &metrics, error, sizeof(error)) != 0 && resident_output[0] == 91);
+    }
+    for (uint32_t policy : {1u, 2u}) assert(wxdouble_kmeans_resident_distances(context, resident_products, resident_left, resident_right, 1, 2, policy, resident_output, &metrics, error, sizeof(error)) != 0 && resident_output[0] == 91);
+    for (double value : {double(INFINITY), double(NAN), 0x1p-501, 0x1p501}) {
+        resident_products[0] = value;
+        assert(wxdouble_kmeans_resident_distances(context, resident_products, resident_left, resident_right, 2, 2, 0, resident_output, &metrics, error, sizeof(error)) != 0 && resident_output[0] == 91);
+    }
+    for (double value : {0x1p130, -0x1p130}) {
+        resident_products[0] = value;
+        for (uint32_t diagonal : {0u, 1u}) assert(wxdouble_kmeans_resident_distances(context, resident_products, resident_left, resident_right, 2, 2, diagonal, resident_output, &metrics, error, sizeof(error)) != 0 && resident_output[0] == 91 && std::string(error) == "double_kmeans_distance_finish_output_overflow");
+    }
+    resident_products[0] = 1;
+    unsigned char resident_unaligned_input[sizeof(resident_products) + 1], resident_unaligned_output[sizeof(resident_output) + 1];
+    std::memcpy(resident_unaligned_input + 1, resident_products, sizeof(resident_products));
+    assert(wxdouble_kmeans_resident_distances(context, reinterpret_cast<double*>(resident_unaligned_input + 1), resident_left, resident_right, 2, 2, 0, reinterpret_cast<float*>(resident_unaligned_output + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(resident_output, resident_unaligned_output + 1, sizeof(resident_output)); assert(resident_output[0] == 9 && resident_output[3] == 14);
+    assert(wxdouble_kmeans_resident_distances(context, resident_products, resident_left, resident_right, 2, 2, 0, reinterpret_cast<float*>(resident_products), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(resident_output, resident_products, sizeof(resident_output)); assert(resident_output[0] == 9 && resident_output[3] == 14);
     uint32_t clamp_words[] = {0x80000000u, 0xbf800000u, 0x40000000u, 1u}; float clamp_values[4], clamp_output[] = {91, 92, 93, 94};
     std::memcpy(clamp_values, clamp_words, sizeof(clamp_values));
     assert(wxdouble_kmeans_distance_clamp(context, clamp_values, 2, 2, 0, clamp_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 1);
@@ -1137,6 +1167,14 @@ int main(int argc, char** argv) {
     assert(wxdouble_kmeans_distance_finish(context, clamp_legacy_product, clamp_legacy_norm, clamp_legacy_norm, 1, 1, finish_output, &metrics, error, sizeof(error)) == 0 && finish_output[0] == 2);
     clamp_output[0] = 91;
     assert(wxdouble_kmeans_distance_clamp(context, clamp_values, 2, 2, 0, clamp_output, &metrics, error, sizeof(error)) != 0 && clamp_output[0] == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_resident_distance_shader = shader.substr(0, shader.find("\n// Preserve overflow bits"));
+    assert(wxdouble_create(pre_resident_distance_shader.data(), pre_resident_distance_shader.size(), &context, error, sizeof(error)) == 0);
+    float resident_legacy_values[] = {-1, 2};
+    assert(wxdouble_kmeans_distance_clamp(context, resident_legacy_values, 1, 2, 0, clamp_output, &metrics, error, sizeof(error)) == 0 && clamp_output[0] == 0 && clamp_output[1] == 2);
+    resident_output[0] = 91;
+    assert(wxdouble_kmeans_resident_distances(context, resident_products, resident_left, resident_right, 2, 2, 0, resident_output, &metrics, error, sizeof(error)) != 0 && resident_output[0] == 91);
     wxdouble_destroy(context);
 
 }

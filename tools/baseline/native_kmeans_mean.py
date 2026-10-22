@@ -89,7 +89,7 @@ def shift_inplace(context, records, values, mean, add, role):
 
 
 @contextlib.contextmanager
-def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None):
+def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False):
     global _ACTIVE
     from sklearn.base import _fit_context
     from sklearn.cluster import KMeans
@@ -116,6 +116,11 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
             raise ValueError("kmeans_distance_clamp_configuration_invalid")
         if distance_clamp_records is not None and getattr(context.library, "wxdouble_kmeans_distance_clamp", None) is None:
             raise ValueError("double_kmeans_distance_clamp_abi_unavailable")
+        if type(resident_distances) is not bool or (resident_distances and distance_clamp_records is None):
+            raise ValueError("kmeans_resident_distances_configuration_invalid")
+        if resident_distances and getattr(context.library, "wxdouble_kmeans_resident_distances", None) is None:
+            raise ValueError("double_kmeans_resident_distances_abi_unavailable")
+        resident_pipeline = None
         original_tolerance = None
         original_plusplus = None
         if prefix_records is not None or minimum_records is not None or probability_records is not None or search_records is not None or best_records is not None or query_records is not None or upcast_norm_records is not None:
@@ -175,7 +180,11 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
                 if distance_clamp_records is not None:
                     from tools.baseline.native_kmeans_upcast_norms import clamp_distances
                 clamp = (lambda values, zero_diagonal: clamp_distances(context, distance_clamp_records, values, zero_diagonal)) if distance_clamp_records is not None else None
-                upcast_distance = compile_upcast_distances(kmeans_module._kmeans_plusplus.__globals__.get("_euclidean_distances"), upcast_norms, finish=finish if distance_finish_records is not None else None, clamp=clamp)
+                if resident_distances:
+                    from tools.baseline.native_kmeans_upcast_norms import ResidentDistancePipeline
+                    resident_pipeline = ResidentDistancePipeline(context, distance_finish_records, distance_clamp_records)
+                    finish, clamp = resident_pipeline.finish, resident_pipeline.clamp
+                upcast_distance = compile_upcast_distances(kmeans_module._kmeans_plusplus.__globals__.get("_euclidean_distances"), upcast_norms, finish=finish if distance_finish_records is not None else None, clamp=clamp, resident=resident_distances)
             original_plusplus = kmeans_module._kmeans_plusplus
             prefix = (lambda weights, distances: weighted_prefix(context, prefix_records, weights, distances)) if prefix_records is not None else None
             minimum = (lambda closest, candidates: candidate_minimum(context, minimum_records, closest, candidates)) if minimum_records is not None else None
@@ -234,7 +243,13 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
 
         @functools.wraps(original)
         def wrapped(*args, **kwargs):
-            return candidate(*args, **kwargs) if threading.get_ident() == owner else original(*args, **kwargs)
+            if threading.get_ident() != owner:
+                return original(*args, **kwargs)
+            try:
+                return candidate(*args, **kwargs)
+            finally:
+                if resident_pipeline is not None:
+                    resident_pipeline.reset()
 
         if original_tolerance is not None:
             @functools.wraps(original_tolerance)

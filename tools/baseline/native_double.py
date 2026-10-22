@@ -562,27 +562,44 @@ class NativeDoubleNormalization:
         return output, {"scope": "experimental_native_kmeans_squared_distance_clamp", "rows": rows, "columns": columns, "zero_diagonal": zero_diagonal, "squared_only": True, "gpu_kernels": ["float_kmeans_distance_clamp"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes, "logical_result_readback_bytes": output.nbytes, "host_numeric_clamping": False, "host_diagonal_fill": False, "binary32_subnormals_preserved": True, "sqrt_replaced": False, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
 
     def kmeans_distance_finish(self, products, left_norms, right_norms):
+        return self._kmeans_distance_finish(products, left_norms, right_norms)
+
+    def kmeans_resident_distances(self, products, left_norms, right_norms, zero_diagonal=False):
+        return self._kmeans_distance_finish(products, left_norms, right_norms, resident=True, zero_diagonal=zero_diagonal)
+
+    def _kmeans_distance_finish(self, products, left_norms, right_norms, resident=False, zero_diagonal=False):
         if any(type(value) is not np.ndarray or value.dtype != np.float64 or not value.flags.c_contiguous for value in (products, left_norms, right_norms)) or products.ndim != 2 or left_norms.ndim != 1 or right_norms.ndim != 1:
             raise ValueError("double_kmeans_distance_finish_input_format_invalid")
         rows, columns = products.shape
         if not 0 < rows <= 4096 or not 0 < columns <= 4096 or products.size > 1024 * 1024 or left_norms.shape != (rows,) or right_norms.shape != (columns,):
             raise ValueError("double_kmeans_distance_finish_shape_invalid")
+        if resident and (rows > 256 or columns > 256 or type(zero_diagonal) is not bool or (zero_diagonal and rows != columns)):
+            raise ValueError("double_kmeans_resident_distances_shape_or_policy_invalid")
         output, metrics, error = np.empty(products.shape, dtype=np.float32), Metrics(), ct.create_string_buffer(128)
         with self.lock:
             if not self.context:
                 raise ValueError("double_context_closed")
             try:
-                native = self.library.wxdouble_kmeans_distance_finish
+                native = self.library.wxdouble_kmeans_resident_distances if resident else self.library.wxdouble_kmeans_distance_finish
             except AttributeError as failure:
-                raise ValueError("double_kmeans_distance_finish_abi_unavailable") from failure
-            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+                raise ValueError("double_kmeans_resident_distances_abi_unavailable" if resident else "double_kmeans_distance_finish_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p] * 4 + [ct.c_uint32] * (3 if resident else 2) + [ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
             native.restype = ct.c_int
             started = time.perf_counter_ns()
-            if native(self.context, products.ctypes.data, left_norms.ctypes.data, right_norms.ctypes.data, rows, columns, output.ctypes.data, ct.byref(metrics), error, len(error)):
+            arguments = [self.context, products.ctypes.data, left_norms.ctypes.data, right_norms.ctypes.data, rows, columns]
+            if resident:
+                arguments.append(int(zero_diagonal))
+            if native(*arguments, output.ctypes.data, ct.byref(metrics), error, len(error)):
                 raise ValueError(error.value.decode("ascii"))
         if metrics.version != 1 or metrics.kernels != 1 or not np.isfinite(output).all():
             raise ValueError("double_kmeans_distance_finish_native_result_invalid")
-        return output, {"scope": "experimental_native_kmeans_distance_finish", "rows": rows, "columns": columns, "gpu_kernels": ["double_kmeans_distance_finish"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": products.nbytes + left_norms.nbytes + right_norms.nbytes, "logical_result_readback_bytes": output.nbytes, "host_numeric_scale_or_norm_addition": False, "host_numeric_dtype_conversion": False, "binary32_subnormals_preserved": True, "distance_clamping_replaced": False, "distance_blas_products_replaced": False, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+        record = {"scope": "experimental_native_kmeans_distance_finish", "rows": rows, "columns": columns, "gpu_kernels": ["double_kmeans_distance_finish"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": products.nbytes + left_norms.nbytes + right_norms.nbytes, "logical_result_readback_bytes": output.nbytes, "host_numeric_scale_or_norm_addition": False, "host_numeric_dtype_conversion": False, "binary32_subnormals_preserved": True, "distance_clamping_replaced": False, "distance_blas_products_replaced": False, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+
+        if resident:
+            if np.any(output.view(np.uint32) >= 0x7f800000):
+                raise ValueError("double_kmeans_resident_distances_native_result_invalid")
+            record.update({"scope": "experimental_native_kmeans_resident_distances", "resident_clamp": True, "zero_diagonal": zero_diagonal, "squared_only": True, "gpu_kernels": ["double_kmeans_resident_distance_finish"], "distance_clamping_replaced": True, "host_numeric_clamping": False, "host_diagonal_fill": False, "intermediate_distance_readback_bytes": 0})
+        return output, record
 
     def kmeans_upcast_norms(self, values):
         if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim != 2 or not values.flags.c_contiguous:

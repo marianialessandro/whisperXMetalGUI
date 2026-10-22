@@ -1214,12 +1214,15 @@ uint distance_float_bits(ulong value) {
 struct DistanceFinishDimensions { uint rows, columns; };
 
 // Keep the scale and both norm additions separately rounded before the final dtype conversion.
+uint distance_finish_bits(ulong product, ulong left_norm, ulong right_norm) {
+    ulong value = df_mul(product, 0xc000000000000000ul);
+    value = matrix_add(value, left_norm);
+    value = matrix_add(value, right_norm);
+    return distance_float_bits(value);
+}
+
 kernel void double_kmeans_distance_finish(device const ulong* products [[buffer(0)]], constant DistanceFinishDimensions& d [[buffer(1)]], device const ulong* norms [[buffer(2)]], device uint* output [[buffer(3)]], uint index [[thread_position_in_grid]]) {
-    if (index >= d.rows * d.columns) return;
-    ulong value = df_mul(products[index], 0xc000000000000000ul);
-    value = matrix_add(value, norms[index / d.columns]);
-    value = matrix_add(value, norms[d.rows + index % d.columns]);
-    output[index] = distance_float_bits(value);
+    if (index < d.rows * d.columns) output[index] = distance_finish_bits(products[index], norms[index / d.columns], norms[d.rows + index % d.columns]);
 }
 
 
@@ -1230,4 +1233,13 @@ kernel void float_kmeans_distance_clamp(device const uint* values [[buffer(0)]],
     if (index >= d.rows * d.columns) return;
     uint value = values[index];
     output[index] = (value >> 31) || (d.zero_diagonal && index / d.columns == index % d.columns) ? 0 : value;
+}
+
+
+// Preserve overflow bits for the original fail-closed check before applying the resident finite clamp.
+kernel void double_kmeans_resident_distance_finish(device const ulong* products [[buffer(0)]], constant DistanceClampDimensions& d [[buffer(1)]], device const ulong* norms [[buffer(2)]], device uint* output [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index >= d.rows * d.columns) return;
+    uint value = distance_finish_bits(products[index], norms[index / d.columns], norms[d.rows + index % d.columns]);
+    bool finite = (value & 0x7fffffffu) < 0x7f800000u;
+    output[index] = finite && ((value >> 31) || (d.zero_diagonal && index / d.columns == index % d.columns)) ? 0 : value;
 }
