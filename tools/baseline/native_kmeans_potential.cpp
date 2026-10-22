@@ -4,6 +4,7 @@
 #include "native_checks.hpp"
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -45,6 +46,49 @@ extern "C" int wxkmeans_weighted_potentials(const float* distances, const float*
         return 1;
     } catch (...) {
         if (error != nullptr && capacity > 0) { std::strncpy(error, "kmeans_potential_failed", capacity - 1); error[capacity - 1] = 0; }
+        return 1;
+    }
+}
+
+extern "C" int wxkmeans_distance_products(const double* left, const double* right, uint32_t rows, uint32_t columns, uint32_t features, double* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity) {
+    try {
+        require(left != nullptr && right != nullptr && output != nullptr && metrics != nullptr, "kmeans_distance_product_pointer_missing");
+        require(rows > 0 && rows <= 256 && columns > 0 && columns <= 256 && features > 0 && features <= 1024, "kmeans_distance_product_shape_invalid");
+        auto started = std::chrono::steady_clock::now();
+        std::vector<double> a(uint64_t(rows) * features), b(uint64_t(columns) * features), result(uint64_t(rows) * columns);
+        std::memcpy(a.data(), reinterpret_cast<const unsigned char*>(left), a.size() * sizeof(double));
+        std::memcpy(b.data(), reinterpret_cast<const unsigned char*>(right), b.size() * sizeof(double));
+        auto valid = [](double value) {
+            uint64_t magnitude = std::bit_cast<uint64_t>(value) & 0x7ffffffffffffffful;
+            return magnitude == 0 || (magnitude >= std::bit_cast<uint64_t>(0x1p-200) && magnitude <= std::bit_cast<uint64_t>(0x1p200));
+        };
+        for (double value : a) require(valid(value), "kmeans_distance_product_value_domain_invalid");
+        for (double value : b) require(valid(value), "kmeans_distance_product_value_domain_invalid");
+        uint32_t blas_calls = 1;
+        if (rows == 1 && columns == 1) {
+            result[0] = 0.; result[0] += cblas_ddot(features, a.data(), 1, b.data(), 1);
+        } else if (features == 1) {
+            for (uint32_t row = 0; row < rows; ++row) for (uint32_t column = 0; column < columns; ++column) { volatile double product = a[row] * b[column]; result[uint64_t(row) * columns + column] = 0. + product; }
+            blas_calls = 0;
+        } else if (rows == 1) {
+            cblas_dgemv(CblasColMajor, CblasTrans, features, columns, 1., b.data(), features, a.data(), 1, 0., result.data(), 1);
+        } else if (columns == 1) {
+            cblas_dgemv(CblasColMajor, CblasTrans, features, rows, 1., a.data(), features, b.data(), 1, 0., result.data(), 1);
+        } else if (left == right && rows == columns) {
+            cblas_dsyrk(CblasRowMajor, CblasUpper, CblasNoTrans, rows, features, 1., a.data(), features, 0., result.data(), columns);
+            for (uint32_t row = 0; row < rows; ++row) for (uint32_t column = row + 1; column < columns; ++column) result[uint64_t(column) * columns + row] = result[uint64_t(row) * columns + column];
+        } else {
+            cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans, rows, columns, features, 1., a.data(), features, b.data(), features, 0., result.data(), columns);
+        }
+        for (double value : result) require(std::isfinite(value), "kmeans_distance_product_result_invalid");
+        std::memcpy(reinterpret_cast<unsigned char*>(output), result.data(), result.size() * sizeof(double));
+        *metrics = {1, blas_calls, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count())};
+        return 0;
+    } catch (const std::exception& failure) {
+        if (error != nullptr && capacity > 0) { std::strncpy(error, failure.what(), capacity - 1); error[capacity - 1] = 0; }
+        return 1;
+    } catch (...) {
+        if (error != nullptr && capacity > 0) { std::strncpy(error, "kmeans_distance_product_failed", capacity - 1); error[capacity - 1] = 0; }
         return 1;
     }
 }

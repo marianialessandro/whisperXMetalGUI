@@ -8,6 +8,8 @@
 struct KmeansPotentialMetrics { uint32_t version, blas_calls; uint64_t wall_ns; };
 extern "C" int wxkmeans_weighted_potentials(const float*, const float*, uint32_t, uint32_t, float*, KmeansPotentialMetrics*, char*, uint32_t);
 
+extern "C" int wxkmeans_distance_products(const double*, const double*, uint32_t, uint32_t, uint32_t, double*, KmeansPotentialMetrics*, char*, uint32_t);
+
 int main() {
     float left[] = {1, 2, 3, 4}, weights[] = {2, 3}, output[] = {91, 92};
     KmeansPotentialMetrics metrics = {}; char error[128] = {};
@@ -41,4 +43,33 @@ int main() {
     assert(wxkmeans_weighted_potentials(zero, zero, 1, 1, output, &metrics, nullptr, 0) == 0 && std::bit_cast<uint32_t>(output[0]) == 0);
     assert(wxkmeans_weighted_potentials(nullptr, nullptr, 0, 0, nullptr, nullptr, nullptr, 0) != 0);
     char tiny[] = {'x'}; assert(wxkmeans_weighted_potentials(nullptr, nullptr, 0, 0, nullptr, nullptr, tiny, 1) != 0 && tiny[0] == 0);
+    double a[] = {1, 2, 3, 4}, b[] = {2, 3, 4, 5}, products[] = {91, 92, 93, 94};
+    assert(wxkmeans_distance_products(a, b, 2, 2, 2, products, &metrics, error, sizeof(error)) == 0 && products[0] == 8 && products[1] == 14 && products[2] == 18 && products[3] == 32);
+    assert(wxkmeans_distance_products(a, a, 2, 2, 2, products, &metrics, error, sizeof(error)) == 0 && products[0] == 5 && products[1] == 11 && products[2] == 11 && products[3] == 25);
+    assert(wxkmeans_distance_products(a, b, 1, 1, 2, products, &metrics, error, sizeof(error)) == 0 && products[0] == 8);
+    products[0] = 91;
+    assert(wxkmeans_distance_products(nullptr, b, 2, 2, 2, products, &metrics, error, sizeof(error)) != 0 && products[0] == 91);
+    assert(wxkmeans_distance_products(a, nullptr, 2, 2, 2, products, &metrics, error, sizeof(error)) != 0 && products[0] == 91);
+    assert(wxkmeans_distance_products(a, b, 2, 2, 2, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_distance_products(a, b, 2, 2, 2, products, nullptr, error, sizeof(error)) != 0 && products[0] == 91);
+    for (uint32_t count : {0u, 257u}) {
+        assert(wxkmeans_distance_products(a, b, count, 2, 2, products, &metrics, error, sizeof(error)) != 0 && products[0] == 91);
+        assert(wxkmeans_distance_products(a, b, 2, count, 2, products, &metrics, error, sizeof(error)) != 0 && products[0] == 91);
+    }
+    for (uint32_t features : {0u, 1025u}) assert(wxkmeans_distance_products(a, b, 2, 2, features, products, &metrics, error, sizeof(error)) != 0 && products[0] == 91);
+    for (double value : {std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN(), 0x1p-201, 0x1p201}) {
+        a[3] = value;
+        assert(wxkmeans_distance_products(a, b, 2, 2, 2, products, &metrics, error, sizeof(error)) != 0 && products[0] == 91);
+        a[3] = 4; b[3] = value;
+        assert(wxkmeans_distance_products(a, b, 2, 2, 2, products, &metrics, error, sizeof(error)) != 0 && products[0] == 91);
+        b[3] = 5;
+    }
+    unsigned char unaligned_a[sizeof(a) + 1], unaligned_b[sizeof(b) + 1], unaligned_products[sizeof(products) + 1];
+    std::memcpy(unaligned_a + 1, a, sizeof(a)); std::memcpy(unaligned_b + 1, b, sizeof(b));
+    assert(wxkmeans_distance_products(reinterpret_cast<double*>(unaligned_a + 1), reinterpret_cast<double*>(unaligned_b + 1), 2, 2, 2, reinterpret_cast<double*>(unaligned_products + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(products, unaligned_products + 1, sizeof(products)); assert(products[0] == 8 && products[3] == 32);
+    assert(wxkmeans_distance_products(a, b, 2, 2, 2, a, &metrics, error, sizeof(error)) == 0 && a[0] == 8 && a[3] == 32);
+    assert(wxkmeans_distance_products(nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, 0) != 0);
+    tiny[0] = 'x'; assert(wxkmeans_distance_products(nullptr, nullptr, 0, 0, 0, nullptr, nullptr, tiny, 1) != 0 && tiny[0] == 0);
+
 }

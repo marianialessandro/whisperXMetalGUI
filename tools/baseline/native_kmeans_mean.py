@@ -89,7 +89,7 @@ def shift_inplace(context, records, values, mean, add, role):
 
 
 @contextlib.contextmanager
-def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None):
+def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None, product_records=None):
     global _ACTIVE
     from sklearn.base import _fit_context
     from sklearn.cluster import KMeans
@@ -136,6 +136,12 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
                 raise ValueError("kmeans_potential_abi_unavailable")
             if np.__config__.CONFIG.get("Build Dependencies", {}).get("blas", {}).get("name") != "accelerate":
                 raise ValueError("kmeans_potential_accelerate_numpy_required")
+        if product_records is not None:
+            from tools.baseline.native_kmeans_potential import distance_products
+            if potential_context is None or upcast_norm_records is None or not isinstance(product_records, list):
+                raise ValueError("kmeans_distance_product_configuration_invalid")
+            if getattr(potential_context.library, "wxkmeans_distance_products", None) is None:
+                raise ValueError("kmeans_distance_product_abi_unavailable")
         resident_pipeline = None
         original_tolerance = None
         original_plusplus = None
@@ -200,7 +206,7 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
                     from tools.baseline.native_kmeans_upcast_norms import ResidentDistancePipeline
                     resident_pipeline = ResidentDistancePipeline(context, distance_finish_records, distance_clamp_records, norm_records=upcast_norm_records if resident_norms else None, minimum_records=minimum_records if resident_minimum else None)
                     finish, clamp = resident_pipeline.finish, resident_pipeline.clamp
-                upcast_distance = compile_upcast_distances(kmeans_module._kmeans_plusplus.__globals__.get("_euclidean_distances"), upcast_norms, finish=finish if distance_finish_records is not None else None, clamp=clamp, resident=resident_distances, resident_norms=resident_norms)
+                upcast_distance = compile_upcast_distances(kmeans_module._kmeans_plusplus.__globals__.get("_euclidean_distances"), upcast_norms, finish=finish if distance_finish_records is not None else None, clamp=clamp, resident=resident_distances, resident_norms=resident_norms, product=(lambda left, right, dense_output: distance_products(potential_context, product_records, left, right, dense_output)) if product_records is not None else None)
             if resident_minimum:
                 resident_pipeline.distance = upcast_distance
             original_plusplus = kmeans_module._kmeans_plusplus

@@ -27,7 +27,7 @@ def squared_upcast_norms(context, records, values, squared=False):
     return result
 
 
-def compile_upcast_distances(original, norms, finish=None, clamp=None, resident=False, resident_norms=False):
+def compile_upcast_distances(original, norms, finish=None, clamp=None, resident=False, resident_norms=False, product=None):
     import sklearn.metrics.pairwise as pairwise
 
     if type(resident) is not bool or (resident and (finish is None or clamp is None)):
@@ -96,7 +96,19 @@ def compile_upcast_distances(original, norms, finish=None, clamp=None, resident=
         finish_statement.value = ast.parse("__wx_distance_finish(safe_sparse_dot(X_chunk, Y_chunk.T, dense_output=True), X_chunk, Y_chunk, X is Y)", mode="eval").body
         tree.body[0].body.insert(3, ast.parse("__wx_no_chunk_norms(XX, YY)").body[0])
         ast.fix_missing_locations(tree)
+    if product is not None:
+        from tools.baseline.native_kmeans_potential import SAFE_SPARSE_DOT_SHA256
+        reference = upcast.__globals__.get("safe_sparse_dot")
+        if not inspect.isfunction(reference) or reference.__closure__ or hashlib.sha256(inspect.getsource(reference).encode()).hexdigest() != SAFE_SPARSE_DOT_SHA256:
+            raise ValueError("kmeans_distance_product_reference_not_supported")
+        target = ast.parse("safe_sparse_dot(X_chunk, Y_chunk.T, dense_output=True)", mode="eval").body
+        found = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.dump(node) == ast.dump(target)]
+        if len(found) != 1:
+            raise ValueError("kmeans_distance_product_expression_contract_changed")
+        found[0].func = ast.Name(id="__wx_distance_product", ctx=ast.Load())
+        ast.fix_missing_locations(tree)
     namespace = dict(upcast.__globals__)
+    namespace["__wx_distance_product"] = product
     namespace["__wx_squared_distance_guard"] = validate_resident_distance_inputs if resident else validate_squared_distance_inputs
     namespace["__wx_no_chunk_norms"] = validate_no_chunk_norms
     namespace["__wx_resident_batch_guard"] = validate_resident_batch
