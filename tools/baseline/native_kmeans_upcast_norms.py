@@ -27,11 +27,13 @@ def squared_upcast_norms(context, records, values, squared=False):
     return result
 
 
-def compile_upcast_distances(original, norms, finish=None, clamp=None, resident=False):
+def compile_upcast_distances(original, norms, finish=None, clamp=None, resident=False, resident_norms=False):
     import sklearn.metrics.pairwise as pairwise
 
     if type(resident) is not bool or (resident and (finish is None or clamp is None)):
         raise ValueError("kmeans_resident_distances_configuration_invalid")
+    if type(resident_norms) is not bool or (resident_norms and not resident):
+        raise ValueError("kmeans_resident_norms_configuration_invalid")
     upcast = pairwise._euclidean_distances_upcast
     if original is not pairwise._euclidean_distances or original.__closure__ or upcast.__closure__ or inspect.unwrap(original) is not original or inspect.unwrap(upcast) is not upcast or hashlib.sha256(inspect.getsource(original).encode()).hexdigest() != EUCLIDEAN_SHA256 or hashlib.sha256(inspect.getsource(upcast).encode()).hexdigest() != UPCAST_SHA256 or original.__globals__.get("_euclidean_distances_upcast") is not upcast or importlib.metadata.version("scikit-learn") != "1.9.1":
         raise ValueError("kmeans_upcast_norms_reference_not_supported")
@@ -53,6 +55,7 @@ def compile_upcast_distances(original, norms, finish=None, clamp=None, resident=
             if len(found) != 1:
                 raise ValueError("kmeans_distance_finish_expression_contract_changed")
             matches.append(found[0])
+        finish_statement = matches[0]
         matches[0].value = ast.parse("__wx_distance_finish(safe_sparse_dot(X_chunk, Y_chunk.T, dense_output=True), XX_chunk, YY_chunk" + (", X is Y)" if resident else ")"), mode="eval").body
         class RemoveNormAdditions(ast.NodeTransformer):
             def visit_AugAssign(self, node):
@@ -77,8 +80,25 @@ def compile_upcast_distances(original, norms, finish=None, clamp=None, resident=
         tree.body[0].body.insert(1, ast.parse("__wx_squared_distance_guard(X, Y, True)").body[0])
         tree.body[0].body.insert(2, ast.parse("__wx_resident_batch_guard(X, Y, batch_size)").body[0])
         ast.fix_missing_locations(tree)
+    if resident_norms:
+        expressions = ("if XX is None:\n    XX_chunk = row_norms(X_chunk, squared=True)[:, None]\nelse:\n    XX_chunk = XX[x_slice]", "if YY is None:\n    YY_chunk = row_norms(Y_chunk, squared=True)[None, :]\nelse:\n    YY_chunk = YY[:, y_slice]")
+        matches = []
+        for expression in expressions:
+            target = ast.parse(expression).body[0]
+            found = [node for node in ast.walk(tree) if ast.dump(node) == ast.dump(target)]
+            if len(found) != 1:
+                raise ValueError("kmeans_resident_norms_expression_contract_changed")
+            matches.append(found[0])
+        class RemoveResidentNormConditions(ast.NodeTransformer):
+            def visit_If(self, node):
+                return None if node in matches else self.generic_visit(node)
+        tree = RemoveResidentNormConditions().visit(tree)
+        finish_statement.value = ast.parse("__wx_distance_finish(safe_sparse_dot(X_chunk, Y_chunk.T, dense_output=True), X_chunk, Y_chunk, X is Y)", mode="eval").body
+        tree.body[0].body.insert(3, ast.parse("__wx_no_chunk_norms(XX, YY)").body[0])
+        ast.fix_missing_locations(tree)
     namespace = dict(upcast.__globals__)
     namespace["__wx_squared_distance_guard"] = validate_resident_distance_inputs if resident else validate_squared_distance_inputs
+    namespace["__wx_no_chunk_norms"] = validate_no_chunk_norms
     namespace["__wx_resident_batch_guard"] = validate_resident_batch
     namespace["__wx_distance_finish"] = finish
     namespace["row_norms"] = norms
@@ -106,8 +126,12 @@ def compile_upcast_distances(original, norms, finish=None, clamp=None, resident=
         guard = ast.parse("__wx_squared_distance_guard(X, Y, squared)").body[0]
         outer.body[0].body.insert(1, guard)
         ast.fix_missing_locations(outer)
+    if resident_norms:
+        outer.body[0].body.insert(2, ast.parse("__wx_no_supplied_norms(X_norm_squared, Y_norm_squared)").body[0])
+        ast.fix_missing_locations(outer)
     namespace = dict(original.__globals__)
     namespace["_euclidean_distances_upcast"] = candidate_upcast
+    namespace["__wx_no_supplied_norms"] = validate_no_supplied_norms
     namespace["__wx_distance_clamp"] = clamp
     namespace["__wx_squared_distance_guard"] = validate_resident_distance_inputs if resident else validate_squared_distance_inputs
     exec(compile(outer, "<WhisperX scoped KMeans Euclidean distance>", "exec"), namespace)
@@ -162,8 +186,9 @@ def resident_finish_distances(context, records, products, left_norms, right_norm
 
 
 class ResidentDistancePipeline:
-    def __init__(self, context, finish_records, clamp_records):
+    def __init__(self, context, finish_records, clamp_records, norm_records=None):
         self.context, self.finish_records, self.clamp_records = context, finish_records, clamp_records
+        self.norm_records = norm_records
         self.pending = None
 
     def reset(self):
@@ -172,7 +197,7 @@ class ResidentDistancePipeline:
     def finish(self, products, left, right, diagonal):
         if self.pending is not None:
             raise ValueError("kmeans_resident_distances_previous_result_not_consumed")
-        output = resident_finish_distances(self.context, self.finish_records, products, left, right, diagonal)
+        output = resident_finish_distances(self.context, self.finish_records, products, left, right, diagonal) if self.norm_records is None else resident_norm_finish_distances(self.context, self.finish_records, self.norm_records, products, left, right, diagonal)
         self.pending = (output, diagonal, len(self.finish_records) - 1)
         return output
 
@@ -187,3 +212,27 @@ class ResidentDistancePipeline:
 def validate_resident_batch(X, Y, batch_size):
     if batch_size is not None and (type(batch_size) is not int or batch_size < max(X.shape[0], Y.shape[0])):
         raise ValueError("kmeans_resident_distances_single_chunk_batch_required")
+
+
+def validate_no_chunk_norms(XX, YY):
+    if XX is not None or YY is not None:
+        raise ValueError("kmeans_resident_norms_provided_chunk_norms_not_supported")
+
+
+def validate_no_supplied_norms(*norms):
+    if any(value is not None and (type(value) is not np.ndarray or value.dtype != np.float32) for value in norms):
+        raise ValueError("kmeans_resident_norms_provided_binary64_norms_not_supported")
+
+
+def resident_norm_finish_distances(context, records, norm_records, products, left, right, zero_diagonal):
+    if any(type(value) is not np.ndarray or value.dtype != np.float64 or value.ndim != 2 for value in (products, left, right)):
+        raise ValueError("kmeans_resident_norms_operand_not_supported")
+    staged = tuple(np.ascontiguousarray(value) for value in (products, left, right))
+    result, record = context.kmeans_resident_norms(*staged, zero_diagonal)
+    record = dict(record)
+    record.update({"adapter_scope": "sklearn_kmeans_plusplus_resident_norms_and_distances", "original_euclidean_sha256": EUCLIDEAN_SHA256, "original_upcast_sha256": UPCAST_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "original_row_norms_sha256": ROW_NORMS_SHA256, "host_input_staging_copy_bytes": sum(value.nbytes for value, original in zip(staged, (products, left, right)) if not np.shares_memory(value, original)), "cpu_residuals": ["float32_to_float64_chunk_conversion", "distance_blas_products", "weighted_potentials", "rng_and_seed_control", "lloyd_or_elkan", "host_staging_and_control"]})
+    dispatch = len(records)
+    records.append(record)
+    for role, values in (("X_chunk", left), ("Y_chunk", right)):
+        norm_records.append({"adapter_scope": "sklearn_kmeans_plusplus_float64_distance_chunk_norms", "operand_role": role, "resident_norm_reuse": True, "shared_finish_dispatch_index": dispatch, "rows": values.shape[0], "features": values.shape[1], "original_euclidean_sha256": EUCLIDEAN_SHA256, "original_upcast_sha256": UPCAST_SHA256, "original_row_norms_sha256": ROW_NORMS_SHA256, "gpu_kernels": ["double_kmeans_upcast_norms"], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "host_input_staging_copy_bytes": 0, "cpu_residuals": ["host_staging_and_control"], "quality_certified": False, "full_pipeline_gpu_certified": False})
+    return result

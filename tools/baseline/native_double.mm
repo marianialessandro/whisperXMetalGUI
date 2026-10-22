@@ -502,6 +502,41 @@ public:
         return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
+    DoubleMetrics kmeans_resident_norms(const double* products, const double* left, const double* right, MatrixDimensions d, uint32_t zero_diagonal, float* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(upcast_norms_pipeline_ != nil && resident_distance_pipeline_ != nil, "double_kmeans_resident_norms_kernel_unavailable");
+        require(products != nullptr && left != nullptr && right != nullptr && output != nullptr && d.rows > 0 && d.rows <= 256 && d.columns > 0 && d.columns <= 256 && d.inner > 0 && d.inner <= 1024 && zero_diagonal <= 1 && (zero_diagonal == 0 || d.rows == d.columns), "double_kmeans_resident_norms_shape_or_pointer_invalid");
+        uint64_t count = uint64_t(d.rows) * d.columns;
+        auto validate = [&](const double* values, uint64_t length, uint64_t minimum, uint64_t maximum) {
+            for (uint64_t index = 0; index < length; ++index) {
+                uint64_t magnitude = assignment_input_bits(values, index) & 0x7ffffffffffffffful;
+                require(magnitude == 0 || (magnitude >= minimum && magnitude <= maximum), "double_kmeans_resident_norms_value_domain_invalid");
+            }
+        };
+        validate(products, count, std::bit_cast<uint64_t>(0x1p-500), std::bit_cast<uint64_t>(0x1p500));
+        validate(left, uint64_t(d.rows) * d.inner, std::bit_cast<uint64_t>(0x1p-200), std::bit_cast<uint64_t>(0x1p200));
+        validate(right, uint64_t(d.columns) * d.inner, std::bit_cast<uint64_t>(0x1p-200), std::bit_cast<uint64_t>(0x1p200));
+        auto started = std::chrono::steady_clock::now();
+        uint64_t left_bytes = uint64_t(d.rows) * d.inner * sizeof(double), right_bytes = uint64_t(d.columns) * d.inner * sizeof(double);
+        reserve(input_, left_bytes + right_bytes); reserve(right_, count * sizeof(double)); reserve(terms_, uint64_t(d.rows + d.columns) * sizeof(double)); reserve(output_, count * sizeof(float));
+        std::memcpy(input_.contents, reinterpret_cast<const unsigned char*>(left), left_bytes);
+        std::memcpy(static_cast<unsigned char*>(input_.contents) + left_bytes, reinterpret_cast<const unsigned char*>(right), right_bytes);
+        std::memcpy(right_.contents, reinterpret_cast<const unsigned char*>(products), count * sizeof(double));
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed"); command.label = @"WhisperX experimental KMeans resident norms and finish";
+        PdistDimensions norms = {d.rows + d.columns, d.inner}; DistanceClampDimensions finish = {d.rows, d.columns, zero_diagonal};
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:upcast_norms_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&norms length:sizeof(norms) atIndex:1]; [encoder setBuffer:terms_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(norms.rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(32, upcast_norms_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:resident_distance_pipeline_]; [encoder setBuffer:right_ offset:0 atIndex:0]; [encoder setBytes:&finish length:sizeof(finish) atIndex:1]; [encoder setBuffer:terms_ offset:0 atIndex:2]; [encoder setBuffer:output_ offset:0 atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, resident_distance_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        const uint32_t* result = static_cast<const uint32_t*>(output_.contents);
+        for (uint64_t index = 0; index < count; ++index) require(result[index] < 0x7f800000u, "double_kmeans_resident_norms_output_overflow_or_invalid");
+        std::memcpy(reinterpret_cast<unsigned char*>(output), result, count * sizeof(float));
+        return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
     DoubleMetrics kmeans_upcast_norms(const double* values, PdistDimensions d, double* output) {
         std::lock_guard<std::mutex> guard(mutex_);
         require(upcast_norms_pipeline_ != nil, "double_kmeans_upcast_norms_kernel_unavailable");
@@ -1708,5 +1743,13 @@ extern "C" int wxdouble_kmeans_resident_distances(void* context, const double* p
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->kmeans_distance_finish(products, left_norms, right_norms, {rows, 0, columns}, output, true, zero_diagonal); return 0; }
         catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_kmeans_resident_distances_failed"); return 1; }
+    }
+}
+
+extern "C" int wxdouble_kmeans_resident_norms(void* context, const double* products, const double* left, const double* right, uint32_t rows, uint32_t columns, uint32_t features, uint32_t zero_diagonal, float* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->kmeans_resident_norms(products, left, right, {rows, features, columns}, zero_diagonal, output); return 0; }
+        catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_kmeans_resident_norms_failed"); return 1; }
     }
 }

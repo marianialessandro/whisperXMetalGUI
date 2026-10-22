@@ -89,7 +89,7 @@ def shift_inplace(context, records, values, mean, add, role):
 
 
 @contextlib.contextmanager
-def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False):
+def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False):
     global _ACTIVE
     from sklearn.base import _fit_context
     from sklearn.cluster import KMeans
@@ -120,6 +120,10 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
             raise ValueError("kmeans_resident_distances_configuration_invalid")
         if resident_distances and getattr(context.library, "wxdouble_kmeans_resident_distances", None) is None:
             raise ValueError("double_kmeans_resident_distances_abi_unavailable")
+        if type(resident_norms) is not bool or (resident_norms and not resident_distances):
+            raise ValueError("kmeans_resident_norms_configuration_invalid")
+        if resident_norms and getattr(context.library, "wxdouble_kmeans_resident_norms", None) is None:
+            raise ValueError("double_kmeans_resident_norms_abi_unavailable")
         resident_pipeline = None
         original_tolerance = None
         original_plusplus = None
@@ -182,9 +186,9 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
                 clamp = (lambda values, zero_diagonal: clamp_distances(context, distance_clamp_records, values, zero_diagonal)) if distance_clamp_records is not None else None
                 if resident_distances:
                     from tools.baseline.native_kmeans_upcast_norms import ResidentDistancePipeline
-                    resident_pipeline = ResidentDistancePipeline(context, distance_finish_records, distance_clamp_records)
+                    resident_pipeline = ResidentDistancePipeline(context, distance_finish_records, distance_clamp_records, norm_records=upcast_norm_records if resident_norms else None)
                     finish, clamp = resident_pipeline.finish, resident_pipeline.clamp
-                upcast_distance = compile_upcast_distances(kmeans_module._kmeans_plusplus.__globals__.get("_euclidean_distances"), upcast_norms, finish=finish if distance_finish_records is not None else None, clamp=clamp, resident=resident_distances)
+                upcast_distance = compile_upcast_distances(kmeans_module._kmeans_plusplus.__globals__.get("_euclidean_distances"), upcast_norms, finish=finish if distance_finish_records is not None else None, clamp=clamp, resident=resident_distances, resident_norms=resident_norms)
             original_plusplus = kmeans_module._kmeans_plusplus
             prefix = (lambda weights, distances: weighted_prefix(context, prefix_records, weights, distances)) if prefix_records is not None else None
             minimum = (lambda closest, candidates: candidate_minimum(context, minimum_records, closest, candidates)) if minimum_records is not None else None
