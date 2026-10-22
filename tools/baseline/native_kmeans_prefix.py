@@ -22,7 +22,7 @@ CLIP_SHA256 = "9a0eb9c2e80a635150f89e1397012b8f775d6abfeebb19e569cede3f23a2f155"
 ARGMIN_SHA256 = "7cfd400e4c8292a14b60ec6628a65256c0c3cd130197eee6e2047daa06b84360"
 
 
-def compile_native_prefix(original, prefix, minimum=None, probabilities=None, search=None, best=None, query_scale=None, upcast_distance=None, resident_candidate_distance=None):
+def compile_native_prefix(original, prefix, minimum=None, probabilities=None, search=None, best=None, query_scale=None, upcast_distance=None, resident_candidate_distance=None, potential=None):
     if not inspect.isfunction(original) or original.__closure__ or inspect.unwrap(original) is not original:
         raise ValueError("kmeans_weighted_prefix_reference_not_supported")
     source = inspect.getsource(original)
@@ -85,11 +85,21 @@ def compile_native_prefix(original, prefix, minimum=None, probabilities=None, se
         resident_matches = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.dump(node) == ast.dump(expected_distance)]
         if len(resident_matches) != 1:
             raise ValueError("kmeans_resident_minimum_expression_contract_changed")
+    potential_matches = []
+    if potential is not None:
+        for expression in ("closest_dist_sq @ sample_weight", "distance_to_candidates @ sample_weight.reshape(-1, 1)"):
+            expected_potential = ast.parse(expression, mode="eval").body
+            found = [node for node in ast.walk(tree) if isinstance(node, ast.BinOp) and ast.dump(node) == ast.dump(expected_potential)]
+            if len(found) != 1:
+                raise ValueError("kmeans_potential_expression_contract_changed")
+            potential_matches.append(found[0])
     class ReplacePrefix(ast.NodeTransformer):
         def visit_Expr(self, node):
             return ast.copy_location(ast.Pass(), node) if clip_matches and node is clip_matches[0] else self.generic_visit(node)
 
         def visit_BinOp(self, node):
+            if node in potential_matches:
+                return ast.copy_location(ast.Call(func=ast.Name(id="__wx_native_kmeans_potential", ctx=ast.Load()), args=[node.left, node.right], keywords=[]), node)
             if scale_matches and node is scale_matches[0]:
                 return ast.copy_location(scale_replacement, node)
             return ast.copy_location(probability_replacement, node) if probability_matches and node is probability_matches[0] else self.generic_visit(node)
@@ -115,6 +125,7 @@ def compile_native_prefix(original, prefix, minimum=None, probabilities=None, se
     namespace = dict(original.__globals__)
     if upcast_distance is not None:
         namespace["_euclidean_distances"] = upcast_distance
+    namespace["__wx_native_kmeans_potential"] = potential
     namespace["__wx_resident_candidate_distance"] = resident_candidate_distance
     namespace["__wx_native_kmeans_weighted_prefix"] = prefix
     namespace["__wx_native_kmeans_candidate_minimum"] = minimum
