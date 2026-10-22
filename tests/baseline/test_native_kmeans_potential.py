@@ -148,6 +148,6 @@ class NativeKMeansPotentialTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory:
             binary = Path(directory) / "potential-sanitizers"
-            command = ["xcrun", "clang++", "-std=c++20", "-O1", "-g", "-ffp-contract=off", "-fsanitize=address,undefined", "-fno-omit-frame-pointer", str(root / "tools/baseline/native_kmeans_potential.cpp"), str(root / "tests/fixtures/baseline/native_kmeans_potential_abi.cpp"), "-framework", "Accelerate", "-o", str(binary)]
+            command = ["xcrun", "clang++", "-std=c++20", "-O1", "-g", "-ffp-contract=off", "-fsanitize=address,undefined", "-fno-omit-frame-pointer", str(root / "tools/baseline/native_kmeans_potential.cpp"), str(root / "tools/baseline/native_kmeans_assignment.cpp"), str(root / "tests/fixtures/baseline/native_kmeans_potential_abi.cpp"), "-framework", "Accelerate", "-o", str(binary)]
             subprocess.run(command, capture_output=True, check=True, timeout=60)
             subprocess.run([str(binary)], capture_output=True, check=True, timeout=60)

@@ -18,9 +18,42 @@ extern "C" int wxkmeans_lloyd_labels_equal(const int32_t*, const int32_t*, uint3
 
 extern "C" int wxkmeans_same_clustering(const int32_t*, const int32_t*, uint32_t, uint32_t, uint32_t*, KmeansPotentialMetrics*, char*, uint32_t);
 
+extern "C" int wxkmeans_lloyd_assignment(const float*, const float*, const float*, uint32_t, uint32_t, uint32_t, int32_t*, float*, KmeansPotentialMetrics*, char*, uint32_t);
+
 int main() {
     float left[] = {1, 2, 3, 4}, weights[] = {2, 3}, output[] = {91, 92};
     KmeansPotentialMetrics metrics = {}; char error[128] = {};
+    float samples[] = {1, 2, 3, 4}, centers[] = {1, 2, 3, 4}, norms[] = {5, 25}, distances[] = {91, 92, 93, 94};
+    int32_t assignments[] = {91, 92};
+    assert(wxkmeans_lloyd_assignment(samples, centers, norms, 2, 2, 2, assignments, distances, &metrics, error, sizeof(error)) == 0 && assignments[0] == 0 && assignments[1] == 1 && distances[0] == -5 && distances[1] == 3 && distances[2] == -17 && distances[3] == -25 && metrics.blas_calls == 1);
+    assignments[0] = 91; distances[0] = 91;
+    assert(wxkmeans_lloyd_assignment(nullptr, centers, norms, 2, 2, 2, assignments, distances, &metrics, error, sizeof(error)) != 0 && assignments[0] == 91 && distances[0] == 91);
+    assert(wxkmeans_lloyd_assignment(samples, nullptr, norms, 2, 2, 2, assignments, distances, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_lloyd_assignment(samples, centers, nullptr, 2, 2, 2, assignments, distances, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_lloyd_assignment(samples, centers, norms, 2, 2, 2, nullptr, distances, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_lloyd_assignment(samples, centers, norms, 2, 2, 2, assignments, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_lloyd_assignment(samples, centers, norms, 2, 2, 2, assignments, distances, nullptr, error, sizeof(error)) != 0);
+    assert(wxkmeans_lloyd_assignment(samples, centers, norms, 2, 2, 2, assignments, reinterpret_cast<float*>(assignments), &metrics, error, sizeof(error)) != 0 && assignments[0] == 91);
+    for (uint32_t size : {0u, 257u}) {
+        assert(wxkmeans_lloyd_assignment(samples, centers, norms, size, 2, 2, assignments, distances, &metrics, error, sizeof(error)) != 0);
+        assert(wxkmeans_lloyd_assignment(samples, centers, norms, 2, size, 2, assignments, distances, &metrics, error, sizeof(error)) != 0);
+    }
+    for (uint32_t size : {0u, 1025u}) assert(wxkmeans_lloyd_assignment(samples, centers, norms, 2, 2, size, assignments, distances, &metrics, error, sizeof(error)) != 0);
+    for (float invalid : {0x1p-61f, 0x1p33f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+        samples[3] = invalid;
+        assert(wxkmeans_lloyd_assignment(samples, centers, norms, 2, 2, 2, assignments, distances, &metrics, error, sizeof(error)) != 0 && assignments[0] == 91 && distances[0] == 91);
+    }
+    samples[3] = 4;
+    for (float invalid : {-1.0f, 0x1p-121f, 0x1p75f, std::numeric_limits<float>::quiet_NaN()}) {
+        norms[1] = invalid;
+        assert(wxkmeans_lloyd_assignment(samples, centers, norms, 2, 2, 2, assignments, distances, &metrics, error, sizeof(error)) != 0 && assignments[0] == 91 && distances[0] == 91);
+    }
+    norms[1] = 25;
+    unsigned char assignment_input[sizeof(samples) + 1], assignment_output[sizeof(assignments) + 1];
+    std::memcpy(assignment_input + 1, samples, sizeof(samples));
+    assert(wxkmeans_lloyd_assignment(reinterpret_cast<float*>(assignment_input + 1), centers, norms, 2, 2, 2, reinterpret_cast<int32_t*>(assignment_output + 1), distances, &metrics, error, sizeof(error)) == 0);
+    std::memcpy(assignments, assignment_output + 1, sizeof(assignments)); assert(assignments[0] == 0 && assignments[1] == 1);
+    assert(wxkmeans_lloyd_assignment(samples, centers, norms, 2, 2, 2, assignments, samples, &metrics, error, sizeof(error)) == 0 && samples[0] == -5 && samples[3] == -25);
     assert(wxkmeans_weighted_potentials(left, weights, 2, 2, output, &metrics, error, sizeof(error)) == 0 && output[0] == 8 && output[1] == 18 && metrics.version == 1 && metrics.blas_calls == 1);
     assert(wxkmeans_weighted_potentials(left, weights, 1, 2, output, &metrics, error, sizeof(error)) == 0 && output[0] == 8);
     assert(wxkmeans_weighted_potentials(left, weights, 2, 1, output, &metrics, error, sizeof(error)) == 0 && output[0] == 2 && output[1] == 4 && metrics.blas_calls == 0);

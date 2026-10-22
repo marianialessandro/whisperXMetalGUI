@@ -1,4 +1,4 @@
-"""Bounded CPU Accelerate bridge preserving the pinned NumPy KMeans++ potential dispatch."""
+"""Bounded CPU Accelerate bridge for pinned KMeans++ operations and Lloyd final assignment."""
 
 import argparse
 import ctypes as ct
@@ -25,9 +25,9 @@ def build_library(output):
     source = Path(__file__).with_suffix(".cpp")
     with tempfile.TemporaryDirectory(prefix="kmeans-potential-build-", dir=output.parent) as directory:
         staged = Path(directory) / "potential.dylib"
-        subprocess.run(["xcrun", "clang++", "-std=c++20", "-O1", "-ffp-contract=off", "-dynamiclib", str(source), "-framework", "Accelerate", "-o", str(staged)], check=True, capture_output=True, timeout=60)
+        subprocess.run(["xcrun", "clang++", "-std=c++20", "-O1", "-ffp-contract=off", "-dynamiclib", str(source), str(source.with_name("native_kmeans_assignment.cpp")), "-framework", "Accelerate", "-o", str(staged)], check=True, capture_output=True, timeout=60)
         os.link(staged, output)
-    return {"library_sha256": hashlib.sha256(output.read_bytes()).hexdigest(), "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(), "scope": "experimental_native_cpu_kmeans_potentials"}
+    return {"library_sha256": hashlib.sha256(output.read_bytes()).hexdigest(), "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(), "assignment_source_sha256": hashlib.sha256(source.with_name("native_kmeans_assignment.cpp").read_bytes()).hexdigest(), "scope": "experimental_native_cpu_kmeans_potentials"}
 
 
 class NativeKMeansPotentials:
@@ -54,6 +54,31 @@ class NativeKMeansPotentials:
     def close(self):
         with self.lock:
             self.closed = True
+
+    def lloyd_assignment(self, values, centers, norms):
+        if any(type(value) is not np.ndarray or value.dtype != np.float32 or not value.flags.c_contiguous for value in (values, centers, norms)) or values.ndim != 2 or centers.ndim != 2 or norms.ndim != 1:
+            raise ValueError("kmeans_lloyd_assignment_operand_format_invalid")
+        rows, features = values.shape
+        clusters = centers.shape[0]
+        if not 0 < rows <= 256 or not 0 < clusters <= 256 or not 0 < features <= 1024 or centers.shape[1] != features or norms.shape != (clusters,):
+            raise ValueError("kmeans_lloyd_assignment_shape_invalid")
+        labels, distances = np.empty(rows, np.int32), np.empty((rows, clusters), np.float32)
+        metrics, error = PotentialMetrics(), ct.create_string_buffer(128)
+        started = time.perf_counter_ns()
+        with self.lock:
+            if self.closed:
+                raise ValueError("kmeans_potential_context_closed")
+            try:
+                native = self.library.wxkmeans_lloyd_assignment
+            except AttributeError as failure:
+                raise ValueError("kmeans_lloyd_assignment_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.c_void_p, ct.POINTER(PotentialMetrics), ct.c_char_p, ct.c_uint32]; native.restype = ct.c_int
+            if native(values.ctypes.data, centers.ctypes.data, norms.ctypes.data, rows, clusters, features, labels.ctypes.data, distances.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.blas_calls != 1 or not np.isfinite(distances).all() or (labels < 0).any() or (labels >= clusters).any():
+            raise ValueError("kmeans_lloyd_assignment_native_result_invalid")
+        record = {"scope": "experimental_native_cpu_lloyd_final_assignment", "execution_device": "cpu", "backend": "accelerate_newlapack_lp64_sgemm_first_minimum", "samples": rows, "clusters": clusters, "features": features, "native_blas_calls": 1, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": values.nbytes + centers.nbytes + norms.nbytes, "host_result_bytes": labels.nbytes + distances.nbytes, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_numeric_assignment": False, "lloyd_iteration_replaced": False, "centroid_updates_replaced": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+        return labels, distances, record
 
     def same_clustering(self, labels, previous, clusters):
         if any(type(value) is not np.ndarray or value.dtype != np.int32 or value.ndim != 1 or not value.flags.c_contiguous for value in (labels, previous)):
