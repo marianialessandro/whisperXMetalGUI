@@ -1191,3 +1191,33 @@ kernel void double_kmeans_upcast_norms(device const ulong* values [[buffer(0)]],
     }
     output[row] = add_positive_double(sums[0], sums[1]);
 }
+
+
+// Convert bounded finite binary64 to IEEE binary32 bits with nearest-even rounding, including subnormals and signed underflow.
+uint distance_float_bits(ulong value) {
+    uint sign = uint(value >> 32) & 0x80000000u;
+    ulong magnitude = value & 0x7ffffffffffffffful;
+    if (magnitude == 0) return sign;
+    int exponent = int(magnitude >> 52) - 896;
+    if (exponent >= 255) return sign | 0x7f800000u;
+    ulong significand = (magnitude & 0xffffffffffffful) | (1ul << 52);
+    uint shift = exponent > 0 ? 29 : uint(30 - exponent);
+    if (shift >= 64) return sign;
+    ulong rounded = significand >> shift, remainder = significand & ((1ul << shift) - 1), halfway = 1ul << (shift - 1);
+    if (remainder > halfway || (remainder == halfway && (rounded & 1))) ++rounded;
+    if (exponent <= 0) return sign | uint(rounded);
+    if (rounded == (1ul << 24)) { rounded >>= 1; ++exponent; }
+    if (exponent >= 255) return sign | 0x7f800000u;
+    return sign | (uint(exponent) << 23) | (uint(rounded) & 0x7fffffu);
+}
+
+struct DistanceFinishDimensions { uint rows, columns; };
+
+// Keep the scale and both norm additions separately rounded before the final dtype conversion.
+kernel void double_kmeans_distance_finish(device const ulong* products [[buffer(0)]], constant DistanceFinishDimensions& d [[buffer(1)]], device const ulong* norms [[buffer(2)]], device uint* output [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index >= d.rows * d.columns) return;
+    ulong value = df_mul(products[index], 0xc000000000000000ul);
+    value = matrix_add(value, norms[index / d.columns]);
+    value = matrix_add(value, norms[d.rows + index % d.columns]);
+    output[index] = distance_float_bits(value);
+}

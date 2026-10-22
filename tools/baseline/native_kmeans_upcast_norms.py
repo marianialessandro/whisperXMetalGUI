@@ -27,7 +27,7 @@ def squared_upcast_norms(context, records, values, squared=False):
     return result
 
 
-def compile_upcast_distances(original, norms):
+def compile_upcast_distances(original, norms, finish=None):
     import sklearn.metrics.pairwise as pairwise
 
     upcast = pairwise._euclidean_distances_upcast
@@ -42,7 +42,23 @@ def compile_upcast_distances(original, norms):
             raise ValueError("kmeans_upcast_norms_expression_contract_changed")
     if len(tree.body) != 1 or not isinstance(tree.body[0], ast.FunctionDef) or tree.body[0].decorator_list:
         raise ValueError("kmeans_upcast_norms_function_contract_changed")
+    if finish is not None:
+        expressions = ("d = -2 * safe_sparse_dot(X_chunk, Y_chunk.T, dense_output=True)", "d += XX_chunk", "d += YY_chunk")
+        matches = []
+        for expression in expressions:
+            target = ast.parse(expression).body[0]
+            found = [node for node in ast.walk(tree) if ast.dump(node) == ast.dump(target)]
+            if len(found) != 1:
+                raise ValueError("kmeans_distance_finish_expression_contract_changed")
+            matches.append(found[0])
+        matches[0].value = ast.parse("__wx_distance_finish(safe_sparse_dot(X_chunk, Y_chunk.T, dense_output=True), XX_chunk, YY_chunk)", mode="eval").body
+        class RemoveNormAdditions(ast.NodeTransformer):
+            def visit_AugAssign(self, node):
+                return None if node in matches[1:] else self.generic_visit(node)
+        tree = RemoveNormAdditions().visit(tree)
+        ast.fix_missing_locations(tree)
     namespace = dict(upcast.__globals__)
+    namespace["__wx_distance_finish"] = finish
     namespace["row_norms"] = norms
     exec(compile(tree, "<WhisperX scoped native KMeans upcast norms>", "exec"), namespace)
     candidate_upcast = namespace[upcast.__name__]
@@ -53,3 +69,14 @@ def compile_upcast_distances(original, norms):
     if inspect.signature(candidate_upcast) != inspect.signature(upcast) or inspect.signature(candidate) != inspect.signature(original):
         raise ValueError("kmeans_upcast_norms_signature_changed")
     return candidate
+
+
+def finish_distances(context, records, products, left_norms, right_norms):
+    if any(type(value) is not np.ndarray or value.dtype != np.float64 or value.ndim != 2 for value in (products, left_norms, right_norms)) or left_norms.shape != (products.shape[0], 1) or right_norms.shape != (1, products.shape[1]):
+        raise ValueError("kmeans_distance_finish_operand_not_supported")
+    staged = tuple(np.ascontiguousarray(value) for value in (products, left_norms, right_norms))
+    result, record = context.kmeans_distance_finish(staged[0], staged[1].reshape(-1), staged[2].reshape(-1))
+    record = dict(record)
+    record.update({"adapter_scope": "sklearn_kmeans_plusplus_distance_chunk_finish", "original_euclidean_sha256": EUCLIDEAN_SHA256, "original_upcast_sha256": UPCAST_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "host_input_staging_copy_bytes": sum(value.nbytes for value, original in zip(staged, (products, left_norms, right_norms)) if not np.shares_memory(value, original)), "cpu_residuals": ["float32_to_float64_chunk_conversion", "distance_blas_products", "distance_clamping_and_optional_sqrt_diagonal_fill", "weighted_potentials", "rng_and_seed_control", "lloyd_or_elkan", "host_staging_and_control"]})
+    records.append(record)
+    return result

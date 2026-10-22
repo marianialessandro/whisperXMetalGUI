@@ -89,7 +89,7 @@ def shift_inplace(context, records, values, mean, add, role):
 
 
 @contextlib.contextmanager
-def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None):
+def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None):
     global _ACTIVE
     from sklearn.base import _fit_context
     from sklearn.cluster import KMeans
@@ -108,6 +108,10 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
                 raise ValueError("kmeans_shift_records_required")
             if getattr(context.library, "wxdouble_float_shift", None) is None:
                 raise ValueError("kmeans_shift_abi_unavailable")
+        if distance_finish_records is not None and (upcast_norm_records is None or not isinstance(distance_finish_records, list)):
+            raise ValueError("kmeans_distance_finish_configuration_invalid")
+        if distance_finish_records is not None and getattr(context.library, "wxdouble_kmeans_distance_finish", None) is None:
+            raise ValueError("double_kmeans_distance_finish_abi_unavailable")
         original_tolerance = None
         original_plusplus = None
         if prefix_records is not None or minimum_records is not None or probability_records is not None or search_records is not None or best_records is not None or query_records is not None or upcast_norm_records is not None:
@@ -150,7 +154,15 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
                     raise ValueError("kmeans_upcast_norms_records_required")
                 if getattr(context.library, "wxdouble_kmeans_upcast_norms", None) is None:
                     raise ValueError("double_kmeans_upcast_norms_abi_unavailable")
-                upcast_distance = compile_upcast_distances(kmeans_module._kmeans_plusplus.__globals__.get("_euclidean_distances"), lambda values, squared=False: squared_upcast_norms(context, upcast_norm_records, values, squared))
+                def upcast_norms(values, squared=False):
+                    result = squared_upcast_norms(context, upcast_norm_records, values, squared)
+                    if distance_finish_records is not None:
+                        upcast_norm_records[-1]["cpu_residuals"] = ["distance_clamping_and_optional_sqrt_diagonal_fill" if name == "distance_scale_norm_additions_clamp_and_dtype_conversion" else name for name in upcast_norm_records[-1]["cpu_residuals"]]
+                    return result
+                if distance_finish_records is not None:
+                    from tools.baseline.native_kmeans_upcast_norms import finish_distances
+                finish = (lambda products, left, right: finish_distances(context, distance_finish_records, products, left, right)) if distance_finish_records is not None else None
+                upcast_distance = compile_upcast_distances(kmeans_module._kmeans_plusplus.__globals__.get("_euclidean_distances"), upcast_norms, finish=finish)
             original_plusplus = kmeans_module._kmeans_plusplus
             prefix = (lambda weights, distances: weighted_prefix(context, prefix_records, weights, distances)) if prefix_records is not None else None
             minimum = (lambda closest, candidates: candidate_minimum(context, minimum_records, closest, candidates)) if minimum_records is not None else None

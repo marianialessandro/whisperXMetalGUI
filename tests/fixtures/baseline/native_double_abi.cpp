@@ -48,6 +48,7 @@ extern "C" int wxdouble_ahc_reindex(void*, const int64_t*, uint32_t, int64_t*, D
 extern "C" int wxdouble_fcluster_distance(void*, const double*, uint32_t, double, uint32_t, int32_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_fcluster_reindex(void*, const double*, uint32_t, double, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_positive_fma(void*, const double*, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_kmeans_distance_finish(void*, const double*, const double*, const double*, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_upcast_norms(void*, const double*, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_ahc_resident(void*, const double*, uint32_t, uint32_t, double, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_centroid_linkage(void*, const double*, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
@@ -66,6 +67,35 @@ int main(int argc, char** argv) {
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    double finish_products[] = {1, 2, 3, 4}, finish_left[] = {10, 20}, finish_right[] = {1, 2}; float finish_output[] = {91, 92, 93, 94};
+    assert(wxdouble_kmeans_distance_finish(context, finish_products, finish_left, finish_right, 2, 2, finish_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 1 && finish_output[0] == 9 && finish_output[3] == 14);
+    finish_output[0] = 91;
+    assert(wxdouble_kmeans_distance_finish(nullptr, finish_products, finish_left, finish_right, 2, 2, finish_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_distance_finish(context, nullptr, finish_left, finish_right, 2, 2, finish_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_distance_finish(context, finish_products, nullptr, finish_right, 2, 2, finish_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_distance_finish(context, finish_products, finish_left, nullptr, 2, 2, finish_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_distance_finish(context, finish_products, finish_left, finish_right, 2, 2, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_distance_finish(context, finish_products, finish_left, finish_right, 2, 2, finish_output, nullptr, error, sizeof(error)) != 0);
+    for (uint32_t size : {0u, 4097u}) {
+        assert(wxdouble_kmeans_distance_finish(context, finish_products, finish_left, finish_right, size, 2, finish_output, &metrics, error, sizeof(error)) != 0 && finish_output[0] == 91);
+        assert(wxdouble_kmeans_distance_finish(context, finish_products, finish_left, finish_right, 2, size, finish_output, &metrics, error, sizeof(error)) != 0 && finish_output[0] == 91);
+    }
+    assert(wxdouble_kmeans_distance_finish(context, finish_products, finish_left, finish_right, 1025, 1025, finish_output, &metrics, error, sizeof(error)) != 0 && finish_output[0] == 91);
+    for (double value : {double(INFINITY), double(NAN), 0x1p-501, 0x1p501}) {
+        finish_products[0] = value;
+        assert(wxdouble_kmeans_distance_finish(context, finish_products, finish_left, finish_right, 2, 2, finish_output, &metrics, error, sizeof(error)) != 0 && finish_output[0] == 91);
+    }
+    finish_products[0] = 0x1p130;
+    assert(wxdouble_kmeans_distance_finish(context, finish_products, finish_left, finish_right, 2, 2, finish_output, &metrics, error, sizeof(error)) != 0 && finish_output[0] == 91 && std::string(error) == "double_kmeans_distance_finish_output_overflow");
+    finish_products[0] = 1; finish_left[0] = -1;
+    assert(wxdouble_kmeans_distance_finish(context, finish_products, finish_left, finish_right, 2, 2, finish_output, &metrics, error, sizeof(error)) != 0 && finish_output[0] == 91);
+    finish_left[0] = 10;
+    unsigned char finish_unaligned_input[sizeof(finish_products) + 1], finish_unaligned_output[sizeof(finish_output) + 1];
+    std::memcpy(finish_unaligned_input + 1, finish_products, sizeof(finish_products));
+    assert(wxdouble_kmeans_distance_finish(context, reinterpret_cast<double*>(finish_unaligned_input + 1), finish_left, finish_right, 2, 2, reinterpret_cast<float*>(finish_unaligned_output + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(finish_output, finish_unaligned_output + 1, sizeof(finish_output)); assert(finish_output[0] == 9 && finish_output[3] == 14);
+    assert(wxdouble_kmeans_distance_finish(context, finish_products, finish_left, finish_right, 2, 2, reinterpret_cast<float*>(finish_products), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(finish_output, finish_products, sizeof(finish_output)); assert(finish_output[0] == 9 && finish_output[3] == 14);
     double upcast_values[] = {3, 4, 0, -0.}, upcast_output[] = {91, 92};
     assert(wxdouble_kmeans_upcast_norms(context, upcast_values, 2, 2, upcast_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 1 && upcast_output[0] == 25 && upcast_output[1] == 0 && !std::signbit(upcast_output[1]));
     upcast_output[0] = 91;
@@ -1062,6 +1092,14 @@ int main(int argc, char** argv) {
     assert(wxdouble_ahc_resident(context, upcast_legacy_matrix, 2, 2, 5., ahc_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 4);
     upcast_output[0] = 91;
     assert(wxdouble_kmeans_upcast_norms(context, upcast_legacy_matrix, 2, 2, upcast_output, &metrics, error, sizeof(error)) != 0 && upcast_output[0] == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_distance_finish_shader = shader.substr(0, shader.find("\n// Convert bounded finite binary64"));
+    assert(wxdouble_create(pre_distance_finish_shader.data(), pre_distance_finish_shader.size(), &context, error, sizeof(error)) == 0);
+    double finish_legacy_values[] = {3, 4};
+    assert(wxdouble_kmeans_upcast_norms(context, finish_legacy_values, 1, 2, upcast_output, &metrics, error, sizeof(error)) == 0 && upcast_output[0] == 25);
+    finish_output[0] = 91;
+    assert(wxdouble_kmeans_distance_finish(context, finish_products, finish_left, finish_right, 2, 2, finish_output, &metrics, error, sizeof(error)) != 0 && finish_output[0] == 91);
     wxdouble_destroy(context);
 
 }

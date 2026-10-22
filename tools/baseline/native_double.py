@@ -538,6 +538,29 @@ class NativeDoubleNormalization:
             raise ValueError("double_vbx_one_hot_native_result_invalid")
         return output, {"scope": "experimental_native_binary64_vbx_one_hot", "operation": "initial_one_hot", "rows": rows, "columns": columns, "gpu_kernels": ["double_vbx_one_hot"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": labels.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
+    def kmeans_distance_finish(self, products, left_norms, right_norms):
+        if any(type(value) is not np.ndarray or value.dtype != np.float64 or not value.flags.c_contiguous for value in (products, left_norms, right_norms)) or products.ndim != 2 or left_norms.ndim != 1 or right_norms.ndim != 1:
+            raise ValueError("double_kmeans_distance_finish_input_format_invalid")
+        rows, columns = products.shape
+        if not 0 < rows <= 4096 or not 0 < columns <= 4096 or products.size > 1024 * 1024 or left_norms.shape != (rows,) or right_norms.shape != (columns,):
+            raise ValueError("double_kmeans_distance_finish_shape_invalid")
+        output, metrics, error = np.empty(products.shape, dtype=np.float32), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_kmeans_distance_finish
+            except AttributeError as failure:
+                raise ValueError("double_kmeans_distance_finish_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, products.ctypes.data, left_norms.ctypes.data, right_norms.ctypes.data, rows, columns, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 1 or not np.isfinite(output).all():
+            raise ValueError("double_kmeans_distance_finish_native_result_invalid")
+        return output, {"scope": "experimental_native_kmeans_distance_finish", "rows": rows, "columns": columns, "gpu_kernels": ["double_kmeans_distance_finish"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": products.nbytes + left_norms.nbytes + right_norms.nbytes, "logical_result_readback_bytes": output.nbytes, "host_numeric_scale_or_norm_addition": False, "host_numeric_dtype_conversion": False, "binary32_subnormals_preserved": True, "distance_clamping_replaced": False, "distance_blas_products_replaced": False, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+
     def kmeans_upcast_norms(self, values):
         if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim != 2 or not values.flags.c_contiguous:
             raise ValueError("double_kmeans_upcast_norms_input_format_invalid")
