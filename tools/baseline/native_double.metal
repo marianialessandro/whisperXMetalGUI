@@ -733,10 +733,11 @@ kernel void float_kmeans_weighted_prefix(device const float* products [[buffer(0
 
 struct KmeansMinimumDimensions { uint rows, columns; };
 
-kernel void float_kmeans_candidate_minimum(device const float* candidates [[buffer(0)]], constant KmeansMinimumDimensions& d [[buffer(1)]], device const float* closest [[buffer(2)]], device float* output [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+kernel void float_kmeans_candidate_minimum(device const uint* candidates [[buffer(0)]], constant KmeansMinimumDimensions& d [[buffer(1)]], device const uint* closest [[buffer(2)]], device uint* output [[buffer(3)]], uint index [[thread_position_in_grid]]) {
     if (index >= d.rows * d.columns) return;
-    float a = closest[index % d.columns], b = candidates[index];
-    output[index] = a == 0.0f && b == 0.0f ? as_type<float>(as_type<uint>(a) | as_type<uint>(b)) : (a < b ? a : b);
+    uint a = closest[index % d.columns], b = candidates[index];
+    uint am = a & 0x7fffffffu, bm = b & 0x7fffffffu;
+    output[index] = am == 0 && bm == 0 ? a | b : (am < bm ? a : b);
 }
 
 struct KmeansProbabilityDimensions { uint count; };

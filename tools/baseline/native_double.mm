@@ -502,10 +502,11 @@ public:
         return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
-    DoubleMetrics kmeans_resident_norms(const double* products, const double* left, const double* right, MatrixDimensions d, uint32_t zero_diagonal, float* output) {
+    DoubleMetrics kmeans_resident_norms(const double* products, const double* left, const double* right, MatrixDimensions d, uint32_t zero_diagonal, float* output, const float* closest = nullptr) {
         std::lock_guard<std::mutex> guard(mutex_);
         require(upcast_norms_pipeline_ != nil && resident_distance_pipeline_ != nil, "double_kmeans_resident_norms_kernel_unavailable");
         require(products != nullptr && left != nullptr && right != nullptr && output != nullptr && d.rows > 0 && d.rows <= 256 && d.columns > 0 && d.columns <= 256 && d.inner > 0 && d.inner <= 1024 && zero_diagonal <= 1 && (zero_diagonal == 0 || d.rows == d.columns), "double_kmeans_resident_norms_shape_or_pointer_invalid");
+        require(closest == nullptr || kmeans_minimum_pipeline_ != nil, "double_kmeans_resident_minimum_kernel_unavailable");
         uint64_t count = uint64_t(d.rows) * d.columns;
         auto validate = [&](const double* values, uint64_t length, uint64_t minimum, uint64_t maximum) {
             for (uint64_t index = 0; index < length; ++index) {
@@ -516,13 +517,20 @@ public:
         validate(products, count, std::bit_cast<uint64_t>(0x1p-500), std::bit_cast<uint64_t>(0x1p500));
         validate(left, uint64_t(d.rows) * d.inner, std::bit_cast<uint64_t>(0x1p-200), std::bit_cast<uint64_t>(0x1p200));
         validate(right, uint64_t(d.columns) * d.inner, std::bit_cast<uint64_t>(0x1p-200), std::bit_cast<uint64_t>(0x1p200));
+        if (closest != nullptr) {
+            for (uint32_t index = 0; index < d.columns; ++index) {
+                uint32_t bits; std::memcpy(&bits, reinterpret_cast<const unsigned char*>(closest) + uint64_t(index) * sizeof(float), sizeof(bits));
+                require((bits & 0x7fffffffu) < 0x7f800000u && ((bits >> 31) == 0 || (bits & 0x7fffffffu) == 0), "double_kmeans_resident_minimum_closest_domain_invalid");
+            }
+        }
         auto started = std::chrono::steady_clock::now();
         uint64_t left_bytes = uint64_t(d.rows) * d.inner * sizeof(double), right_bytes = uint64_t(d.columns) * d.inner * sizeof(double);
-        reserve(input_, left_bytes + right_bytes); reserve(right_, count * sizeof(double)); reserve(terms_, uint64_t(d.rows + d.columns) * sizeof(double)); reserve(output_, count * sizeof(float));
+        reserve(input_, left_bytes + right_bytes + (closest == nullptr ? 0 : uint64_t(d.columns) * sizeof(float))); reserve(right_, count * sizeof(double)); reserve(terms_, uint64_t(d.rows + d.columns) * sizeof(double)); reserve(output_, count * sizeof(float) * (closest == nullptr ? 1 : 2));
         std::memcpy(input_.contents, reinterpret_cast<const unsigned char*>(left), left_bytes);
         std::memcpy(static_cast<unsigned char*>(input_.contents) + left_bytes, reinterpret_cast<const unsigned char*>(right), right_bytes);
+        if (closest != nullptr) std::memcpy(static_cast<unsigned char*>(input_.contents) + left_bytes + right_bytes, reinterpret_cast<const unsigned char*>(closest), uint64_t(d.columns) * sizeof(float));
         std::memcpy(right_.contents, reinterpret_cast<const unsigned char*>(products), count * sizeof(double));
-        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed"); command.label = @"WhisperX experimental KMeans resident norms and finish";
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed"); command.label = closest == nullptr ? @"WhisperX experimental KMeans resident norms and finish" : @"WhisperX experimental KMeans resident norms finish and minimum";
         PdistDimensions norms = {d.rows + d.columns, d.inner}; DistanceClampDimensions finish = {d.rows, d.columns, zero_diagonal};
         id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
         [encoder setComputePipelineState:upcast_norms_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&norms length:sizeof(norms) atIndex:1]; [encoder setBuffer:terms_ offset:0 atIndex:2];
@@ -530,11 +538,21 @@ public:
         encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
         [encoder setComputePipelineState:resident_distance_pipeline_]; [encoder setBuffer:right_ offset:0 atIndex:0]; [encoder setBytes:&finish length:sizeof(finish) atIndex:1]; [encoder setBuffer:terms_ offset:0 atIndex:2]; [encoder setBuffer:output_ offset:0 atIndex:3];
         [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, resident_distance_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        if (closest != nullptr) {
+            KmeansMinimumDimensions minimum = {d.rows, d.columns};
+            encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+            [encoder setComputePipelineState:kmeans_minimum_pipeline_]; [encoder setBuffer:output_ offset:0 atIndex:0]; [encoder setBytes:&minimum length:sizeof(minimum) atIndex:1]; [encoder setBuffer:input_ offset:left_bytes + right_bytes atIndex:2]; [encoder setBuffer:output_ offset:count * sizeof(float) atIndex:3];
+            [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, kmeans_minimum_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        }
         [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
         const uint32_t* result = static_cast<const uint32_t*>(output_.contents);
         for (uint64_t index = 0; index < count; ++index) require(result[index] < 0x7f800000u, "double_kmeans_resident_norms_output_overflow_or_invalid");
+        if (closest != nullptr) {
+            result += count;
+            for (uint64_t index = 0; index < count; ++index) require((result[index] & 0x7fffffffu) < 0x7f800000u && ((result[index] >> 31) == 0 || (result[index] & 0x7fffffffu) == 0), "double_kmeans_resident_minimum_output_invalid");
+        }
         std::memcpy(reinterpret_cast<unsigned char*>(output), result, count * sizeof(float));
-        return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+        return {1, uint32_t(closest == nullptr ? 2 : 3), uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
     DoubleMetrics kmeans_upcast_norms(const double* values, PdistDimensions d, double* output) {
@@ -1751,5 +1769,13 @@ extern "C" int wxdouble_kmeans_resident_norms(void* context, const double* produ
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->kmeans_resident_norms(products, left, right, {rows, features, columns}, zero_diagonal, output); return 0; }
         catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_kmeans_resident_norms_failed"); return 1; }
+    }
+}
+
+extern "C" int wxdouble_kmeans_resident_minimum(void* context, const double* products, const double* left, const double* right, const float* closest, uint32_t rows, uint32_t columns, uint32_t features, uint32_t zero_diagonal, float* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr && closest != nullptr, "double_context_metrics_or_closest_missing"); *metrics = static_cast<DoubleContext*>(context)->kmeans_resident_norms(products, left, right, {rows, features, columns}, zero_diagonal, output, closest); return 0; }
+        catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_kmeans_resident_minimum_failed"); return 1; }
     }
 }

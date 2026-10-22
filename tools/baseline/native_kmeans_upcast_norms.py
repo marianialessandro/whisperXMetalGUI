@@ -186,18 +186,24 @@ def resident_finish_distances(context, records, products, left_norms, right_norm
 
 
 class ResidentDistancePipeline:
-    def __init__(self, context, finish_records, clamp_records, norm_records=None):
+    def __init__(self, context, finish_records, clamp_records, norm_records=None, minimum_records=None):
         self.context, self.finish_records, self.clamp_records = context, finish_records, clamp_records
         self.norm_records = norm_records
+        self.minimum_records = minimum_records
+        self.closest = None
+        self.pending_minimum = None
+        self.distance = None
         self.pending = None
 
     def reset(self):
         self.pending = None
+        self.closest = None
+        self.pending_minimum = None
 
     def finish(self, products, left, right, diagonal):
         if self.pending is not None:
             raise ValueError("kmeans_resident_distances_previous_result_not_consumed")
-        output = resident_finish_distances(self.context, self.finish_records, products, left, right, diagonal) if self.norm_records is None else resident_norm_finish_distances(self.context, self.finish_records, self.norm_records, products, left, right, diagonal)
+        output = resident_finish_distances(self.context, self.finish_records, products, left, right, diagonal) if self.norm_records is None else resident_norm_finish_distances(self.context, self.finish_records, self.norm_records, products, left, right, diagonal, closest=self.closest)
         self.pending = (output, diagonal, len(self.finish_records) - 1)
         return output
 
@@ -206,7 +212,35 @@ class ResidentDistancePipeline:
         if pending is None or values is not pending[0] or diagonal is not pending[1]:
             raise ValueError("kmeans_resident_distances_result_reuse_mismatch")
         self.clamp_records.append({"adapter_scope": "sklearn_kmeans_plusplus_squared_distance_clamp", "original_euclidean_sha256": EUCLIDEAN_SHA256, "resident_clamp_reuse": True, "shared_finish_dispatch_index": pending[2], "zero_diagonal": diagonal, "squared_only": True, "rows": values.shape[0], "columns": values.shape[1], "gpu_kernels": ["double_kmeans_resident_distance_finish"], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "host_input_staging_copy_bytes": 0, "cpu_residuals": ["host_staging_and_control"], "quality_certified": False, "full_pipeline_gpu_certified": False})
+        if self.closest is not None:
+            self.pending_minimum = (self.closest, values, pending[2])
         return values
+
+    def candidate_distance(self, closest, *args, **kwargs):
+        if self.minimum_records is None or self.norm_records is None or self.distance is None or self.closest is not None or self.pending is not None or self.pending_minimum is not None:
+            raise ValueError("kmeans_resident_minimum_state_invalid")
+        if type(closest) is not np.ndarray or closest.dtype != np.float32 or closest.ndim not in (1, 2) or (closest.ndim == 2 and closest.shape[0] != 1):
+            raise ValueError("kmeans_resident_minimum_closest_not_supported")
+        self.closest = closest
+        try:
+            result = self.distance(*args, **kwargs)
+            if self.pending_minimum is None or self.pending_minimum[1] is not result or self.pending is not None:
+                raise ValueError("kmeans_resident_minimum_distance_not_consumed")
+            return result
+        except BaseException:
+            self.reset()
+            raise
+        finally:
+            self.closest = None
+
+    def minimum(self, closest, candidates):
+        if self.pending_minimum is None or closest is not self.pending_minimum[0] or candidates is not self.pending_minimum[1]:
+            raise ValueError("kmeans_resident_minimum_result_identity_invalid")
+        from tools.baseline.native_kmeans_prefix import PLUSPLUS_SHA256
+        dispatch = self.pending_minimum[2]
+        self.minimum_records.append({"adapter_scope": "sklearn_dense_kmeans_plusplus_inplace_candidate_minimum", "resident_minimum_reuse": True, "original_plusplus_sha256": PLUSPLUS_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "shared_finish_dispatch_index": dispatch, "rows": candidates.shape[0], "columns": candidates.shape[1], "gpu_kernels": ["float_kmeans_candidate_minimum"], "command_buffers_per_run": 0, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "host_inplace_copy_bytes": 0, "computation_gpu_seconds": None, "quality_certified": False, "full_pipeline_gpu_certified": False})
+        self.pending_minimum = None
+        return candidates
 
 
 def validate_resident_batch(X, Y, batch_size):
@@ -224,13 +258,16 @@ def validate_no_supplied_norms(*norms):
         raise ValueError("kmeans_resident_norms_provided_binary64_norms_not_supported")
 
 
-def resident_norm_finish_distances(context, records, norm_records, products, left, right, zero_diagonal):
+def resident_norm_finish_distances(context, records, norm_records, products, left, right, zero_diagonal, closest=None):
     if any(type(value) is not np.ndarray or value.dtype != np.float64 or value.ndim != 2 for value in (products, left, right)):
         raise ValueError("kmeans_resident_norms_operand_not_supported")
     staged = tuple(np.ascontiguousarray(value) for value in (products, left, right))
-    result, record = context.kmeans_resident_norms(*staged, zero_diagonal)
+    staged_closest = np.ascontiguousarray(closest) if closest is not None else None
+    result, record = context.kmeans_resident_norms(*staged, zero_diagonal) if closest is None else context.kmeans_resident_minimum(*staged, staged_closest, zero_diagonal)
     record = dict(record)
     record.update({"adapter_scope": "sklearn_kmeans_plusplus_resident_norms_and_distances", "original_euclidean_sha256": EUCLIDEAN_SHA256, "original_upcast_sha256": UPCAST_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "original_row_norms_sha256": ROW_NORMS_SHA256, "host_input_staging_copy_bytes": sum(value.nbytes for value, original in zip(staged, (products, left, right)) if not np.shares_memory(value, original)), "cpu_residuals": ["float32_to_float64_chunk_conversion", "distance_blas_products", "weighted_potentials", "rng_and_seed_control", "lloyd_or_elkan", "host_staging_and_control"]})
+    if closest is not None and not np.shares_memory(staged_closest, closest):
+        record["host_input_staging_copy_bytes"] += staged_closest.nbytes
     dispatch = len(records)
     records.append(record)
     for role, values in (("X_chunk", left), ("Y_chunk", right)):

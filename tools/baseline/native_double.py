@@ -602,28 +602,46 @@ class NativeDoubleNormalization:
         return output, record
 
     def kmeans_resident_norms(self, products, left, right, zero_diagonal=False):
+        return self._kmeans_resident_norms(products, left, right, zero_diagonal)
+
+    def kmeans_resident_minimum(self, products, left, right, closest, zero_diagonal=False):
+        if type(closest) is not np.ndarray or closest.dtype != np.float32 or closest.ndim not in (1, 2) or not closest.flags.c_contiguous or closest.size == 0 or (closest.ndim == 2 and closest.shape[0] != 1):
+            raise ValueError("double_kmeans_resident_minimum_closest_format_invalid")
+        return self._kmeans_resident_norms(products, left, right, zero_diagonal, closest=closest)
+
+    def _kmeans_resident_norms(self, products, left, right, zero_diagonal, closest=None):
         if any(type(value) is not np.ndarray or value.dtype != np.float64 or value.ndim != 2 or not value.flags.c_contiguous for value in (products, left, right)):
             raise ValueError("double_kmeans_resident_norms_input_format_invalid")
         rows, columns = products.shape
         features = left.shape[1]
         if not 0 < rows <= 256 or not 0 < columns <= 256 or not 0 < features <= 1024 or left.shape != (rows, features) or right.shape != (columns, features) or type(zero_diagonal) is not bool or (zero_diagonal and rows != columns):
             raise ValueError("double_kmeans_resident_norms_shape_or_policy_invalid")
+        if closest is not None and closest.size != columns:
+            raise ValueError("double_kmeans_resident_minimum_closest_shape_invalid")
         output, metrics, error = np.empty(products.shape, dtype=np.float32), Metrics(), ct.create_string_buffer(128)
         with self.lock:
             if not self.context:
                 raise ValueError("double_context_closed")
             try:
-                native = self.library.wxdouble_kmeans_resident_norms
+                native = self.library.wxdouble_kmeans_resident_norms if closest is None else self.library.wxdouble_kmeans_resident_minimum
             except AttributeError as failure:
-                raise ValueError("double_kmeans_resident_norms_abi_unavailable") from failure
-            native.argtypes = [ct.c_void_p] * 4 + [ct.c_uint32] * 4 + [ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+                raise ValueError("double_kmeans_resident_norms_abi_unavailable" if closest is None else "double_kmeans_resident_minimum_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p] * (4 if closest is None else 5) + [ct.c_uint32] * 4 + [ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
             native.restype = ct.c_int
             started = time.perf_counter_ns()
-            if native(self.context, products.ctypes.data, left.ctypes.data, right.ctypes.data, rows, columns, features, int(zero_diagonal), output.ctypes.data, ct.byref(metrics), error, len(error)):
+            arguments = [self.context, products.ctypes.data, left.ctypes.data, right.ctypes.data]
+            if closest is not None:
+                arguments.append(closest.ctypes.data)
+            if native(*arguments, rows, columns, features, int(zero_diagonal), output.ctypes.data, ct.byref(metrics), error, len(error)):
                 raise ValueError(error.value.decode("ascii"))
-        if metrics.version != 1 or metrics.kernels != 2 or np.any(output.view(np.uint32) >= 0x7f800000):
+        if metrics.version != 1 or metrics.kernels != (2 if closest is None else 3) or np.any((output.view(np.uint32) & 0x7fffffff) >= 0x7f800000) or np.any(output < 0):
             raise ValueError("double_kmeans_resident_norms_native_result_invalid")
-        return output, {"scope": "experimental_native_kmeans_resident_norms_and_distances", "rows": rows, "columns": columns, "features": features, "resident_clamp": True, "resident_norms": True, "zero_diagonal": zero_diagonal, "squared_only": True, "gpu_kernels": ["double_kmeans_upcast_norms", "double_kmeans_resident_distance_finish"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": products.nbytes + left.nbytes + right.nbytes, "logical_result_readback_bytes": output.nbytes, "intermediate_norm_readback_bytes": 0, "intermediate_distance_readback_bytes": 0, "host_numeric_row_norms": False, "host_numeric_scale_or_norm_addition": False, "host_numeric_dtype_conversion": False, "host_numeric_clamping": False, "host_diagonal_fill": False, "distance_clamping_replaced": True, "distance_blas_products_replaced": False, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+        record = {"scope": "experimental_native_kmeans_resident_norms_and_distances", "rows": rows, "columns": columns, "features": features, "resident_clamp": True, "resident_norms": True, "zero_diagonal": zero_diagonal, "squared_only": True, "gpu_kernels": ["double_kmeans_upcast_norms", "double_kmeans_resident_distance_finish"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": products.nbytes + left.nbytes + right.nbytes, "logical_result_readback_bytes": output.nbytes, "intermediate_norm_readback_bytes": 0, "intermediate_distance_readback_bytes": 0, "host_numeric_row_norms": False, "host_numeric_scale_or_norm_addition": False, "host_numeric_dtype_conversion": False, "host_numeric_clamping": False, "host_diagonal_fill": False, "distance_clamping_replaced": True, "distance_blas_products_replaced": False, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+        if closest is not None:
+            record.update({"scope": "experimental_native_kmeans_resident_norms_distances_minimum", "resident_minimum": True, "intermediate_candidate_readback_bytes": 0})
+            record["gpu_kernels"].append("float_kmeans_candidate_minimum")
+            record["logical_input_upload_bytes"] += closest.nbytes
+        return output, record
 
     def kmeans_upcast_norms(self, values):
         if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim != 2 or not values.flags.c_contiguous:

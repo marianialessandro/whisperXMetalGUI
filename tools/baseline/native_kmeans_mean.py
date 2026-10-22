@@ -89,7 +89,7 @@ def shift_inplace(context, records, values, mean, add, role):
 
 
 @contextlib.contextmanager
-def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False):
+def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False):
     global _ACTIVE
     from sklearn.base import _fit_context
     from sklearn.cluster import KMeans
@@ -124,6 +124,10 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
             raise ValueError("kmeans_resident_norms_configuration_invalid")
         if resident_norms and getattr(context.library, "wxdouble_kmeans_resident_norms", None) is None:
             raise ValueError("double_kmeans_resident_norms_abi_unavailable")
+        if type(resident_minimum) is not bool or (resident_minimum and (not resident_norms or minimum_records is None)):
+            raise ValueError("kmeans_resident_minimum_configuration_invalid")
+        if resident_minimum and getattr(context.library, "wxdouble_kmeans_resident_minimum", None) is None:
+            raise ValueError("double_kmeans_resident_minimum_abi_unavailable")
         resident_pipeline = None
         original_tolerance = None
         original_plusplus = None
@@ -186,17 +190,21 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
                 clamp = (lambda values, zero_diagonal: clamp_distances(context, distance_clamp_records, values, zero_diagonal)) if distance_clamp_records is not None else None
                 if resident_distances:
                     from tools.baseline.native_kmeans_upcast_norms import ResidentDistancePipeline
-                    resident_pipeline = ResidentDistancePipeline(context, distance_finish_records, distance_clamp_records, norm_records=upcast_norm_records if resident_norms else None)
+                    resident_pipeline = ResidentDistancePipeline(context, distance_finish_records, distance_clamp_records, norm_records=upcast_norm_records if resident_norms else None, minimum_records=minimum_records if resident_minimum else None)
                     finish, clamp = resident_pipeline.finish, resident_pipeline.clamp
                 upcast_distance = compile_upcast_distances(kmeans_module._kmeans_plusplus.__globals__.get("_euclidean_distances"), upcast_norms, finish=finish if distance_finish_records is not None else None, clamp=clamp, resident=resident_distances, resident_norms=resident_norms)
+            if resident_minimum:
+                resident_pipeline.distance = upcast_distance
             original_plusplus = kmeans_module._kmeans_plusplus
             prefix = (lambda weights, distances: weighted_prefix(context, prefix_records, weights, distances)) if prefix_records is not None else None
             minimum = (lambda closest, candidates: candidate_minimum(context, minimum_records, closest, candidates)) if minimum_records is not None else None
+            if resident_minimum:
+                minimum = resident_pipeline.minimum
             probabilities = (lambda weights: seed_probabilities(context, probability_records, weights)) if probability_records is not None else None
             search = (lambda cdf, queries: candidate_search(context, search_records, cdf, queries)) if search_records is not None else None
             best = (lambda potentials: best_candidate(context, best_records, potentials)) if best_records is not None else None
             query_scale = (lambda random_values, potential: scale_queries(context, query_records, random_values, potential)) if query_records is not None else None
-            candidate_plusplus = compile_native_prefix(original_plusplus, prefix, minimum=minimum, probabilities=probabilities, search=search, best=best, query_scale=query_scale, upcast_distance=upcast_distance if upcast_norm_records is not None else None)
+            candidate_plusplus = compile_native_prefix(original_plusplus, prefix, minimum=minimum, probabilities=probabilities, search=search, best=best, query_scale=query_scale, upcast_distance=upcast_distance if upcast_norm_records is not None else None, resident_candidate_distance=resident_pipeline.candidate_distance if resident_minimum else None)
         if tolerance_records is not None:
             import sklearn.cluster._kmeans as kmeans_module
             from tools.baseline.native_kmeans_tolerance import compile_native_tolerance, tolerance_value

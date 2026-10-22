@@ -22,7 +22,7 @@ CLIP_SHA256 = "9a0eb9c2e80a635150f89e1397012b8f775d6abfeebb19e569cede3f23a2f155"
 ARGMIN_SHA256 = "7cfd400e4c8292a14b60ec6628a65256c0c3cd130197eee6e2047daa06b84360"
 
 
-def compile_native_prefix(original, prefix, minimum=None, probabilities=None, search=None, best=None, query_scale=None, upcast_distance=None):
+def compile_native_prefix(original, prefix, minimum=None, probabilities=None, search=None, best=None, query_scale=None, upcast_distance=None, resident_candidate_distance=None):
     if not inspect.isfunction(original) or original.__closure__ or inspect.unwrap(original) is not original:
         raise ValueError("kmeans_weighted_prefix_reference_not_supported")
     source = inspect.getsource(original)
@@ -77,6 +77,14 @@ def compile_native_prefix(original, prefix, minimum=None, probabilities=None, se
         best_matches = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.dump(node) == ast.dump(expected_best)]
         if len(best_matches) != 1:
             raise ValueError("kmeans_best_candidate_expression_contract_changed")
+    resident_matches = []
+    if resident_candidate_distance is not None:
+        if minimum is None or upcast_distance is None:
+            raise ValueError("kmeans_resident_minimum_configuration_invalid")
+        expected_distance = ast.parse("_euclidean_distances(X[candidate_ids], X, Y_norm_squared=x_squared_norms, squared=True)", mode="eval").body
+        resident_matches = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.dump(node) == ast.dump(expected_distance)]
+        if len(resident_matches) != 1:
+            raise ValueError("kmeans_resident_minimum_expression_contract_changed")
     class ReplacePrefix(ast.NodeTransformer):
         def visit_Expr(self, node):
             return ast.copy_location(ast.Pass(), node) if clip_matches and node is clip_matches[0] else self.generic_visit(node)
@@ -87,6 +95,10 @@ def compile_native_prefix(original, prefix, minimum=None, probabilities=None, se
             return ast.copy_location(probability_replacement, node) if probability_matches and node is probability_matches[0] else self.generic_visit(node)
 
         def visit_Call(self, node):
+            if resident_matches and node is resident_matches[0]:
+                node.func = ast.Name(id="__wx_resident_candidate_distance", ctx=ast.Load())
+                node.args.insert(0, ast.Name(id="closest_dist_sq", ctx=ast.Load()))
+                return node
             if best_matches and node is best_matches[0]:
                 node.func = ast.Name(id="__wx_native_kmeans_best_candidate", ctx=ast.Load())
                 return node
@@ -103,6 +115,7 @@ def compile_native_prefix(original, prefix, minimum=None, probabilities=None, se
     namespace = dict(original.__globals__)
     if upcast_distance is not None:
         namespace["_euclidean_distances"] = upcast_distance
+    namespace["__wx_resident_candidate_distance"] = resident_candidate_distance
     namespace["__wx_native_kmeans_weighted_prefix"] = prefix
     namespace["__wx_native_kmeans_candidate_minimum"] = minimum
     namespace["__wx_native_kmeans_seed_probabilities"] = probabilities
