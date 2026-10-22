@@ -4,6 +4,7 @@ import argparse
 import ctypes as ct
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -536,6 +537,51 @@ class NativeDoubleNormalization:
         if metrics.version != 1 or metrics.kernels != 1 or not np.isfinite(output).all():
             raise ValueError("double_vbx_one_hot_native_result_invalid")
         return output, {"scope": "experimental_native_binary64_vbx_one_hot", "operation": "initial_one_hot", "rows": rows, "columns": columns, "gpu_kernels": ["double_vbx_one_hot"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": labels.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
+
+    def centroid_linkage(self, distances):
+        if type(distances) is not np.ndarray or distances.dtype != np.float64 or distances.ndim != 1 or not distances.flags.c_contiguous:
+            raise ValueError("double_centroid_linkage_input_format_invalid")
+        leaves = (1 + math.isqrt(1 + 8 * distances.size)) // 2
+        if not 2 <= leaves <= 256 or leaves * (leaves - 1) // 2 != distances.size:
+            raise ValueError("double_centroid_linkage_shape_invalid")
+        output, metrics, error = np.empty((leaves - 1, 4), dtype=np.float64), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_centroid_linkage
+            except AttributeError as failure:
+                raise ValueError("double_centroid_linkage_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, distances.ctypes.data, leaves, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 1 or not np.isfinite(output).all():
+            raise ValueError("double_centroid_linkage_native_result_invalid")
+        return output, {"scope": "experimental_native_centroid_dendrogram", "leaves": leaves, "pairs": distances.size, "method": "centroid", "algorithm": "pinned_scipy_fast_linkage_heap", "arithmetic": "binary64_emulation_with_pinned_positive_fma", "gpu_kernels": ["double_centroid_linkage"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": distances.nbytes, "logical_result_readback_bytes": output.nbytes + 4, "logical_status_readback_bytes": 4, "private_array_element_bytes": 9216, "physical_copy_bytes": None, "host_numeric_merge_search": False, "host_numeric_distance_update": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+
+    def positive_fma(self, values):
+        if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim != 2 or not values.flags.c_contiguous:
+            raise ValueError("double_positive_fma_input_format_invalid")
+        if values.shape[1] != 3 or not 0 < len(values) <= 4096:
+            raise ValueError("double_positive_fma_shape_invalid")
+        output, metrics, error = np.empty(len(values), dtype=np.float64), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_positive_fma
+            except AttributeError as failure:
+                raise ValueError("double_positive_fma_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, values.ctypes.data, len(values), output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 1 or not np.isfinite(output).all() or np.any(output < 0):
+            raise ValueError("double_positive_fma_native_result_invalid")
+        return output, {"scope": "experimental_native_positive_binary64_fma", "count": len(values), "rounding": "single_nearest_even_after_exact_product_and_addend", "gpu_kernels": ["double_positive_fma"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
     def fcluster_reindex(self, tree, cutoff):
         if type(tree) is not np.ndarray or tree.dtype != np.float64 or tree.ndim != 2 or not tree.flags.c_contiguous:

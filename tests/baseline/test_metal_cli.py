@@ -13,6 +13,48 @@ from tools.metal_cli import main, native_alignment
 
 
 class MetalCLITests(unittest.TestCase):
+    def test_ahc_residual_reporting_requires_all_numeric_stages_and_success(self):
+        from tools.metal_cli import reconcile_ahc_residuals
+        stages = ("embedding_normalization_observed", "ahc_euclidean_distances_observed", "ahc_centroid_linkage_observed", "ahc_distance_cut_observed", "ahc_label_reindex_observed")
+        for missing in (None, *stages, "failure"):
+            report = {stage: stage != missing for stage in stages}
+            report["status"] = "failed" if missing == "failure" else "completed_with_native_ctc"
+            records = {"stage": [{"cpu_residuals": ["ahc", "optional_kmeans", "host_staging_and_control"]}], "empty": []}
+            reconcile_ahc_residuals(report, records)
+            self.assertEqual(report["ahc_numeric_stages_native_observed"], missing is None)
+            self.assertEqual("ahc" in records["stage"][0]["cpu_residuals"], missing is not None)
+            self.assertIn("optional_kmeans", records["stage"][0]["cpu_residuals"])
+            self.assertNotIn("full_pipeline_gpu_certified", report)
+
+    def test_ahc_centroid_linkage_requires_native_distances(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stderr(io.StringIO()):
+            report = Path(directory) / "report.json"
+            with self.assertRaises(SystemExit) as caught:
+                main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--ahc-centroid-linkage"])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertFalse(report.exists())
+
+    def test_ahc_centroid_linkage_capability_failure_restores_scope_and_privacy(self):
+        from pyannote.audio.pipelines.clustering import VBxClustering
+        original = VBxClustering.__call__
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with patch("tools.baseline.mps_storage_probe.MPSCTC") as native, patch("tools.baseline.native_double.NativeDoubleNormalization") as double:
+                native.return_value.__enter__.return_value.identity = {}
+                native.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.identity = {}
+                double.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.library = SimpleNamespace()
+                with self.assertRaisesRegex(ValueError, "centroid_linkage_abi_unavailable"):
+                    main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--plda-normalization-library", "unused.dylib", "--plda-normalization-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--ahc-euclidean-distances", "--ahc-centroid-linkage", "--hf_token", "private-secret"])
+            data = json.loads(report.read_text())
+            self.assertTrue(data["ahc_centroid_linkage_requested"])
+            self.assertFalse(data["ahc_centroid_linkage_observed"])
+            self.assertEqual(data["native_ahc_centroid_linkage_calls"], 0)
+            self.assertIs(VBxClustering.__call__, original)
+            self.assertNotIn("private.wav", report.read_text())
+            self.assertNotIn("private-secret", report.read_text())
+
     def test_ahc_resident_cut_requires_both_standalone_flags(self):
         for extra in ([], ["--ahc-distance-cut"], ["--ahc-label-reindex"]):
             with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stderr(io.StringIO()):

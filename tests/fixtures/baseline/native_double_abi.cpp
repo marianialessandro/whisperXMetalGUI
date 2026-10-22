@@ -47,6 +47,8 @@ extern "C" int wxdouble_pdist_euclidean(void*, const double*, uint32_t, uint32_t
 extern "C" int wxdouble_ahc_reindex(void*, const int64_t*, uint32_t, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_fcluster_distance(void*, const double*, uint32_t, double, uint32_t, int32_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_fcluster_reindex(void*, const double*, uint32_t, double, int64_t*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_positive_fma(void*, const double*, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_centroid_linkage(void*, const double*, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
 
 int main(int argc, char** argv) {
@@ -62,6 +64,47 @@ int main(int argc, char** argv) {
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    double fma_values[] = {1. + 0x1p-52, 1. + 0x1p-52, 0x1p-53}, fma_output[] = {91};
+    assert(wxdouble_positive_fma(context, fma_values, 1, fma_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 1 && fma_output[0] == std::fma(fma_values[0], fma_values[1], fma_values[2]));
+    fma_output[0] = 91;
+    assert(wxdouble_positive_fma(nullptr, fma_values, 1, fma_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_positive_fma(context, nullptr, 1, fma_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_positive_fma(context, fma_values, 1, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_positive_fma(context, fma_values, 1, fma_output, nullptr, error, sizeof(error)) != 0);
+    for (uint32_t count : {0u, 4097u}) assert(wxdouble_positive_fma(context, fma_values, count, fma_output, &metrics, error, sizeof(error)) != 0 && fma_output[0] == 91);
+    for (double invalid : {-0., -1., 0x1p-201, 0x1p201, std::numeric_limits<double>::quiet_NaN()}) {
+        fma_values[0] = invalid;
+        assert(wxdouble_positive_fma(context, fma_values, 1, fma_output, &metrics, error, sizeof(error)) != 0 && fma_output[0] == 91);
+    }
+    fma_values[0] = 1. + 0x1p-52;
+    alignas(double) unsigned char fma_unaligned_input[sizeof(fma_values) + 1], fma_unaligned_output[sizeof(fma_output) + 1];
+    std::memcpy(fma_unaligned_input + 1, fma_values, sizeof(fma_values));
+    assert(wxdouble_positive_fma(context, reinterpret_cast<double*>(fma_unaligned_input + 1), 1, reinterpret_cast<double*>(fma_unaligned_output + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(fma_output, fma_unaligned_output + 1, sizeof(fma_output));
+    assert(fma_output[0] == std::fma(fma_values[0], fma_values[1], fma_values[2]));
+    double fma_expected = fma_output[0];
+    assert(wxdouble_positive_fma(context, fma_values, 1, fma_values, &metrics, error, sizeof(error)) == 0 && fma_values[0] == fma_expected);
+
+    double linkage_values[12] = {1, 1, 1}, linkage_output[8] = {91, 92, 93, 94, 95, 96, 97, 98};
+    assert(wxdouble_centroid_linkage(context, linkage_values, 3, linkage_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 1 && linkage_output[0] == 0 && linkage_output[1] == 1 && linkage_output[2] == 1 && linkage_output[3] == 2 && linkage_output[4] == 2 && linkage_output[5] == 3 && linkage_output[6] == std::sqrt(.75) && linkage_output[7] == 3);
+    linkage_output[0] = 91;
+    assert(wxdouble_centroid_linkage(nullptr, linkage_values, 3, linkage_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_centroid_linkage(context, nullptr, 3, linkage_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_centroid_linkage(context, linkage_values, 3, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_centroid_linkage(context, linkage_values, 3, linkage_output, nullptr, error, sizeof(error)) != 0);
+    for (uint32_t count : {0u, 1u, 257u}) assert(wxdouble_centroid_linkage(context, linkage_values, count, linkage_output, &metrics, error, sizeof(error)) != 0 && linkage_output[0] == 91);
+    for (double invalid : {-1., 0x1p-33, 0x1p33, std::numeric_limits<double>::quiet_NaN()}) {
+        linkage_values[0] = invalid;
+        assert(wxdouble_centroid_linkage(context, linkage_values, 3, linkage_output, &metrics, error, sizeof(error)) != 0 && linkage_output[0] == 91);
+    }
+    linkage_values[0] = 1;
+    alignas(double) unsigned char linkage_unaligned_input[sizeof(linkage_values) + 1], linkage_unaligned_output[sizeof(linkage_output) + 1];
+    std::memcpy(linkage_unaligned_input + 1, linkage_values, sizeof(linkage_values));
+    assert(wxdouble_centroid_linkage(context, reinterpret_cast<double*>(linkage_unaligned_input + 1), 3, reinterpret_cast<double*>(linkage_unaligned_output + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(linkage_output, linkage_unaligned_output + 1, sizeof(linkage_output));
+    assert(linkage_output[0] == 0 && linkage_output[6] == std::sqrt(.75));
+    assert(wxdouble_centroid_linkage(context, linkage_values, 3, linkage_values, &metrics, error, sizeof(error)) == 0 && linkage_values[0] == 0 && linkage_values[6] == std::sqrt(.75));
+
     double resident_cut_tree[] = {0, 1, 2, 2, 2, 3, 1, 3};
     int64_t resident_cut_output[] = {91, 92, 93};
     assert(wxdouble_fcluster_reindex(context, resident_cut_tree, 3, 1., resident_cut_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 2 && resident_cut_output[0] == 0 && resident_cut_output[1] == 1 && resident_cut_output[2] == 2);
@@ -943,6 +986,21 @@ int main(int argc, char** argv) {
     assert(wxdouble_fcluster_distance(context, resident_cut_legacy_tree, 2, 1., 0, cut_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 1 && cut_output[0] == 1);
     resident_cut_output[0] = 91;
     assert(wxdouble_fcluster_reindex(context, resident_cut_legacy_tree, 2, 1., resident_cut_output, &metrics, error, sizeof(error)) != 0 && resident_cut_output[0] == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_fma_shader = shader.substr(0, shader.find("\nstruct WidePositive"));
+    assert(wxdouble_create(pre_fma_shader.data(), pre_fma_shader.size(), &context, error, sizeof(error)) == 0);
+    assert(wxdouble_fcluster_reindex(context, resident_cut_legacy_tree, 2, 1., resident_cut_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 2);
+    fma_output[0] = 91; linkage_output[0] = 91;
+    assert(wxdouble_positive_fma(context, fma_values, 1, fma_output, &metrics, error, sizeof(error)) != 0 && fma_output[0] == 91);
+    assert(wxdouble_centroid_linkage(context, linkage_values, 3, linkage_output, &metrics, error, sizeof(error)) != 0 && linkage_output[0] == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_linkage_shader = shader.substr(0, shader.find("\nstruct CentroidLinkageDimensions"));
+    assert(wxdouble_create(pre_linkage_shader.data(), pre_linkage_shader.size(), &context, error, sizeof(error)) == 0);
+    fma_values[0] = 1; fma_values[1] = 2; fma_values[2] = 3;
+    assert(wxdouble_positive_fma(context, fma_values, 1, fma_output, &metrics, error, sizeof(error)) == 0 && fma_output[0] == 5);
+    assert(wxdouble_centroid_linkage(context, linkage_values, 3, linkage_output, &metrics, error, sizeof(error)) != 0 && linkage_output[0] == 91);
     wxdouble_destroy(context);
 
 }

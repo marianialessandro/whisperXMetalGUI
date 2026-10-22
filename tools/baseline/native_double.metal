@@ -983,3 +983,143 @@ struct CutLabelDimensions { uint count; };
 kernel void integer_cut_labels_i64(device const int* labels [[buffer(0)]], constant CutLabelDimensions& d [[buffer(1)]], device long* output [[buffer(2)]], uint row [[thread_position_in_grid]]) {
     if (row < d.count) output[row] = long(labels[row]);
 }
+
+
+struct WidePositive { ulong low, high; };
+
+WidePositive wide_positive_shift_jam(WidePositive value, uint shift) {
+    if (shift == 0) return value;
+    if (shift >= 128) return {ulong(value.low != 0 || value.high != 0), 0};
+    if (shift >= 64) {
+        uint remainder = shift - 64;
+        ulong low = remainder == 0 ? value.high : value.high >> remainder;
+        bool sticky = value.low != 0 || (remainder != 0 && (value.high & ((1ul << remainder) - 1)) != 0);
+        return {low | ulong(sticky), 0};
+    }
+    return {(value.low >> shift) | (value.high << (64 - shift)) | ulong((value.low & ((1ul << shift) - 1)) != 0), value.high >> shift};
+}
+
+// Positive bounded FMA retains the exact 106-bit product and aligned addend until one nearest-even rounding.
+ulong fma_positive_binary64(ulong a, ulong b, ulong c) {
+    if (a == 0 || b == 0) return c;
+    if (c == 0) return multiply_positive_binary64(a, b);
+    ulong mask = (1ul << 52) - 1, x = (a & mask) | (1ul << 52), y = (b & mask) | (1ul << 52);
+    ulong p00 = ulong(uint(x)) * uint(y), p01 = ulong(uint(x)) * (y >> 32), p10 = (x >> 32) * uint(y), p11 = (x >> 32) * (y >> 32);
+    ulong middle = (p00 >> 32) + uint(p01) + uint(p10);
+    WidePositive product = {(middle << 32) | uint(p00), p11 + (p01 >> 32) + (p10 >> 32) + (middle >> 32)};
+    uint leading = (product.high & (1ul << 41)) ? 105 : 104, shift = 126 - leading;
+    int exponent = int(a >> 52) + int(b >> 52) - 1023 + int(leading == 105), addend_exponent = int(c >> 52);
+    product = {product.low << shift, (product.high << shift) | (product.low >> (64 - shift))};
+    WidePositive addend = {0, ((c & mask) | (1ul << 52)) << 10};
+    if (exponent < addend_exponent) { product = wide_positive_shift_jam(product, uint(addend_exponent - exponent)); exponent = addend_exponent; }
+    else addend = wide_positive_shift_jam(addend, uint(exponent - addend_exponent));
+    ulong low = product.low + addend.low;
+    WidePositive sum = {low, product.high + addend.high + ulong(low < product.low)};
+    if (sum.high & (1ul << 63)) { sum = wide_positive_shift_jam(sum, 1); ++exponent; }
+    ulong rounded = sum.high >> 10, remainder = sum.high & 1023ul;
+    if (remainder > 512 || (remainder == 512 && (sum.low != 0 || (rounded & 1)))) ++rounded;
+    if (rounded == (1ul << 53)) { rounded >>= 1; ++exponent; }
+    return (ulong(exponent) << 52) | (rounded & mask);
+}
+
+struct PositiveFmaDimensions { uint count; };
+
+kernel void double_positive_fma(device const ulong* values [[buffer(0)]], constant PositiveFmaDimensions& d [[buffer(1)]], device ulong* output [[buffer(2)]], uint row [[thread_position_in_grid]]) {
+    if (row < d.count) output[row] = fma_positive_binary64(values[row * 3], values[row * 3 + 1], values[row * 3 + 2]);
+}
+
+
+struct CentroidLinkageDimensions { uint leaves; };
+struct CentroidPair { int key; ulong value; };
+struct CentroidHeap { uint count; uint keys[256], indices[256]; ulong values[256]; };
+
+bool centroid_less(ulong a, ulong b) { return (a & 0x7ffffffffffffffful) < (b & 0x7ffffffffffffffful); }
+uint centroid_index(uint n, uint a, uint b) {
+    if (a > b) { uint swap = a; a = b; b = swap; }
+    return n * a - a * (a + 1) / 2 + b - a - 1;
+}
+void centroid_heap_swap(thread CentroidHeap& heap, uint a, uint b) {
+    ulong value = heap.values[a]; heap.values[a] = heap.values[b]; heap.values[b] = value;
+    uint key_a = heap.keys[a], key_b = heap.keys[b]; heap.keys[a] = key_b; heap.keys[b] = key_a;
+    heap.indices[key_a] = b; heap.indices[key_b] = a;
+}
+void centroid_heap_down(thread CentroidHeap& heap, uint index) {
+    uint child = 2 * index + 1;
+    while (child < heap.count) {
+        if (child + 1 < heap.count && centroid_less(heap.values[child + 1], heap.values[child])) ++child;
+        if (centroid_less(heap.values[child], heap.values[index])) { centroid_heap_swap(heap, index, child); index = child; child = 2 * index + 1; }
+        else break;
+    }
+}
+void centroid_heap_change(thread CentroidHeap& heap, uint key, ulong value) {
+    uint index = heap.indices[key]; ulong old = heap.values[index]; heap.values[index] = value;
+    if (centroid_less(value, old)) {
+        while (index > 0) { uint parent = (index - 1) / 2; if (!centroid_less(heap.values[index], heap.values[parent])) break; centroid_heap_swap(heap, index, parent); index = parent; }
+    } else centroid_heap_down(heap, index);
+}
+CentroidPair centroid_find(uint n, device const ulong* distances, thread const uint* sizes, uint x) {
+    CentroidPair result = {-1, 0x7ff0000000000000ul};
+    for (uint y = x + 1; y < n; ++y) {
+        if (sizes[y] == 0) continue;
+        ulong value = distances[centroid_index(n, x, y)];
+        if (centroid_less(value, result.value)) { result.key = int(y); result.value = value; }
+    }
+    return result;
+}
+
+// Adapted from SciPy fast_linkage and Heap; BSD attribution is retained in native_linkage_notice.txt.
+kernel void double_centroid_linkage(device ulong* distances [[buffer(0)]], constant CentroidLinkageDimensions& d [[buffer(1)]], device ulong* tree [[buffer(2)]], device uint* status [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if (index != 0) return;
+    status[0] = 0;
+    uint sizes[256], ids[256]; int neighbors[256]; ulong minimum[256]; CentroidHeap heap;
+    heap.count = d.leaves - 1;
+    for (uint x = 0; x < d.leaves; ++x) { sizes[x] = 1; ids[x] = x; }
+    for (uint x = 0; x < d.leaves - 1; ++x) {
+        CentroidPair pair = centroid_find(d.leaves, distances, sizes, x);
+        if (pair.key < 0) { status[0] = 1; return; }
+        neighbors[x] = pair.key; minimum[x] = pair.value;
+        heap.keys[x] = x; heap.indices[x] = x; heap.values[x] = pair.value;
+    }
+    for (int x = int(heap.count / 2) - 1; x >= 0; --x) centroid_heap_down(heap, uint(x));
+    for (uint k = 0; k < d.leaves - 1; ++k) {
+        uint x = 0, y = 0; ulong distance = 0;
+        for (uint attempt = 0; attempt < d.leaves - k; ++attempt) {
+            x = heap.keys[0]; distance = heap.values[0]; y = uint(neighbors[x]);
+            if ((distance & 0x7ffffffffffffffful) == (distances[centroid_index(d.leaves, x, y)] & 0x7ffffffffffffffful)) break;
+            CentroidPair pair = centroid_find(d.leaves, distances, sizes, x);
+            if (pair.key < 0) { status[0] = 1; return; }
+            y = uint(pair.key); distance = pair.value; neighbors[x] = pair.key; minimum[x] = pair.value;
+            centroid_heap_change(heap, x, distance);
+        }
+        centroid_heap_swap(heap, 0, heap.count - 1); --heap.count; centroid_heap_down(heap, 0);
+        uint nx = sizes[x], ny = sizes[y];
+        tree[k * 4] = df_integer(int(min(ids[x], ids[y]))); tree[k * 4 + 1] = df_integer(int(max(ids[x], ids[y])));
+        tree[k * 4 + 2] = distance; tree[k * 4 + 3] = df_integer(int(nx + ny));
+        sizes[x] = 0; sizes[y] = nx + ny; ids[y] = d.leaves + k;
+        for (uint z = 0; z < d.leaves; ++z) {
+            if (sizes[z] == 0 || z == y) continue;
+            ulong a = distances[centroid_index(d.leaves, z, x)] & 0x7ffffffffffffffful, b = distances[centroid_index(d.leaves, z, y)] & 0x7ffffffffffffffful, xy = distance & 0x7ffffffffffffffful;
+            if ((a != 0 && (a < 0x39b0000000000000ul || a > 0x4270000000000000ul)) || (b != 0 && (b < 0x39b0000000000000ul || b > 0x4270000000000000ul)) || (xy != 0 && (xy < 0x39b0000000000000ul || xy > 0x4270000000000000ul))) { status[0] = 2; return; }
+            ulong weight = df_integer(int(nx + ny));
+            ulong weighted_a = multiply_positive_binary64(df_integer(int(nx)), a);
+            ulong weighted_b = multiply_positive_binary64(multiply_positive_binary64(df_integer(int(ny)), b), b);
+            ulong sum = fma_positive_binary64(weighted_a, a, weighted_b);
+            ulong penalty = divide_positive_binary64(multiply_positive_binary64(multiply_positive_binary64(df_integer(int(nx * ny)), xy), xy), weight);
+            ulong variance = df_sub(sum, penalty);
+            if ((variance >> 63) && (variance & 0x7ffffffffffffffful) != 0) { status[0] = 3; return; }
+            ulong updated = sqrt_positive_binary64(divide_positive_binary64(variance & 0x7ffffffffffffffful, weight));
+            if (updated != 0 && (updated < 0x39b0000000000000ul || updated > 0x4270000000000000ul)) { status[0] = 2; return; }
+            distances[centroid_index(d.leaves, z, y)] = updated;
+        }
+        for (uint z = 0; z < x; ++z) if (sizes[z] > 0 && neighbors[z] == int(x)) neighbors[z] = int(y);
+        for (uint z = 0; z < y; ++z) {
+            if (sizes[z] == 0) continue;
+            distance = distances[centroid_index(d.leaves, z, y)];
+            if (centroid_less(distance, minimum[z])) { neighbors[z] = int(y); minimum[z] = distance; centroid_heap_change(heap, z, distance); }
+        }
+        if (y < d.leaves - 1) {
+            CentroidPair pair = centroid_find(d.leaves, distances, sizes, y);
+            if (pair.key >= 0) { neighbors[y] = pair.key; minimum[y] = pair.value; centroid_heap_change(heap, y, pair.value); }
+        }
+    }
+}
