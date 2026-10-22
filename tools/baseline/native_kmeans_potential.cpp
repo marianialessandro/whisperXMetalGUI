@@ -92,3 +92,34 @@ extern "C" int wxkmeans_distance_products(const double* left, const double* righ
         return 1;
     }
 }
+
+extern "C" int wxkmeans_upcast_chunk(const float* input, uint32_t rows, uint32_t features, double* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity) {
+    try {
+        require(input != nullptr && output != nullptr && metrics != nullptr, "kmeans_upcast_chunk_pointer_missing");
+        require(rows > 0 && rows <= 256 && features > 0 && features <= 1024, "kmeans_upcast_chunk_shape_invalid");
+        auto started = std::chrono::steady_clock::now();
+        uint64_t count = uint64_t(rows) * features;
+        std::vector<uint64_t> result(count);
+        for (uint64_t index = 0; index < count; ++index) {
+            uint32_t bits; std::memcpy(&bits, reinterpret_cast<const unsigned char*>(input) + index * sizeof(float), sizeof(bits));
+            uint32_t exponent = (bits >> 23) & 255u, fraction = bits & 0x7fffffu;
+            require(exponent != 255u, "kmeans_upcast_chunk_finite_input_required");
+            uint64_t value = uint64_t(bits >> 31) << 63;
+            if (exponent != 0) value |= (uint64_t(exponent + 896u) << 52) | (uint64_t(fraction) << 29);
+            else if (fraction != 0) {
+                uint32_t highest = 31u - uint32_t(std::countl_zero(fraction));
+                value |= (uint64_t(highest + 874u) << 52) | (uint64_t(fraction - (1u << highest)) << (52u - highest));
+            }
+            result[index] = value;
+        }
+        std::memcpy(reinterpret_cast<unsigned char*>(output), result.data(), count * sizeof(double));
+        *metrics = {1, 0, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count())};
+        return 0;
+    } catch (const std::exception& failure) {
+        if (error != nullptr && capacity > 0) { std::strncpy(error, failure.what(), capacity - 1); error[capacity - 1] = 0; }
+        return 1;
+    } catch (...) {
+        if (error != nullptr && capacity > 0) { std::strncpy(error, "kmeans_upcast_chunk_failed", capacity - 1); error[capacity - 1] = 0; }
+        return 1;
+    }
+}

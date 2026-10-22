@@ -27,7 +27,7 @@ def squared_upcast_norms(context, records, values, squared=False):
     return result
 
 
-def compile_upcast_distances(original, norms, finish=None, clamp=None, resident=False, resident_norms=False, product=None):
+def compile_upcast_distances(original, norms, finish=None, clamp=None, resident=False, resident_norms=False, product=None, upcast_chunk=None):
     import sklearn.metrics.pairwise as pairwise
 
     if type(resident) is not bool or (resident and (finish is None or clamp is None)):
@@ -107,7 +107,17 @@ def compile_upcast_distances(original, norms, finish=None, clamp=None, resident=
             raise ValueError("kmeans_distance_product_expression_contract_changed")
         found[0].func = ast.Name(id="__wx_distance_product", ctx=ast.Load())
         ast.fix_missing_locations(tree)
+    if upcast_chunk is not None:
+        for role, expression in (("X_chunk", "xp.astype(X[x_slice, :], xp_max_float)"), ("Y_chunk", "xp.astype(Y[y_slice, :], xp_max_float)")):
+            target = ast.parse(expression, mode="eval").body
+            found = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.dump(node) == ast.dump(target)]
+            if len(found) != 1:
+                raise ValueError("kmeans_upcast_chunk_expression_contract_changed")
+            found[0].func = ast.Name(id="__wx_upcast_chunk", ctx=ast.Load())
+            found[0].args.append(ast.Constant(value=role))
+        ast.fix_missing_locations(tree)
     namespace = dict(upcast.__globals__)
+    namespace["__wx_upcast_chunk"] = upcast_chunk
     namespace["__wx_distance_product"] = product
     namespace["__wx_squared_distance_guard"] = validate_resident_distance_inputs if resident else validate_squared_distance_inputs
     namespace["__wx_no_chunk_norms"] = validate_no_chunk_norms

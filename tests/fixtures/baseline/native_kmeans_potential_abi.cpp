@@ -10,6 +10,8 @@ extern "C" int wxkmeans_weighted_potentials(const float*, const float*, uint32_t
 
 extern "C" int wxkmeans_distance_products(const double*, const double*, uint32_t, uint32_t, uint32_t, double*, KmeansPotentialMetrics*, char*, uint32_t);
 
+extern "C" int wxkmeans_upcast_chunk(const float*, uint32_t, uint32_t, double*, KmeansPotentialMetrics*, char*, uint32_t);
+
 int main() {
     float left[] = {1, 2, 3, 4}, weights[] = {2, 3}, output[] = {91, 92};
     KmeansPotentialMetrics metrics = {}; char error[128] = {};
@@ -71,5 +73,30 @@ int main() {
     assert(wxkmeans_distance_products(a, b, 2, 2, 2, a, &metrics, error, sizeof(error)) == 0 && a[0] == 8 && a[3] == 32);
     assert(wxkmeans_distance_products(nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, 0) != 0);
     tiny[0] = 'x'; assert(wxkmeans_distance_products(nullptr, nullptr, 0, 0, 0, nullptr, nullptr, tiny, 1) != 0 && tiny[0] == 0);
+
+    float chunk[] = {-0.0f, std::numeric_limits<float>::denorm_min(), std::numeric_limits<float>::max()};
+    double converted[] = {91, 92, 93};
+    assert(wxkmeans_upcast_chunk(chunk, 1, 3, converted, &metrics, error, sizeof(error)) == 0 && metrics.version == 1 && metrics.blas_calls == 0);
+    assert(std::bit_cast<uint64_t>(converted[0]) == 0x8000000000000000ul && converted[1] == 0x1p-149 && converted[2] == static_cast<double>(std::numeric_limits<float>::max()));
+    converted[0] = 91; converted[1] = 92; converted[2] = 93;
+    assert(wxkmeans_upcast_chunk(nullptr, 1, 3, converted, &metrics, error, sizeof(error)) != 0 && converted[0] == 91);
+    assert(wxkmeans_upcast_chunk(chunk, 1, 3, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_upcast_chunk(chunk, 1, 3, converted, nullptr, error, sizeof(error)) != 0 && converted[0] == 91);
+    for (uint32_t rows : {0u, 257u}) assert(wxkmeans_upcast_chunk(chunk, rows, 3, converted, &metrics, error, sizeof(error)) != 0 && converted[0] == 91);
+    for (uint32_t features : {0u, 1025u}) assert(wxkmeans_upcast_chunk(chunk, 1, features, converted, &metrics, error, sizeof(error)) != 0 && converted[0] == 91);
+    for (uint32_t bits : {0x7f800000u, 0xff800000u, 0x7fc00000u, 0x7f800001u, 0xffc00001u}) {
+        chunk[2] = std::bit_cast<float>(bits);
+        assert(wxkmeans_upcast_chunk(chunk, 1, 3, converted, &metrics, error, sizeof(error)) != 0 && converted[0] == 91 && converted[1] == 92 && converted[2] == 93);
+    }
+    chunk[2] = 3;
+    unsigned char unaligned_chunk[sizeof(chunk) + 1], unaligned_converted[sizeof(converted) + 1];
+    std::memcpy(unaligned_chunk + 1, chunk, sizeof(chunk));
+    assert(wxkmeans_upcast_chunk(reinterpret_cast<float*>(unaligned_chunk + 1), 1, 3, reinterpret_cast<double*>(unaligned_converted + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(converted, unaligned_converted + 1, sizeof(converted)); assert(converted[1] == 0x1p-149 && converted[2] == 3);
+    unsigned char overlapping[sizeof(converted)]; std::memcpy(overlapping, chunk, sizeof(chunk));
+    assert(wxkmeans_upcast_chunk(reinterpret_cast<float*>(overlapping), 1, 3, reinterpret_cast<double*>(overlapping), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(converted, overlapping, sizeof(converted)); assert(converted[1] == 0x1p-149 && converted[2] == 3);
+    assert(wxkmeans_upcast_chunk(nullptr, 0, 0, nullptr, nullptr, nullptr, 0) != 0);
+    tiny[0] = 'x'; assert(wxkmeans_upcast_chunk(nullptr, 0, 0, nullptr, nullptr, tiny, 1) != 0 && tiny[0] == 0);
 
 }
