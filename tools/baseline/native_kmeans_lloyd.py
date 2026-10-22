@@ -14,7 +14,10 @@ LLOYD_SHA256 = "d4bf3cb3792265da9d5d1550fa0f61fdd389f0302a677f72e761c482a4824880
 THREADPOOL_DECORATOR_SHA256 = "ec72498b68ea605724643838a8bc4c343ef6d150f8d09fd8b0d068d08c6cab60"
 
 
-def compile_native_lloyd(original, shift_total):
+ARRAY_EQUAL_SHA256 = "be4f8df0142c72cbd63a30ed74a48129155a6aa845e5e6d2f2898a2a59d35be6"
+
+
+def compile_native_lloyd(original, shift_total=None, labels_equal=None):
     from sklearn.cluster import _kmeans
     from sklearn.utils.parallel import _threadpool_controller_decorator
     inner = inspect.unwrap(original)
@@ -30,9 +33,19 @@ def compile_native_lloyd(original, shift_total):
     decorator = ast.parse('_threadpool_controller_decorator(limits=1, user_api="blas")', mode="eval").body
     if len(tree.body) != 1 or len(tree.body[0].decorator_list) != 1 or ast.dump(tree.body[0].decorator_list[0]) != ast.dump(decorator) or len(matches) != 1:
         raise ValueError("kmeans_lloyd_shift_expression_contract_changed")
-    matches[0].func = ast.Name(id="__wx_lloyd_shift_total", ctx=ast.Load())
-    matches[0].args = [ast.Name(id="center_shift", ctx=ast.Load())]
+    if shift_total is not None:
+        matches[0].func = ast.Name(id="__wx_lloyd_shift_total", ctx=ast.Load())
+        matches[0].args = [ast.Name(id="center_shift", ctx=ast.Load())]
+    if labels_equal is not None:
+        if inner.__globals__.get("np") is not np or hashlib.sha256(inspect.getsource(np.array_equal).encode()).hexdigest() != ARRAY_EQUAL_SHA256:
+            raise ValueError("kmeans_lloyd_labels_reference_not_supported")
+        target = ast.parse("np.array_equal(labels, labels_old)", mode="eval").body
+        found = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.dump(node) == ast.dump(target)]
+        if len(found) != 1:
+            raise ValueError("kmeans_lloyd_labels_expression_contract_changed")
+        found[0].func = ast.Name(id="__wx_lloyd_labels_equal", ctx=ast.Load())
     namespace = dict(inner.__globals__); namespace["__wx_lloyd_shift_total"] = shift_total
+    namespace["__wx_lloyd_labels_equal"] = labels_equal
     ast.fix_missing_locations(tree)
     exec(compile(tree, "<WhisperX scoped native Lloyd shift reduction>", "exec"), namespace)
     candidate = namespace[inner.__name__]
@@ -46,5 +59,12 @@ def shift_total(context, records, shifts):
         raise ValueError("kmeans_lloyd_shift_numpy_buffer_not_supported")
     output, record = context.lloyd_shift_total(shifts)
     record.update({"adapter_scope": "sklearn_dense_float32_lloyd_center_shift", "original_lloyd_sha256": LLOYD_SHA256, "threadpool_decorator_sha256": THREADPOOL_DECORATOR_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "cpu_residuals": ["lloyd_cython_iteration_and_centroid_updates", "inertia", "convergence_comparison_and_control", "host_staging_and_control"]})
+    records.append(record)
+    return output
+
+
+def labels_equal(context, records, labels, previous):
+    output, record = context.lloyd_labels_equal(labels, previous)
+    record.update({"adapter_scope": "sklearn_dense_float32_lloyd_strict_convergence", "original_lloyd_sha256": LLOYD_SHA256, "threadpool_decorator_sha256": THREADPOOL_DECORATOR_SHA256, "original_array_equal_sha256": ARRAY_EQUAL_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "cpu_residuals": ["lloyd_cython_iteration_and_centroid_updates", "inertia", "convergence_branch_and_control", "host_staging_and_control"]})
     records.append(record)
     return output

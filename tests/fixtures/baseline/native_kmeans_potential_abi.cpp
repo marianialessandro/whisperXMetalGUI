@@ -14,6 +14,8 @@ extern "C" int wxkmeans_upcast_chunk(const float*, uint32_t, uint32_t, double*, 
 
 extern "C" int wxkmeans_lloyd_shift_total(const float*, uint32_t, float*, KmeansPotentialMetrics*, char*, uint32_t);
 
+extern "C" int wxkmeans_lloyd_labels_equal(const int32_t*, const int32_t*, uint32_t, uint32_t*, KmeansPotentialMetrics*, char*, uint32_t);
+
 int main() {
     float left[] = {1, 2, 3, 4}, weights[] = {2, 3}, output[] = {91, 92};
     KmeansPotentialMetrics metrics = {}; char error[128] = {};
@@ -118,5 +120,26 @@ int main() {
     std::memcpy(&total, unaligned_total + 1, sizeof(total)); assert(total == 25);
     assert(wxkmeans_lloyd_shift_total(shifts, 2, shifts, &metrics, error, sizeof(error)) == 0 && shifts[0] == 25);
     assert(wxkmeans_lloyd_shift_total(nullptr, 0, nullptr, nullptr, nullptr, 0) != 0);
+
+    int32_t labels[] = {0, 1, 4095}, previous[] = {0, 1, 4095}; uint32_t equal = 91;
+    assert(wxkmeans_lloyd_labels_equal(labels, previous, 3, &equal, &metrics, error, sizeof(error)) == 0 && equal == 1 && metrics.blas_calls == 0);
+    previous[0] = -1;
+    assert(wxkmeans_lloyd_labels_equal(labels, previous, 3, &equal, &metrics, error, sizeof(error)) == 0 && equal == 0);
+    equal = 91;
+    assert(wxkmeans_lloyd_labels_equal(nullptr, previous, 3, &equal, &metrics, error, sizeof(error)) != 0 && equal == 91);
+    assert(wxkmeans_lloyd_labels_equal(labels, nullptr, 3, &equal, &metrics, error, sizeof(error)) != 0 && equal == 91);
+    assert(wxkmeans_lloyd_labels_equal(labels, previous, 3, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_lloyd_labels_equal(labels, previous, 3, &equal, nullptr, error, sizeof(error)) != 0 && equal == 91);
+    for (uint32_t count : {0u, 4097u}) assert(wxkmeans_lloyd_labels_equal(labels, previous, count, &equal, &metrics, error, sizeof(error)) != 0 && equal == 91);
+    for (int32_t value : {-2, 4096, std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::max()}) {
+        previous[2] = value;
+        assert(wxkmeans_lloyd_labels_equal(labels, previous, 3, &equal, &metrics, error, sizeof(error)) != 0 && equal == 91);
+    }
+    previous[2] = 4095;
+    unsigned char unaligned_labels[sizeof(labels) + 1], unaligned_equal[sizeof(equal) + 1]; std::memcpy(unaligned_labels + 1, labels, sizeof(labels));
+    assert(wxkmeans_lloyd_labels_equal(reinterpret_cast<int32_t*>(unaligned_labels + 1), labels, 3, reinterpret_cast<uint32_t*>(unaligned_equal + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(&equal, unaligned_equal + 1, sizeof(equal)); assert(equal == 1);
+    assert(wxkmeans_lloyd_labels_equal(labels, labels, 3, reinterpret_cast<uint32_t*>(labels), &metrics, error, sizeof(error)) == 0 && labels[0] == 1);
+    assert(wxkmeans_lloyd_labels_equal(nullptr, nullptr, 0, nullptr, nullptr, nullptr, 0) != 0);
 
 }
