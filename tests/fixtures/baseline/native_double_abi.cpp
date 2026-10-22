@@ -48,6 +48,7 @@ extern "C" int wxdouble_ahc_reindex(void*, const int64_t*, uint32_t, int64_t*, D
 extern "C" int wxdouble_fcluster_distance(void*, const double*, uint32_t, double, uint32_t, int32_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_fcluster_reindex(void*, const double*, uint32_t, double, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_positive_fma(void*, const double*, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_kmeans_distance_clamp(void*, const float*, uint32_t, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_distance_finish(void*, const double*, const double*, const double*, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_upcast_norms(void*, const double*, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_ahc_resident(void*, const double*, uint32_t, uint32_t, double, int64_t*, DoubleMetrics*, char*, uint32_t);
@@ -67,6 +68,34 @@ int main(int argc, char** argv) {
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    uint32_t clamp_words[] = {0x80000000u, 0xbf800000u, 0x40000000u, 1u}; float clamp_values[4], clamp_output[] = {91, 92, 93, 94};
+    std::memcpy(clamp_values, clamp_words, sizeof(clamp_values));
+    assert(wxdouble_kmeans_distance_clamp(context, clamp_values, 2, 2, 0, clamp_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 1);
+    uint32_t clamp_results[4]; std::memcpy(clamp_results, clamp_output, sizeof(clamp_results)); assert(clamp_results[0] == 0 && clamp_results[1] == 0 && clamp_results[2] == 0x40000000u && clamp_results[3] == 1);
+    assert(wxdouble_kmeans_distance_clamp(context, clamp_values, 2, 2, 1, clamp_output, &metrics, error, sizeof(error)) == 0 && clamp_output[3] == 0);
+    clamp_output[0] = 91;
+    assert(wxdouble_kmeans_distance_clamp(nullptr, clamp_values, 2, 2, 0, clamp_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_distance_clamp(context, nullptr, 2, 2, 0, clamp_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_distance_clamp(context, clamp_values, 2, 2, 0, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_distance_clamp(context, clamp_values, 2, 2, 0, clamp_output, nullptr, error, sizeof(error)) != 0);
+    for (uint32_t size : {0u, 4097u}) {
+        assert(wxdouble_kmeans_distance_clamp(context, clamp_values, size, 2, 0, clamp_output, &metrics, error, sizeof(error)) != 0 && clamp_output[0] == 91);
+        assert(wxdouble_kmeans_distance_clamp(context, clamp_values, 2, size, 0, clamp_output, &metrics, error, sizeof(error)) != 0 && clamp_output[0] == 91);
+    }
+    assert(wxdouble_kmeans_distance_clamp(context, clamp_values, 1025, 1025, 0, clamp_output, &metrics, error, sizeof(error)) != 0 && clamp_output[0] == 91);
+    assert(wxdouble_kmeans_distance_clamp(context, clamp_values, 2, 2, 2, clamp_output, &metrics, error, sizeof(error)) != 0 && clamp_output[0] == 91);
+    assert(wxdouble_kmeans_distance_clamp(context, clamp_values, 1, 2, 1, clamp_output, &metrics, error, sizeof(error)) != 0 && clamp_output[0] == 91);
+    for (uint32_t word : {0x7f800000u, 0xff800000u, 0x7fc00000u}) {
+        std::memcpy(clamp_values, &word, sizeof(word));
+        assert(wxdouble_kmeans_distance_clamp(context, clamp_values, 2, 2, 0, clamp_output, &metrics, error, sizeof(error)) != 0 && clamp_output[0] == 91);
+    }
+    std::memcpy(clamp_values, clamp_words, sizeof(clamp_values));
+    unsigned char clamp_unaligned_input[sizeof(clamp_values) + 1], clamp_unaligned_output[sizeof(clamp_output) + 1];
+    std::memcpy(clamp_unaligned_input + 1, clamp_values, sizeof(clamp_values));
+    assert(wxdouble_kmeans_distance_clamp(context, reinterpret_cast<float*>(clamp_unaligned_input + 1), 2, 2, 0, reinterpret_cast<float*>(clamp_unaligned_output + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(clamp_results, clamp_unaligned_output + 1, sizeof(clamp_results)); assert(clamp_results[0] == 0 && clamp_results[3] == 1);
+    assert(wxdouble_kmeans_distance_clamp(context, clamp_values, 2, 2, 0, clamp_values, &metrics, error, sizeof(error)) == 0);
+    std::memcpy(clamp_results, clamp_values, sizeof(clamp_results)); assert(clamp_results[0] == 0 && clamp_results[3] == 1);
     double finish_products[] = {1, 2, 3, 4}, finish_left[] = {10, 20}, finish_right[] = {1, 2}; float finish_output[] = {91, 92, 93, 94};
     assert(wxdouble_kmeans_distance_finish(context, finish_products, finish_left, finish_right, 2, 2, finish_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 1 && finish_output[0] == 9 && finish_output[3] == 14);
     finish_output[0] = 91;
@@ -1100,6 +1129,14 @@ int main(int argc, char** argv) {
     assert(wxdouble_kmeans_upcast_norms(context, finish_legacy_values, 1, 2, upcast_output, &metrics, error, sizeof(error)) == 0 && upcast_output[0] == 25);
     finish_output[0] = 91;
     assert(wxdouble_kmeans_distance_finish(context, finish_products, finish_left, finish_right, 2, 2, finish_output, &metrics, error, sizeof(error)) != 0 && finish_output[0] == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_distance_clamp_shader = shader.substr(0, shader.find("\nstruct DistanceClampDimensions"));
+    assert(wxdouble_create(pre_distance_clamp_shader.data(), pre_distance_clamp_shader.size(), &context, error, sizeof(error)) == 0);
+    double clamp_legacy_product[] = {1}, clamp_legacy_norm[] = {2};
+    assert(wxdouble_kmeans_distance_finish(context, clamp_legacy_product, clamp_legacy_norm, clamp_legacy_norm, 1, 1, finish_output, &metrics, error, sizeof(error)) == 0 && finish_output[0] == 2);
+    clamp_output[0] = 91;
+    assert(wxdouble_kmeans_distance_clamp(context, clamp_values, 2, 2, 0, clamp_output, &metrics, error, sizeof(error)) != 0 && clamp_output[0] == 91);
     wxdouble_destroy(context);
 
 }

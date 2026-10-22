@@ -24,6 +24,8 @@ struct FclusterDimensions { uint32_t leaves, zero_based; uint64_t cutoff; };
 static_assert(sizeof(FclusterDimensions) == 16);
 struct ReindexDimensions { uint32_t count; };
 struct PdistDimensions { uint32_t rows, features; };
+struct DistanceClampDimensions { uint32_t rows, columns, zero_diagonal; };
+static_assert(sizeof(DistanceClampDimensions) == 12);
 struct AssignmentDimensions { uint32_t rows, columns; };
 struct AssignmentBatchDimensions { uint32_t chunks, rows, columns; };
 static_assert(sizeof(AssignmentBatchDimensions) == 12);
@@ -61,7 +63,7 @@ class DoubleContext {
     id<MTLComputePipelineState> kmeans_centroid_pipeline_;
     id<MTLComputePipelineState> float_shift_pipeline_;
     id<MTLComputePipelineState> tolerance_mean_pipeline_, tolerance_square_pipeline_, tolerance_final_pipeline_;
-    id<MTLComputePipelineState> distance_finish_pipeline_, upcast_norms_pipeline_;
+    id<MTLComputePipelineState> distance_clamp_pipeline_, distance_finish_pipeline_, upcast_norms_pipeline_;
     id<MTLComputePipelineState> resident_linkage_pipeline_, resident_cut_pipeline_, resident_labels_pipeline_;
     id<MTLComputePipelineState> centroid_linkage_pipeline_, positive_fma_pipeline_, cut_labels_pipeline_, fcluster_pipeline_, reindex_pipeline_, pdist_pipeline_, inactive_assignment_pipeline_, assignment_batch_pipeline_, assignment_pipeline_, kmeans_best_pipeline_, kmeans_search_pipeline_, kmeans_probability_sum_pipeline_, kmeans_probability_pipeline_, kmeans_minimum_pipeline_, kmeans_norm_pipeline_, kmeans_weighted_products_pipeline_, kmeans_weighted_prefix_pipeline_;
     id<MTLComputePipelineState> pipeline_, matmul_pipeline_, element_pipeline_, terms_pipeline_, rho_pipeline_, gamma_pipeline_, statistics_pipeline_, score_pipeline_, prior_pipeline_, posterior_pipeline_, likelihood_pipeline_, elbo_terms_pipeline_, elbo_final_pipeline_, transcendental_pipeline_, log1p_pipeline_, lse_terms_pipeline_, lse_final_pipeline_, initialization_pipeline_, qinit_pipeline_, centroid_pipeline_, one_hot_pipeline_, cosine_norm_pipeline_, cosine_distance_pipeline_, cosine_score_pipeline_, argmax_pipeline_, minimum_pipeline_, inactive_pipeline_, nan_minimum_pipeline_, nan_cleanup_pipeline_;
@@ -146,6 +148,8 @@ public:
         if (best_candidate_function != nil) kmeans_best_pipeline_ = [device_ newComputePipelineStateWithFunction:best_candidate_function error:&error];
         id<MTLFunction> assignment_function = [library newFunctionWithName:@"double_linear_assignment_max"];
         if (assignment_function != nil) assignment_pipeline_ = [device_ newComputePipelineStateWithFunction:assignment_function error:&error];
+        id<MTLFunction> distance_clamp_function = [library newFunctionWithName:@"float_kmeans_distance_clamp"];
+        if (distance_clamp_function != nil) distance_clamp_pipeline_ = [device_ newComputePipelineStateWithFunction:distance_clamp_function error:&error];
         id<MTLFunction> distance_finish_function = [library newFunctionWithName:@"double_kmeans_distance_finish"];
         if (distance_finish_function != nil) distance_finish_pipeline_ = [device_ newComputePipelineStateWithFunction:distance_finish_function error:&error];
         id<MTLFunction> upcast_norms_function = [library newFunctionWithName:@"double_kmeans_upcast_norms"];
@@ -434,6 +438,29 @@ public:
         for (uint32_t row = 0; row < d.rows; ++row) require(std::isfinite(static_cast<const double*>(terms_.contents)[row]), "double_vbx_logsumexp_shift_domain_invalid");
         std::memcpy(output, terms_.contents, uint64_t(d.rows) * sizeof(double));
         return {1, 2, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
+    }
+
+    DoubleMetrics kmeans_distance_clamp(const float* values, DistanceClampDimensions d, float* output) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        require(distance_clamp_pipeline_ != nil, "double_kmeans_distance_clamp_kernel_unavailable");
+        require(values != nullptr && output != nullptr && d.rows > 0 && d.rows <= 4096 && d.columns > 0 && d.columns <= 4096 && uint64_t(d.rows) * d.columns <= 1024 * 1024 && d.zero_diagonal <= 1 && (d.zero_diagonal == 0 || d.rows == d.columns), "double_kmeans_distance_clamp_shape_or_pointer_invalid");
+        uint64_t count = uint64_t(d.rows) * d.columns;
+        for (uint64_t index = 0; index < count; ++index) {
+            uint32_t bits = 0; std::memcpy(&bits, reinterpret_cast<const unsigned char*>(values) + index * sizeof(float), sizeof(bits));
+            require((bits & 0x7fffffffu) < 0x7f800000u, "double_kmeans_distance_clamp_value_domain_invalid");
+        }
+        auto started = std::chrono::steady_clock::now();
+        reserve(input_, count * sizeof(float)); reserve(output_, count * sizeof(float));
+        std::memcpy(input_.contents, reinterpret_cast<const unsigned char*>(values), count * sizeof(float));
+        id<MTLCommandBuffer> command = [queue_ commandBuffer]; require(command != nil, "double_command_creation_failed"); command.label = @"WhisperX experimental KMeans squared-distance clamp";
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder]; require(encoder != nil, "double_encoder_creation_failed");
+        [encoder setComputePipelineState:distance_clamp_pipeline_]; [encoder setBuffer:input_ offset:0 atIndex:0]; [encoder setBytes:&d length:sizeof(d) atIndex:1]; [encoder setBuffer:output_ offset:0 atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, distance_clamp_pipeline_.maxTotalThreadsPerThreadgroup), 1, 1)]; [encoder endEncoding];
+        [command commit]; [command waitUntilCompleted]; require(command.status == MTLCommandBufferStatusCompleted && command.error == nil, "double_command_failed");
+        const uint32_t* result = static_cast<const uint32_t*>(output_.contents);
+        for (uint64_t index = 0; index < count; ++index) require((result[index] >> 31) == 0 && result[index] < 0x7f800000u, "double_kmeans_distance_clamp_result_invalid");
+        std::memcpy(reinterpret_cast<unsigned char*>(output), result, count * sizeof(float));
+        return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
     DoubleMetrics kmeans_distance_finish(const double* products, const double* left_norms, const double* right_norms, MatrixDimensions d, float* output) {
@@ -1655,5 +1682,13 @@ extern "C" int wxdouble_kmeans_distance_finish(void* context, const double* prod
         try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->kmeans_distance_finish(products, left_norms, right_norms, {rows, 0, columns}, output); return 0; }
         catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_kmeans_distance_finish_failed"); return 1; }
+    }
+}
+
+extern "C" int wxdouble_kmeans_distance_clamp(void* context, const float* values, uint32_t rows, uint32_t columns, uint32_t zero_diagonal, float* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->kmeans_distance_clamp(values, {rows, columns, zero_diagonal}, output); return 0; }
+        catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_kmeans_distance_clamp_failed"); return 1; }
     }
 }

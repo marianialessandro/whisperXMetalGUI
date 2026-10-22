@@ -27,7 +27,7 @@ def squared_upcast_norms(context, records, values, squared=False):
     return result
 
 
-def compile_upcast_distances(original, norms, finish=None):
+def compile_upcast_distances(original, norms, finish=None, clamp=None):
     import sklearn.metrics.pairwise as pairwise
 
     upcast = pairwise._euclidean_distances_upcast
@@ -62,9 +62,33 @@ def compile_upcast_distances(original, norms, finish=None):
     namespace["row_norms"] = norms
     exec(compile(tree, "<WhisperX scoped native KMeans upcast norms>", "exec"), namespace)
     candidate_upcast = namespace[upcast.__name__]
+    outer = ast.parse(textwrap.dedent(inspect.getsource(original)))
+    if clamp is not None:
+        if finish is None:
+            raise ValueError("kmeans_distance_clamp_configuration_invalid")
+        expressions = ("xp_zero = xp.asarray(0, device=device_, dtype=distances.dtype)", "distances = _modify_in_place_if_numpy(xp, xp.maximum, distances, xp_zero, out=distances)", "if X is Y:\n    _fill_diagonal(distances, 0, xp=xp)")
+        matches = []
+        for expression in expressions:
+            target = ast.parse(expression).body[0]
+            found = [node for node in ast.walk(outer) if ast.dump(node) == ast.dump(target)]
+            if len(found) != 1:
+                raise ValueError("kmeans_distance_clamp_expression_contract_changed")
+            matches.append(found[0])
+        matches[1].value = ast.parse("__wx_distance_clamp(distances, X is Y)", mode="eval").body
+        class RemoveClampTemporaries(ast.NodeTransformer):
+            def visit_Assign(self, node):
+                return None if node is matches[0] else self.generic_visit(node)
+            def visit_If(self, node):
+                return None if node is matches[2] else self.generic_visit(node)
+        outer = RemoveClampTemporaries().visit(outer)
+        guard = ast.parse("__wx_squared_distance_guard(X, Y, squared)").body[0]
+        outer.body[0].body.insert(1, guard)
+        ast.fix_missing_locations(outer)
     namespace = dict(original.__globals__)
     namespace["_euclidean_distances_upcast"] = candidate_upcast
-    exec(compile(ast.parse(textwrap.dedent(inspect.getsource(original))), "<WhisperX scoped KMeans Euclidean distance>", "exec"), namespace)
+    namespace["__wx_distance_clamp"] = clamp
+    namespace["__wx_squared_distance_guard"] = validate_squared_distance_inputs
+    exec(compile(outer, "<WhisperX scoped KMeans Euclidean distance>", "exec"), namespace)
     candidate = namespace[original.__name__]
     if inspect.signature(candidate_upcast) != inspect.signature(upcast) or inspect.signature(candidate) != inspect.signature(original):
         raise ValueError("kmeans_upcast_norms_signature_changed")
@@ -78,5 +102,21 @@ def finish_distances(context, records, products, left_norms, right_norms):
     result, record = context.kmeans_distance_finish(staged[0], staged[1].reshape(-1), staged[2].reshape(-1))
     record = dict(record)
     record.update({"adapter_scope": "sklearn_kmeans_plusplus_distance_chunk_finish", "original_euclidean_sha256": EUCLIDEAN_SHA256, "original_upcast_sha256": UPCAST_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "host_input_staging_copy_bytes": sum(value.nbytes for value, original in zip(staged, (products, left_norms, right_norms)) if not np.shares_memory(value, original)), "cpu_residuals": ["float32_to_float64_chunk_conversion", "distance_blas_products", "distance_clamping_and_optional_sqrt_diagonal_fill", "weighted_potentials", "rng_and_seed_control", "lloyd_or_elkan", "host_staging_and_control"]})
+    records.append(record)
+    return result
+
+
+def validate_squared_distance_inputs(X, Y, squared):
+    if squared is not True or any(type(value) is not np.ndarray or value.dtype != np.float32 or value.ndim != 2 for value in (X, Y)):
+        raise ValueError("kmeans_distance_clamp_squared_float32_policy_required")
+
+
+def clamp_distances(context, records, values, zero_diagonal):
+    if type(values) is not np.ndarray or values.dtype != np.float32 or values.ndim != 2:
+        raise ValueError("kmeans_distance_clamp_operand_not_supported")
+    staged = np.ascontiguousarray(values)
+    result, record = context.kmeans_distance_clamp(staged, zero_diagonal)
+    record = dict(record)
+    record.update({"adapter_scope": "sklearn_kmeans_plusplus_squared_distance_clamp", "original_euclidean_sha256": EUCLIDEAN_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "host_input_staging_copy_bytes": 0 if np.shares_memory(staged, values) else staged.nbytes, "cpu_residuals": ["float32_to_float64_chunk_conversion", "distance_blas_products", "weighted_potentials", "rng_and_seed_control", "lloyd_or_elkan", "host_staging_and_control"]})
     records.append(record)
     return result

@@ -1221,3 +1221,13 @@ kernel void double_kmeans_distance_finish(device const ulong* products [[buffer(
     value = matrix_add(value, norms[d.rows + index % d.columns]);
     output[index] = distance_float_bits(value);
 }
+
+
+struct DistanceClampDimensions { uint rows, columns, zero_diagonal; };
+
+// Positive-zero maximum and identity-diagonal fill preserve all positive binary32 bits, including subnormals.
+kernel void float_kmeans_distance_clamp(device const uint* values [[buffer(0)]], constant DistanceClampDimensions& d [[buffer(1)]], device uint* output [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    if (index >= d.rows * d.columns) return;
+    uint value = values[index];
+    output[index] = (value >> 31) || (d.zero_diagonal && index / d.columns == index % d.columns) ? 0 : value;
+}
