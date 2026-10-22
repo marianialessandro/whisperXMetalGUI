@@ -1170,3 +1170,24 @@ kernel void double_resident_fcluster(device const ulong* tree [[buffer(0)]], con
 kernel void integer_resident_cut_labels_i64(device const int* labels [[buffer(0)]], constant CutLabelDimensions& d [[buffer(1)]], device long* output [[buffer(2)]], device const uint* status [[buffer(3)]], uint row [[thread_position_in_grid]]) {
     if (row < d.count && status[0] == 0) output[row] = long(labels[row]);
 }
+
+
+// NumPy 2.2.6 NEON f64 einsum uses two lanes and reversed groups of four vectors; see native_numpy_norm_notice.txt.
+kernel void double_kmeans_upcast_norms(device const ulong* values [[buffer(0)]], constant PdistDimensions& d [[buffer(1)]], device ulong* output [[buffer(2)]], uint row [[thread_position_in_grid]]) {
+    if (row >= d.rows) return;
+    ulong sums[2] = {0, 0}; uint column = 0;
+    for (; column + 8 <= d.features; column += 8) {
+        for (int block = 3; block >= 0; --block) {
+            for (uint lane = 0; lane < 2; ++lane) {
+                ulong value = values[row * d.features + column + uint(block) * 2 + lane] & 0x7ffffffffffffffful;
+                sums[lane] = fma_positive_binary64(value, value, sums[lane]);
+            }
+        }
+    }
+    for (uint lane_offset = 0; column < d.features; ++column, ++lane_offset) {
+        ulong value = values[row * d.features + column] & 0x7ffffffffffffffful;
+        uint lane = lane_offset % 2;
+        sums[lane] = fma_positive_binary64(value, value, sums[lane]);
+    }
+    output[row] = add_positive_double(sums[0], sums[1]);
+}

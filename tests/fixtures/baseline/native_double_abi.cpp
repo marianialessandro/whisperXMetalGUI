@@ -48,6 +48,7 @@ extern "C" int wxdouble_ahc_reindex(void*, const int64_t*, uint32_t, int64_t*, D
 extern "C" int wxdouble_fcluster_distance(void*, const double*, uint32_t, double, uint32_t, int32_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_fcluster_reindex(void*, const double*, uint32_t, double, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_positive_fma(void*, const double*, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_kmeans_upcast_norms(void*, const double*, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_ahc_resident(void*, const double*, uint32_t, uint32_t, double, int64_t*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_centroid_linkage(void*, const double*, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
 extern "C" void wxdouble_destroy(void*);
@@ -65,6 +66,25 @@ int main(int argc, char** argv) {
     assert(wxdouble_create(shader.data(), shader.size(), nullptr, error, sizeof(error)) != 0);
     assert(wxdouble_create(nullptr, 0, &context, error, sizeof(error)) != 0 && context == nullptr);
     assert(wxdouble_create(shader.data(), shader.size(), &context, error, sizeof(error)) == 0 && context != nullptr);
+    double upcast_values[] = {3, 4, 0, -0.}, upcast_output[] = {91, 92};
+    assert(wxdouble_kmeans_upcast_norms(context, upcast_values, 2, 2, upcast_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 1 && upcast_output[0] == 25 && upcast_output[1] == 0 && !std::signbit(upcast_output[1]));
+    upcast_output[0] = 91;
+    assert(wxdouble_kmeans_upcast_norms(nullptr, upcast_values, 2, 2, upcast_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_upcast_norms(context, nullptr, 2, 2, upcast_output, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_upcast_norms(context, upcast_values, 2, 2, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_upcast_norms(context, upcast_values, 2, 2, upcast_output, nullptr, error, sizeof(error)) != 0);
+    for (uint32_t rows : {0u, 4097u}) assert(wxdouble_kmeans_upcast_norms(context, upcast_values, rows, 2, upcast_output, &metrics, error, sizeof(error)) != 0 && upcast_output[0] == 91);
+    for (uint32_t columns : {0u, 1025u}) assert(wxdouble_kmeans_upcast_norms(context, upcast_values, 2, columns, upcast_output, &metrics, error, sizeof(error)) != 0 && upcast_output[0] == 91);
+    for (double value : {double(INFINITY), double(NAN), 0x1p-201, 0x1p201}) {
+        upcast_values[0] = value;
+        assert(wxdouble_kmeans_upcast_norms(context, upcast_values, 2, 2, upcast_output, &metrics, error, sizeof(error)) != 0 && upcast_output[0] == 91);
+    }
+    upcast_values[0] = 3;
+    unsigned char upcast_unaligned_input[sizeof(upcast_values) + 1], upcast_unaligned_output[sizeof(upcast_output) + 1];
+    std::memcpy(upcast_unaligned_input + 1, upcast_values, sizeof(upcast_values));
+    assert(wxdouble_kmeans_upcast_norms(context, reinterpret_cast<double*>(upcast_unaligned_input + 1), 2, 2, reinterpret_cast<double*>(upcast_unaligned_output + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(upcast_output, upcast_unaligned_output + 1, sizeof(upcast_output)); assert(upcast_output[0] == 25 && upcast_output[1] == 0);
+    assert(wxdouble_kmeans_upcast_norms(context, upcast_values, 2, 2, upcast_values, &metrics, error, sizeof(error)) == 0 && upcast_values[0] == 25 && upcast_values[1] == 0);
     double ahc_values[] = {0, 0, 3, 4}; int64_t ahc_output[] = {91, 92};
     assert(wxdouble_ahc_resident(context, ahc_values, 2, 2, 5., ahc_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 4 && ahc_output[0] == 0 && ahc_output[1] == 0);
     ahc_output[0] = 91;
@@ -1034,6 +1054,14 @@ int main(int argc, char** argv) {
     assert(wxdouble_centroid_linkage(context, ahc_legacy_distances, 2, linkage_output, &metrics, error, sizeof(error)) == 0 && linkage_output[2] == 1);
     ahc_output[0] = 91;
     assert(wxdouble_ahc_resident(context, input, 2, 1, 1., ahc_output, &metrics, error, sizeof(error)) != 0 && ahc_output[0] == 91);
+    wxdouble_destroy(context);
+
+    std::string pre_upcast_norm_shader = shader.substr(0, shader.find("\n// NumPy 2.2.6 NEON f64"));
+    assert(wxdouble_create(pre_upcast_norm_shader.data(), pre_upcast_norm_shader.size(), &context, error, sizeof(error)) == 0);
+    double upcast_legacy_matrix[] = {0, 0, 3, 4};
+    assert(wxdouble_ahc_resident(context, upcast_legacy_matrix, 2, 2, 5., ahc_output, &metrics, error, sizeof(error)) == 0 && metrics.kernels == 4);
+    upcast_output[0] = 91;
+    assert(wxdouble_kmeans_upcast_norms(context, upcast_legacy_matrix, 2, 2, upcast_output, &metrics, error, sizeof(error)) != 0 && upcast_output[0] == 91);
     wxdouble_destroy(context);
 
 }

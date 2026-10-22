@@ -22,7 +22,7 @@ CLIP_SHA256 = "9a0eb9c2e80a635150f89e1397012b8f775d6abfeebb19e569cede3f23a2f155"
 ARGMIN_SHA256 = "7cfd400e4c8292a14b60ec6628a65256c0c3cd130197eee6e2047daa06b84360"
 
 
-def compile_native_prefix(original, prefix, minimum=None, probabilities=None, search=None, best=None, query_scale=None):
+def compile_native_prefix(original, prefix, minimum=None, probabilities=None, search=None, best=None, query_scale=None, upcast_distance=None):
     if not inspect.isfunction(original) or original.__closure__ or inspect.unwrap(original) is not original:
         raise ValueError("kmeans_weighted_prefix_reference_not_supported")
     source = inspect.getsource(original)
@@ -101,6 +101,8 @@ def compile_native_prefix(original, prefix, minimum=None, probabilities=None, se
             return self.generic_visit(node)
     tree = ReplacePrefix().visit(tree)
     namespace = dict(original.__globals__)
+    if upcast_distance is not None:
+        namespace["_euclidean_distances"] = upcast_distance
     namespace["__wx_native_kmeans_weighted_prefix"] = prefix
     namespace["__wx_native_kmeans_candidate_minimum"] = minimum
     namespace["__wx_native_kmeans_seed_probabilities"] = probabilities

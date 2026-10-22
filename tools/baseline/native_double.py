@@ -538,6 +538,29 @@ class NativeDoubleNormalization:
             raise ValueError("double_vbx_one_hot_native_result_invalid")
         return output, {"scope": "experimental_native_binary64_vbx_one_hot", "operation": "initial_one_hot", "rows": rows, "columns": columns, "gpu_kernels": ["double_vbx_one_hot"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": labels.nbytes, "logical_result_readback_bytes": output.nbytes, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False}
 
+    def kmeans_upcast_norms(self, values):
+        if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim != 2 or not values.flags.c_contiguous:
+            raise ValueError("double_kmeans_upcast_norms_input_format_invalid")
+        rows, features = values.shape
+        if not 0 < rows <= 4096 or not 0 < features <= 1024:
+            raise ValueError("double_kmeans_upcast_norms_shape_invalid")
+        output, metrics, error = np.empty(rows, dtype=np.float64), Metrics(), ct.create_string_buffer(128)
+        with self.lock:
+            if not self.context:
+                raise ValueError("double_context_closed")
+            try:
+                native = self.library.wxdouble_kmeans_upcast_norms
+            except AttributeError as failure:
+                raise ValueError("double_kmeans_upcast_norms_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(Metrics), ct.c_char_p, ct.c_uint32]
+            native.restype = ct.c_int
+            started = time.perf_counter_ns()
+            if native(self.context, values.ctypes.data, rows, features, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.kernels != 1 or not np.isfinite(output).all() or np.any(output < 0):
+            raise ValueError("double_kmeans_upcast_norms_native_result_invalid")
+        return output, {"scope": "experimental_native_binary64_kmeans_upcast_norms", "rows": rows, "features": features, "reduction_policy": "numpy_2_2_6_neon_f64_reverse8_fma2", "gpu_kernels": ["double_kmeans_upcast_norms"], "command_buffers_per_run": 1, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "native_wall_ns": metrics.wall_ns, "computation_gpu_seconds": metrics.gpu_seconds, "allocated_shared_buffer_bytes": metrics.allocated_bytes, "logical_input_upload_bytes": values.nbytes, "logical_result_readback_bytes": output.nbytes, "host_numeric_row_norms": False, "physical_copy_bytes": None, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+
     def ahc_resident(self, values, cutoff):
         if type(values) is not np.ndarray or values.dtype != np.float64 or values.ndim != 2 or not values.flags.c_contiguous:
             raise ValueError("double_ahc_resident_input_format_invalid")

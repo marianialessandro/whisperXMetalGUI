@@ -89,7 +89,7 @@ def shift_inplace(context, records, values, mean, add, role):
 
 
 @contextlib.contextmanager
-def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None):
+def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None):
     global _ACTIVE
     from sklearn.base import _fit_context
     from sklearn.cluster import KMeans
@@ -110,7 +110,7 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
                 raise ValueError("kmeans_shift_abi_unavailable")
         original_tolerance = None
         original_plusplus = None
-        if prefix_records is not None or minimum_records is not None or probability_records is not None or search_records is not None or best_records is not None or query_records is not None:
+        if prefix_records is not None or minimum_records is not None or probability_records is not None or search_records is not None or best_records is not None or query_records is not None or upcast_norm_records is not None:
             import sklearn.cluster._kmeans as kmeans_module
             from tools.baseline.native_kmeans_prefix import best_candidate, candidate_search, compile_native_prefix, scale_queries, seed_probabilities, weighted_prefix
             if prefix_records is not None:
@@ -144,6 +144,13 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
                     raise ValueError("kmeans_query_scaling_records_required")
                 if getattr(context.library, "wxdouble_matmul", None) is None:
                     raise ValueError("kmeans_query_scaling_abi_unavailable")
+            if upcast_norm_records is not None:
+                from tools.baseline.native_kmeans_upcast_norms import compile_upcast_distances, squared_upcast_norms
+                if not isinstance(upcast_norm_records, list):
+                    raise ValueError("kmeans_upcast_norms_records_required")
+                if getattr(context.library, "wxdouble_kmeans_upcast_norms", None) is None:
+                    raise ValueError("double_kmeans_upcast_norms_abi_unavailable")
+                upcast_distance = compile_upcast_distances(kmeans_module._kmeans_plusplus.__globals__.get("_euclidean_distances"), lambda values, squared=False: squared_upcast_norms(context, upcast_norm_records, values, squared))
             original_plusplus = kmeans_module._kmeans_plusplus
             prefix = (lambda weights, distances: weighted_prefix(context, prefix_records, weights, distances)) if prefix_records is not None else None
             minimum = (lambda closest, candidates: candidate_minimum(context, minimum_records, closest, candidates)) if minimum_records is not None else None
@@ -151,7 +158,7 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
             search = (lambda cdf, queries: candidate_search(context, search_records, cdf, queries)) if search_records is not None else None
             best = (lambda potentials: best_candidate(context, best_records, potentials)) if best_records is not None else None
             query_scale = (lambda random_values, potential: scale_queries(context, query_records, random_values, potential)) if query_records is not None else None
-            candidate_plusplus = compile_native_prefix(original_plusplus, prefix, minimum=minimum, probabilities=probabilities, search=search, best=best, query_scale=query_scale)
+            candidate_plusplus = compile_native_prefix(original_plusplus, prefix, minimum=minimum, probabilities=probabilities, search=search, best=best, query_scale=query_scale, upcast_distance=upcast_distance if upcast_norm_records is not None else None)
         if tolerance_records is not None:
             import sklearn.cluster._kmeans as kmeans_module
             from tools.baseline.native_kmeans_tolerance import compile_native_tolerance, tolerance_value
@@ -186,6 +193,8 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
             if norm_records is not None:
                 records[-1]["cpu_residuals"] = [name for name in records[-1]["cpu_residuals"] if name != "squared_norms"]
                 records[-1]["cpu_residuals"].append("kmeans_initialization_internal_norms")
+            if upcast_norm_records is not None:
+                records[-1]["cpu_residuals"] = [name for name in records[-1]["cpu_residuals"] if name != "kmeans_initialization_internal_norms"]
             return output
 
         def shift(values, offset, add, role):
