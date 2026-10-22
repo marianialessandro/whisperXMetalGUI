@@ -123,3 +123,37 @@ extern "C" int wxkmeans_upcast_chunk(const float* input, uint32_t rows, uint32_t
         return 1;
     }
 }
+
+// NumPy pairwise reduction order is adapted under the notice in native_numpy_norm_notice.txt.
+static float kmeans_pairwise_shift_sum(const float* values, uint32_t count) {
+    if (count < 8) { float total = -0.0f; for (uint32_t index = 0; index < count; ++index) total += values[index]; return total; }
+    if (count > 128) { uint32_t split = (count / 2) & ~7u; return kmeans_pairwise_shift_sum(values, split) + kmeans_pairwise_shift_sum(values + split, count - split); }
+    float lanes[8]; for (uint32_t lane = 0; lane < 8; ++lane) lanes[lane] = values[lane];
+    uint32_t index = 8;
+    for (; index < count - count % 8; index += 8) for (uint32_t lane = 0; lane < 8; ++lane) lanes[lane] += values[index + lane];
+    float total = ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3])) + ((lanes[4] + lanes[5]) + (lanes[6] + lanes[7]));
+    for (; index < count; ++index) total += values[index];
+    return total;
+}
+
+extern "C" int wxkmeans_lloyd_shift_total(const float* shifts, uint32_t count, float* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity) {
+    try {
+        require(shifts != nullptr && output != nullptr && metrics != nullptr, "kmeans_lloyd_shift_pointer_missing");
+        require(count > 0 && count <= 1024, "kmeans_lloyd_shift_count_invalid");
+        auto started = std::chrono::steady_clock::now();
+        std::vector<float> values(count), squares(count); std::memcpy(values.data(), reinterpret_cast<const unsigned char*>(shifts), count * sizeof(float));
+        for (uint32_t index = 0; index < count; ++index) {
+            uint32_t bits = std::bit_cast<uint32_t>(values[index]), magnitude = bits & 0x7fffffffu;
+            require(magnitude == 0 || ((bits >> 31) == 0 && magnitude >= std::bit_cast<uint32_t>(0x1p-60f) && magnitude <= std::bit_cast<uint32_t>(0x1p32f)), "kmeans_lloyd_shift_value_domain_invalid");
+            volatile float square = values[index] * values[index]; squares[index] = square;
+        }
+        float result = 0.0f + kmeans_pairwise_shift_sum(squares.data(), count);
+        require(std::isfinite(result) && result >= 0, "kmeans_lloyd_shift_result_invalid");
+        std::memcpy(reinterpret_cast<unsigned char*>(output), &result, sizeof(result));
+        *metrics = {1, 0, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count())}; return 0;
+    } catch (const std::exception& failure) {
+        if (error != nullptr && capacity > 0) { std::strncpy(error, failure.what(), capacity - 1); error[capacity - 1] = 0; } return 1;
+    } catch (...) {
+        if (error != nullptr && capacity > 0) { std::strncpy(error, "kmeans_lloyd_shift_failed", capacity - 1); error[capacity - 1] = 0; } return 1;
+    }
+}

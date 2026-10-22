@@ -1,3 +1,6 @@
+The C++ Lloyd center-shift squared-sum also adapts NumPy 2.2.6 pairwise reduction ordering.
+Source: https://github.com/numpy/numpy/blob/v2.2.6/numpy/_core/src/umath/loops_utils.h.src
+
 The binary64 KMeans upcast norm kernel adapts the NumPy 2.2.6 NEON einsum sum-of-products reduction order.
 Sources: https://github.com/numpy/numpy/blob/v2.2.6/numpy/_core/src/multiarray/einsum_sumprod.c.src
 https://github.com/numpy/numpy/blob/v2.2.6/numpy/_core/src/common/simd/neon/arithmetic.h

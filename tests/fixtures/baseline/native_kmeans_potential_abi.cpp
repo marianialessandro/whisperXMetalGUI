@@ -12,6 +12,8 @@ extern "C" int wxkmeans_distance_products(const double*, const double*, uint32_t
 
 extern "C" int wxkmeans_upcast_chunk(const float*, uint32_t, uint32_t, double*, KmeansPotentialMetrics*, char*, uint32_t);
 
+extern "C" int wxkmeans_lloyd_shift_total(const float*, uint32_t, float*, KmeansPotentialMetrics*, char*, uint32_t);
+
 int main() {
     float left[] = {1, 2, 3, 4}, weights[] = {2, 3}, output[] = {91, 92};
     KmeansPotentialMetrics metrics = {}; char error[128] = {};
@@ -98,5 +100,23 @@ int main() {
     std::memcpy(converted, overlapping, sizeof(converted)); assert(converted[1] == 0x1p-149 && converted[2] == 3);
     assert(wxkmeans_upcast_chunk(nullptr, 0, 0, nullptr, nullptr, nullptr, 0) != 0);
     tiny[0] = 'x'; assert(wxkmeans_upcast_chunk(nullptr, 0, 0, nullptr, nullptr, tiny, 1) != 0 && tiny[0] == 0);
+
+    float shifts[] = {3, 4}, total = 91;
+    assert(wxkmeans_lloyd_shift_total(shifts, 2, &total, &metrics, error, sizeof(error)) == 0 && total == 25 && metrics.blas_calls == 0);
+    total = 91;
+    assert(wxkmeans_lloyd_shift_total(nullptr, 2, &total, &metrics, error, sizeof(error)) != 0 && total == 91);
+    assert(wxkmeans_lloyd_shift_total(shifts, 2, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_lloyd_shift_total(shifts, 2, &total, nullptr, error, sizeof(error)) != 0 && total == 91);
+    for (uint32_t count : {0u, 1025u}) assert(wxkmeans_lloyd_shift_total(shifts, count, &total, &metrics, error, sizeof(error)) != 0 && total == 91);
+    for (float value : {-1.0f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN(), 0x1p-61f, 0x1p33f}) {
+        shifts[1] = value;
+        assert(wxkmeans_lloyd_shift_total(shifts, 2, &total, &metrics, error, sizeof(error)) != 0 && total == 91);
+    }
+    shifts[1] = 4;
+    unsigned char unaligned_shifts[sizeof(shifts) + 1], unaligned_total[sizeof(total) + 1]; std::memcpy(unaligned_shifts + 1, shifts, sizeof(shifts));
+    assert(wxkmeans_lloyd_shift_total(reinterpret_cast<float*>(unaligned_shifts + 1), 2, reinterpret_cast<float*>(unaligned_total + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(&total, unaligned_total + 1, sizeof(total)); assert(total == 25);
+    assert(wxkmeans_lloyd_shift_total(shifts, 2, shifts, &metrics, error, sizeof(error)) == 0 && shifts[0] == 25);
+    assert(wxkmeans_lloyd_shift_total(nullptr, 0, nullptr, nullptr, nullptr, 0) != 0);
 
 }
