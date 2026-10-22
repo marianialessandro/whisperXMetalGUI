@@ -55,6 +55,28 @@ class NativeKMeansPotentials:
         with self.lock:
             self.closed = True
 
+    def lloyd_center_shifts(self, updated, previous):
+        if any(type(value) is not np.ndarray or value.dtype != np.float32 or value.ndim != 2 or not value.flags.c_contiguous for value in (updated, previous)):
+            raise ValueError("kmeans_lloyd_center_shifts_operand_format_invalid")
+        clusters, features = updated.shape
+        if not 0 < clusters <= 256 or not 0 < features <= 1024 or previous.shape != updated.shape:
+            raise ValueError("kmeans_lloyd_center_shifts_shape_invalid")
+        output, metrics, error = np.empty(clusters, np.float32), PotentialMetrics(), ct.create_string_buffer(128)
+        started = time.perf_counter_ns()
+        with self.lock:
+            if self.closed:
+                raise ValueError("kmeans_potential_context_closed")
+            try:
+                native = self.library.wxkmeans_lloyd_center_shifts
+            except AttributeError as failure:
+                raise ValueError("kmeans_lloyd_center_shifts_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(PotentialMetrics), ct.c_char_p, ct.c_uint32]; native.restype = ct.c_int
+            if native(updated.ctypes.data, previous.ctypes.data, clusters, features, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.blas_calls != 0 or not np.isfinite(output).all() or (output < 0).any():
+            raise ValueError("kmeans_lloyd_center_shifts_native_result_invalid")
+        return output, {"scope": "experimental_native_cpu_lloyd_center_shifts", "execution_device": "cpu", "backend": "cpp_cython_float32_four_term_fma_sqrt", "clusters": clusters, "features": features, "native_blas_calls": 0, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": updated.nbytes + previous.nbytes, "host_result_bytes": output.nbytes, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_numeric_center_shift": False, "center_shifts_replaced": True, "lloyd_iteration_replaced": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+
     def lloyd_centroids(self, values, weights, labels, clusters):
         if type(values) is not np.ndarray or values.dtype != np.float32 or values.ndim != 2 or not values.flags.c_contiguous or type(weights) is not np.ndarray or weights.dtype != np.float32 or weights.ndim != 1 or not weights.flags.c_contiguous or type(labels) is not np.ndarray or labels.dtype != np.int32 or labels.ndim != 1 or not labels.flags.c_contiguous:
             raise ValueError("kmeans_lloyd_centroids_operand_format_invalid")

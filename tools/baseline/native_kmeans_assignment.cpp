@@ -97,3 +97,41 @@ extern "C" int wxkmeans_lloyd_centroids(const float* values, const float* weight
         return 1;
     }
 }
+
+// Preserve the pinned Cython float32 Euclidean group order and scalar tail, including the rounded second square.
+extern "C" int wxkmeans_lloyd_center_shifts(const float* updated, const float* previous, uint32_t clusters, uint32_t features, float* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity) {
+    try {
+        require(updated != nullptr && previous != nullptr && output != nullptr && metrics != nullptr, "kmeans_lloyd_center_shifts_pointer_missing");
+        require(clusters > 0 && clusters <= 256 && features > 0 && features <= 1024, "kmeans_lloyd_center_shifts_shape_invalid");
+        auto started = std::chrono::steady_clock::now();
+        std::vector<float> a(uint64_t(clusters) * features), b(a.size()), result(clusters);
+        std::memcpy(a.data(), updated, a.size() * sizeof(float));
+        std::memcpy(b.data(), previous, b.size() * sizeof(float));
+        for (float value : a) require(std::isfinite(value) && std::abs(value) <= 0x1p32f, "kmeans_lloyd_center_shifts_value_domain_invalid");
+        for (float value : b) require(std::isfinite(value) && std::abs(value) <= 0x1p32f, "kmeans_lloyd_center_shifts_value_domain_invalid");
+        for (uint32_t cluster = 0; cluster < clusters; ++cluster) {
+            uint64_t start = uint64_t(cluster) * features;
+            float total = 0.0f; uint32_t feature = 0;
+            for (; feature + 4 <= features; feature += 4) {
+                float d0 = a[start + feature] - b[start + feature], d1 = a[start + feature + 1] - b[start + feature + 1], d2 = a[start + feature + 2] - b[start + feature + 2], d3 = a[start + feature + 3] - b[start + feature + 3];
+                volatile float second_square = d1 * d1;
+                float group = std::fma(d0, d0, second_square);
+                group = std::fma(d2, d2, group);
+                group = std::fma(d3, d3, group);
+                total += group;
+            }
+            for (; feature < features; ++feature) { float difference = a[start + feature] - b[start + feature]; total = std::fma(difference, difference, total); }
+            result[cluster] = std::sqrt(total);
+            require(std::isfinite(result[cluster]) && result[cluster] >= 0, "kmeans_lloyd_center_shifts_result_invalid");
+        }
+        std::memcpy(output, result.data(), result.size() * sizeof(float));
+        *metrics = {1, 0, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count())};
+        return 0;
+    } catch (const std::exception& failure) {
+        if (error != nullptr && capacity > 0) { std::strncpy(error, failure.what(), capacity - 1); error[capacity - 1] = 0; }
+        return 1;
+    } catch (...) {
+        if (error != nullptr && capacity > 0) { std::strncpy(error, "kmeans_lloyd_center_shifts_failed", capacity - 1); error[capacity - 1] = 0; }
+        return 1;
+    }
+}

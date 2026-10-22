@@ -1,4 +1,5 @@
 #include <cassert>
+#include <cmath>
 #include <bit>
 #include <cstdint>
 #include <cstring>
@@ -22,9 +23,32 @@ extern "C" int wxkmeans_lloyd_assignment(const float*, const float*, const float
 
 extern "C" int wxkmeans_lloyd_centroids(const float*, const float*, const int32_t*, uint32_t, uint32_t, uint32_t, float*, float*, KmeansPotentialMetrics*, char*, uint32_t);
 
+extern "C" int wxkmeans_lloyd_center_shifts(const float*, const float*, uint32_t, uint32_t, float*, KmeansPotentialMetrics*, char*, uint32_t);
+
 int main() {
     float left[] = {1, 2, 3, 4}, weights[] = {2, 3}, output[] = {91, 92};
     KmeansPotentialMetrics metrics = {}; char error[128] = {};
+    float movement_values[] = {3, 4, -0.0f, 0.0f}, movement_previous[] = {0, 0, 0, 0}, movement_output[] = {91, 92};
+    assert(wxkmeans_lloyd_center_shifts(movement_values, movement_previous, 2, 2, movement_output, &metrics, error, sizeof(error)) == 0 && movement_output[0] == 5 && movement_output[1] == 0 && !std::signbit(movement_output[1]) && metrics.blas_calls == 0);
+    movement_output[0] = 91; movement_output[1] = 92;
+    assert(wxkmeans_lloyd_center_shifts(nullptr, movement_previous, 2, 2, movement_output, &metrics, error, sizeof(error)) != 0 && movement_output[0] == 91);
+    assert(wxkmeans_lloyd_center_shifts(movement_values, nullptr, 2, 2, movement_output, &metrics, error, sizeof(error)) != 0 && movement_output[0] == 91);
+    assert(wxkmeans_lloyd_center_shifts(movement_values, movement_previous, 2, 2, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_lloyd_center_shifts(movement_values, movement_previous, 2, 2, movement_output, nullptr, error, sizeof(error)) != 0);
+    for (uint32_t size : {0u, 257u}) assert(wxkmeans_lloyd_center_shifts(movement_values, movement_previous, size, 2, movement_output, &metrics, error, sizeof(error)) != 0 && movement_output[0] == 91);
+    for (uint32_t size : {0u, 1025u}) assert(wxkmeans_lloyd_center_shifts(movement_values, movement_previous, 2, size, movement_output, &metrics, error, sizeof(error)) != 0 && movement_output[0] == 91);
+    for (float invalid : {0x1p33f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+        movement_values[3] = invalid;
+        assert(wxkmeans_lloyd_center_shifts(movement_values, movement_previous, 2, 2, movement_output, &metrics, error, sizeof(error)) != 0 && movement_output[0] == 91 && movement_output[1] == 92);
+    }
+    movement_values[3] = 0; movement_previous[3] = std::numeric_limits<float>::quiet_NaN();
+    assert(wxkmeans_lloyd_center_shifts(movement_values, movement_previous, 2, 2, movement_output, &metrics, error, sizeof(error)) != 0 && movement_output[0] == 91);
+    movement_previous[3] = 0;
+    unsigned char movement_input[sizeof(movement_values) + 1], movement_unaligned[sizeof(movement_output) + 1];
+    std::memcpy(movement_input + 1, movement_values, sizeof(movement_values));
+    assert(wxkmeans_lloyd_center_shifts(reinterpret_cast<float*>(movement_input + 1), movement_previous, 2, 2, reinterpret_cast<float*>(movement_unaligned + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(movement_output, movement_unaligned + 1, sizeof(movement_output)); assert(movement_output[0] == 5 && movement_output[1] == 0);
+    assert(wxkmeans_lloyd_center_shifts(movement_values, movement_previous, 2, 2, movement_values, &metrics, error, sizeof(error)) == 0 && movement_values[0] == 5 && movement_values[1] == 0);
     float cx[] = {1, 2, 3, 4}, cw[] = {1, 3}, cc[] = {91, 92}, ct[] = {93}; int32_t cl[] = {0, 0};
     assert(wxkmeans_lloyd_centroids(cx, cw, cl, 2, 1, 2, cc, ct, &metrics, error, sizeof(error)) == 0 && cc[0] == 2.5f && cc[1] == 3.5f && ct[0] == 4 && metrics.blas_calls == 0);
     cc[0] = 91; ct[0] = 93;

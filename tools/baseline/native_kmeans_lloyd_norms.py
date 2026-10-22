@@ -15,7 +15,7 @@ LLOYD_BINARY_SHA256 = "865e1791855baec7f4a8233cc5792a13a04efcdb4daef57d986c10fe2
 
 
 class LloydNormScope:
-    def __init__(self, context, records, assignment_context=None, assignment_records=None, centroid_records=None):
+    def __init__(self, context, records, assignment_context=None, assignment_records=None, centroid_records=None, center_shift_records=None):
         import sklearn.cluster._k_means_lloyd as module
         if not isinstance(records, list):
             raise ValueError("kmeans_lloyd_norm_records_required")
@@ -42,6 +42,12 @@ class LloydNormScope:
             if hashlib.sha256(Path(common.__file__).read_bytes()).hexdigest() != "793cb26715cc85762eb460e29cce45a4a40584ddcaba761bfd69adafd080f3cf" or "float" not in getattr(common._euclidean_dense_dense_wrapper, "__signatures__", {}):
                 raise ValueError("kmeans_lloyd_centroids_shift_reference_not_supported")
             self.original_shift = common._euclidean_dense_dense_wrapper["float"]
+        if center_shift_records is not None:
+            if centroid_records is None or not isinstance(center_shift_records, list):
+                raise ValueError("kmeans_lloyd_center_shifts_configuration_invalid")
+            if getattr(assignment_context.library, "wxkmeans_lloyd_center_shifts", None) is None:
+                raise ValueError("kmeans_lloyd_center_shifts_abi_unavailable")
+        self.center_shift_records = center_shift_records
         self.centroid_records = centroid_records
         self.assignment_context, self.assignment_records = assignment_context, assignment_records
         self.iteration_signature = inspect.signature(module.lloyd_iter_chunked_dense)
@@ -89,14 +95,21 @@ class LloydNormScope:
                 started = time.perf_counter_ns()
                 assigned, distances, assignment_record = self.assignment_context.lloyd_assignment(np.asarray(X), self.centers, norms)
                 updated, totals, record = self.assignment_context.lloyd_centroids(np.asarray(X), np.asarray(sample_weight), assigned, clusters)
-                shifts = np.empty(clusters, np.float32)
-                for cluster in range(clusters):
-                    shifts[cluster] = self.original_shift(updated[cluster], self.centers[cluster], False)
+                if self.center_shift_records is not None:
+                    shifts, shift_record = self.assignment_context.lloyd_center_shifts(updated, self.centers)
+                    shift_record.update({"adapter_scope": "sklearn_dense_float32_lloyd_centroid_movement", "original_common_binary_sha256": "793cb26715cc85762eb460e29cce45a4a40584ddcaba761bfd69adafd080f3cf", "cpu_residuals": ["inertia", "convergence_control", "host_staging_and_control"]})
+                else:
+                    shifts = np.empty(clusters, np.float32)
+                    for cluster in range(clusters):
+                        shifts[cluster] = self.original_shift(updated[cluster], self.centers[cluster], False)
                 if not np.isfinite(shifts).all():
                     raise ValueError("kmeans_lloyd_centroids_shift_result_invalid")
                 for (output, shape, dtype), result in zip(outputs, (assigned, updated, totals, shifts)):
                     np.copyto(output, result, casting="no")
                 record.update({"adapter_scope": "sklearn_dense_float32_lloyd_regular_assignment_and_centroids", "original_lloyd_binary_sha256": LLOYD_BINARY_SHA256, "assignment_backend": assignment_record["backend"], "assignment_native_wall_ns": assignment_record["native_wall_ns"], "centroid_completion_and_bridge_wall_ns": record["completion_and_bridge_wall_ns"], "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "centroid_host_input_snapshot_bytes": record["host_input_snapshot_bytes"], "host_input_snapshot_bytes": assignment_record["host_input_snapshot_bytes"] + record["host_input_snapshot_bytes"], "centroid_host_result_bytes": record["host_result_bytes"], "host_result_bytes": assignment_record["host_result_bytes"] + record["host_result_bytes"], "centroid_native_wall_ns": record["native_wall_ns"], "native_wall_ns": assignment_record["native_wall_ns"] + record["native_wall_ns"], "native_blas_calls": 1, "assignment_host_input_snapshot_bytes": assignment_record["host_input_snapshot_bytes"], "assignment_host_result_bytes": assignment_record["host_result_bytes"], "center_shift_backend": "original_cython_euclidean_dense_dense_float", "center_shift_calls": clusters, "host_output_copy_bytes": sum(output.nbytes for output, shape, dtype in outputs), "centroid_norms_device": "gpu", "cpu_residuals": ["cython_center_shift", "inertia", "convergence_control", "host_staging_and_control"], "unsupported_operations": ["empty_cluster_relocation", "multiple_chunk_merge"]})
+                if self.center_shift_records is not None:
+                    record.update({"center_shift_backend": shift_record["backend"], "center_shift_calls": 1, "center_shift_rows": clusters, "cpu_residuals": ["inertia", "convergence_control", "host_staging_and_control"]})
+                    self.center_shift_records.append(shift_record)
                 self.centroid_records.append(record)
                 return None
             if bound is not None and bound.arguments["update_centers"] is False:
