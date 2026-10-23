@@ -18,16 +18,30 @@ class PotentialMetrics(ct.Structure):
     _fields_ = [("version", ct.c_uint32), ("blas_calls", ct.c_uint32), ("wall_ns", ct.c_uint64)]
 
 
-def build_library(output):
+def build_library(output, with_inertia=False):
     output = Path(output).absolute()
     if output.exists() or output.is_symlink():
         raise ValueError("kmeans_potential_build_output_exists")
     source = Path(__file__).with_suffix(".cpp")
     with tempfile.TemporaryDirectory(prefix="kmeans-potential-build-", dir=output.parent) as directory:
         staged = Path(directory) / "potential.dylib"
-        subprocess.run(["xcrun", "clang++", "-std=c++20", "-O1", "-ffp-contract=off", "-dynamiclib", str(source), str(source.with_name("native_kmeans_assignment.cpp")), "-framework", "Accelerate", "-o", str(staged)], check=True, capture_output=True, timeout=60)
+        command = ["xcrun", "clang++", "-std=c++20", "-O1", "-ffp-contract=off", "-dynamiclib", str(source), str(source.with_name("native_kmeans_assignment.cpp")), "-framework", "Accelerate", "-o", str(staged)]
+        if with_inertia:
+            from tools.baseline.native_kmeans_inertia import runtime_path
+            runtime = runtime_path()
+            inertia_object = Path(directory) / "inertia.o"
+            subprocess.run(["xcrun", "clang++", "-std=c++20", "-O1", "-ffp-contract=off", "-Xpreprocessor", "-fopenmp", "-fPIC", "-c", str(source.with_name("native_kmeans_inertia.cpp")), "-o", str(inertia_object)], check=True, capture_output=True, timeout=60)
+            command += [str(inertia_object), str(runtime), "-Wl,-rpath," + str(runtime.parent)]
+        subprocess.run(command, check=True, capture_output=True, timeout=60)
+        if with_inertia:
+            install_id = subprocess.run(["otool", "-D", str(runtime)], check=True, capture_output=True, text=True, timeout=10).stdout.splitlines()[1].strip()
+            subprocess.run(["install_name_tool", "-change", install_id, "@rpath/libomp.dylib", str(staged)], check=True, capture_output=True, timeout=10)
+            subprocess.run(["codesign", "--force", "--sign", "-", "--timestamp=none", str(staged)], check=True, capture_output=True, timeout=10)
         os.link(staged, output)
-    return {"library_sha256": hashlib.sha256(output.read_bytes()).hexdigest(), "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(), "assignment_source_sha256": hashlib.sha256(source.with_name("native_kmeans_assignment.cpp").read_bytes()).hexdigest(), "scope": "experimental_native_cpu_kmeans_potentials"}
+    identity = {"library_sha256": hashlib.sha256(output.read_bytes()).hexdigest(), "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(), "assignment_source_sha256": hashlib.sha256(source.with_name("native_kmeans_assignment.cpp").read_bytes()).hexdigest(), "distance_source_sha256": hashlib.sha256(source.with_name("native_kmeans_distance.hpp").read_bytes()).hexdigest(), "scope": "experimental_native_cpu_kmeans_potentials"}
+    if with_inertia:
+        identity.update({"inertia_source_sha256": hashlib.sha256(source.with_name("native_kmeans_inertia.cpp").read_bytes()).hexdigest(), "openmp_runtime_sha256": hashlib.sha256(runtime.read_bytes()).hexdigest()})
+    return identity
 
 
 class NativeKMeansPotentials:
@@ -42,6 +56,9 @@ class NativeKMeansPotentials:
             raise ValueError("kmeans_potential_abi_unavailable") from failure
         self.native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(PotentialMetrics), ct.c_char_p, ct.c_uint32]
         self.native.restype = ct.c_int
+        if getattr(self.library, "wxkmeans_inertia_dense", None) is not None:
+            from tools.baseline.native_kmeans_inertia import validate_loaded_runtime
+            validate_loaded_runtime(self.library)
         self.lock, self.closed = threading.RLock(), False
         self.identity = {"library_sha256": expected_sha256, "backend": "cpu_accelerate_ilp64", "production_backend": False}
 
@@ -54,6 +71,33 @@ class NativeKMeansPotentials:
     def close(self):
         with self.lock:
             self.closed = True
+
+    def inertia_dense(self, values, weights, centers, labels, n_threads, single_label=-1):
+        if any(type(value) is not np.ndarray or value.dtype != np.float32 or not value.flags.c_contiguous for value in (values, weights, centers)) or values.ndim != 2 or centers.ndim != 2 or weights.ndim != 1 or type(labels) is not np.ndarray or labels.dtype != np.int32 or labels.ndim != 1 or not labels.flags.c_contiguous:
+            raise ValueError("kmeans_inertia_operand_format_invalid")
+        rows, features = values.shape
+        clusters = centers.shape[0]
+        if not 0 < rows <= 256 or not 0 < clusters <= 256 or not 0 < features <= 1024 or centers.shape[1] != features or weights.shape != (rows,) or labels.shape != (rows,):
+            raise ValueError("kmeans_inertia_shape_invalid")
+        if type(n_threads) is not int or n_threads not in (1, 2, 12):
+            raise ValueError("kmeans_inertia_thread_count_not_supported")
+        if type(single_label) is not int or not -1 <= single_label < clusters:
+            raise ValueError("kmeans_inertia_single_label_invalid")
+        output, metrics, error = np.empty(1, np.float32), PotentialMetrics(), ct.create_string_buffer(128)
+        started = time.perf_counter_ns()
+        with self.lock:
+            if self.closed:
+                raise ValueError("kmeans_potential_context_closed")
+            try:
+                native = self.library.wxkmeans_inertia_dense
+            except AttributeError as failure:
+                raise ValueError("kmeans_inertia_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p] * 4 + [ct.c_uint32] * 4 + [ct.c_int32, ct.c_void_p, ct.POINTER(PotentialMetrics), ct.c_char_p, ct.c_uint32]; native.restype = ct.c_int
+            if native(values.ctypes.data, weights.ctypes.data, centers.ctypes.data, labels.ctypes.data, rows, clusters, features, n_threads, single_label, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.blas_calls != 0 or not np.isfinite(output[0]) or output[0] < 0:
+            raise ValueError("kmeans_inertia_native_result_invalid")
+        return float(output[0]), {"scope": "experimental_native_cpu_openmp_inertia", "execution_device": "cpu", "backend": "cpp_pinned_openmp_static_float32_fma", "samples": rows, "clusters": clusters, "features": features, "requested_threads": n_threads, "actual_threads": n_threads, "single_label": single_label, "native_blas_calls": 0, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": values.nbytes + weights.nbytes + centers.nbytes + labels.nbytes, "host_result_bytes": 4, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_numeric_inertia": False, "thread_count_changed": False, "lloyd_iteration_replaced": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
 
     def lloyd_center_shifts(self, updated, previous):
         if any(type(value) is not np.ndarray or value.dtype != np.float32 or value.ndim != 2 or not value.flags.c_contiguous for value in (updated, previous)):
@@ -295,8 +339,9 @@ def upcast_chunk(context, records, values, role, target_dtype=np.float64):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, help="New native CPU Accelerate dylib path; existing files are preserved.")
+    parser.add_argument("--with-inertia", action="store_true", help="Additionally build the pinned OpenMP inertia ABI using sklearn's existing libomp; default builds retain the previous dependencies.")
     args = parser.parse_args()
-    print(json.dumps(build_library(args.output), sort_keys=True))
+    print(json.dumps(build_library(args.output, with_inertia=args.with_inertia), sort_keys=True))
 
 
 if __name__ == "__main__":

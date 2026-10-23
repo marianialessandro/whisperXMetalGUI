@@ -1,6 +1,7 @@
 #define ACCELERATE_NEW_LAPACK
 #include <Accelerate/Accelerate.h>
 #include "native_checks.hpp"
+#include "native_kmeans_distance.hpp"
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -111,17 +112,7 @@ extern "C" int wxkmeans_lloyd_center_shifts(const float* updated, const float* p
         for (float value : b) require(std::isfinite(value) && std::abs(value) <= 0x1p32f, "kmeans_lloyd_center_shifts_value_domain_invalid");
         for (uint32_t cluster = 0; cluster < clusters; ++cluster) {
             uint64_t start = uint64_t(cluster) * features;
-            float total = 0.0f; uint32_t feature = 0;
-            for (; feature + 4 <= features; feature += 4) {
-                float d0 = a[start + feature] - b[start + feature], d1 = a[start + feature + 1] - b[start + feature + 1], d2 = a[start + feature + 2] - b[start + feature + 2], d3 = a[start + feature + 3] - b[start + feature + 3];
-                volatile float second_square = d1 * d1;
-                float group = std::fma(d0, d0, second_square);
-                group = std::fma(d2, d2, group);
-                group = std::fma(d3, d3, group);
-                total += group;
-            }
-            for (; feature < features; ++feature) { float difference = a[start + feature] - b[start + feature]; total = std::fma(difference, difference, total); }
-            result[cluster] = std::sqrt(total);
+            result[cluster] = std::sqrt(wxkmeans_squared_distance(a.data() + start, b.data() + start, features));
             require(std::isfinite(result[cluster]) && result[cluster] >= 0, "kmeans_lloyd_center_shifts_result_invalid");
         }
         std::memcpy(output, result.data(), result.size() * sizeof(float));
