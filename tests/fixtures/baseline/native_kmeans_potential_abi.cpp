@@ -12,6 +12,7 @@ struct KmeansPotentialMetrics { uint32_t version, blas_calls; uint64_t wall_ns; 
 extern "C" int wxkmeans_weighted_potentials(const float*, const float*, uint32_t, uint32_t, float*, KmeansPotentialMetrics*, char*, uint32_t);
 
 extern "C" int wxkmeans_distance_products(const double*, const double*, uint32_t, uint32_t, uint32_t, double*, KmeansPotentialMetrics*, char*, uint32_t);
+extern "C" int wxkmeans_distance_products_512(const double*, const double*, uint32_t, uint32_t, uint32_t, double*, KmeansPotentialMetrics*, char*, uint32_t);
 
 extern "C" int wxkmeans_upcast_chunk(const float*, uint32_t, uint32_t, double*, KmeansPotentialMetrics*, char*, uint32_t);
 extern "C" int wxkmeans_upcast_chunk_512(const float*, uint32_t, uint32_t, double*, KmeansPotentialMetrics*, char*, uint32_t);
@@ -278,5 +279,22 @@ int main() {
     std::memcpy(large_converted.data(), large_alias.data() + 1, large_converted.size() * sizeof(double));
     for (size_t index = 0; index < large_chunk.size(); ++index) assert(large_converted[index] == double(large_chunk[index]));
     assert(wxkmeans_upcast_chunk_512(nullptr, 512, 17, large_converted.data(), &metrics, error, sizeof(error)) != 0);
+
+    std::vector<double> large_left(3 * 17, .25), large_right(512 * 17, .5), large_product(3 * 512, 91.);
+    assert(wxkmeans_distance_products_512(large_left.data(), large_right.data(), 3, 512, 17, large_product.data(), &metrics, error, sizeof(error)) == 0);
+    for (double value : large_product) assert(value == 17. * .125);
+    std::fill(large_product.begin(), large_product.end(), 91.);
+    assert(wxkmeans_distance_products(large_left.data(), large_right.data(), 3, 512, 17, large_product.data(), &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_distance_products_512(large_left.data(), large_right.data(), 3, 513, 17, large_product.data(), &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_distance_products_512(nullptr, large_right.data(), 3, 512, 17, large_product.data(), &metrics, error, sizeof(error)) != 0);
+    large_right.back() = std::numeric_limits<double>::infinity();
+    assert(wxkmeans_distance_products_512(large_left.data(), large_right.data(), 3, 512, 17, large_product.data(), &metrics, error, sizeof(error)) != 0);
+    for (double value : large_product) assert(value == 91.);
+    large_right.back() = .5;
+    std::vector<unsigned char> large_product_alias(large_right.size() * sizeof(double) + 1);
+    std::memcpy(large_product_alias.data() + 1, large_right.data(), large_right.size() * sizeof(double));
+    assert(wxkmeans_distance_products_512(large_left.data(), reinterpret_cast<double*>(large_product_alias.data() + 1), 3, 512, 17, reinterpret_cast<double*>(large_product_alias.data() + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(large_product.data(), large_product_alias.data() + 1, large_product.size() * sizeof(double));
+    for (double value : large_product) assert(value == 17. * .125);
 
 }

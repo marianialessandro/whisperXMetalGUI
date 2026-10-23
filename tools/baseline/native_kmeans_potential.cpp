@@ -51,10 +51,10 @@ extern "C" int wxkmeans_weighted_potentials(const float* distances, const float*
     }
 }
 
-extern "C" int wxkmeans_distance_products(const double* left, const double* right, uint32_t rows, uint32_t columns, uint32_t features, double* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity) {
+static int wxkmeans_distance_products_impl(const double* left, const double* right, uint32_t rows, uint32_t columns, uint32_t features, double* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity, uint32_t maximum_extent) {
     try {
         require(left != nullptr && right != nullptr && output != nullptr && metrics != nullptr, "kmeans_distance_product_pointer_missing");
-        require(rows > 0 && rows <= 256 && columns > 0 && columns <= 256 && features > 0 && features <= 1024, "kmeans_distance_product_shape_invalid");
+        require(rows > 0 && rows <= maximum_extent && columns > 0 && columns <= maximum_extent && features > 0 && features <= 1024, "kmeans_distance_product_shape_invalid");
         auto started = std::chrono::steady_clock::now();
         std::vector<double> a(uint64_t(rows) * features), b(uint64_t(columns) * features), result(uint64_t(rows) * columns);
         std::memcpy(a.data(), reinterpret_cast<const unsigned char*>(left), a.size() * sizeof(double));
@@ -92,6 +92,14 @@ extern "C" int wxkmeans_distance_products(const double* left, const double* righ
         if (error != nullptr && capacity > 0) { std::strncpy(error, "kmeans_distance_product_failed", capacity - 1); error[capacity - 1] = 0; }
         return 1;
     }
+}
+
+extern "C" int wxkmeans_distance_products(const double* left, const double* right, uint32_t rows, uint32_t columns, uint32_t features, double* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity) {
+    return wxkmeans_distance_products_impl(left, right, rows, columns, features, output, metrics, error, capacity, 256);
+}
+
+extern "C" int wxkmeans_distance_products_512(const double* left, const double* right, uint32_t rows, uint32_t columns, uint32_t features, double* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity) {
+    return wxkmeans_distance_products_impl(left, right, rows, columns, features, output, metrics, error, capacity, 512);
 }
 
 static int wxkmeans_upcast_chunk_impl(const float* input, uint32_t rows, uint32_t features, double* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity, uint32_t maximum_rows) {

@@ -907,6 +907,14 @@ class MetalCLITests(unittest.TestCase):
             self.assertNotIn("private.wav", report.read_text())
             self.assertNotIn("private-secret", report.read_text())
 
+    def test_kmeans_distance_products_512_requires_base_option(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stderr(io.StringIO()):
+            report = Path(directory) / "report.json"
+            with self.assertRaises(SystemExit) as caught:
+                main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--kmeans-distance-products-512"])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertFalse(report.exists())
+
     def test_kmeans_distance_products_requires_library_and_upcast_norms(self):
         for extra in ([], ["--kmeans-upcast-norms"], ["--kmeans-potential-library", "unused.dylib", "--kmeans-potential-library-sha256", "0" * 64]):
             with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stderr(io.StringIO()):
@@ -935,6 +943,33 @@ class MetalCLITests(unittest.TestCase):
             data = json.loads(report.read_text())
             self.assertEqual(data["status"], "failed")
             self.assertTrue(data["kmeans_distance_products_requested"])
+            self.assertFalse(data["kmeans_distance_products_observed"])
+            self.assertEqual(data["native_cpu_kmeans_distance_product_calls"], 0)
+            self.assertIs(KMeans.fit, original_fit)
+            self.assertIs(kmeans_module._kmeans_plusplus, original_plus)
+            self.assertNotIn("private.wav", report.read_text())
+            self.assertNotIn("private-secret", report.read_text())
+
+    def test_kmeans_distance_products_512_capability_failure_restores_privacy(self):
+        from sklearn.cluster import KMeans
+        import sklearn.cluster._kmeans as kmeans_module
+        original_fit, original_plus = KMeans.fit, kmeans_module._kmeans_plusplus
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with patch("tools.baseline.mps_storage_probe.MPSCTC") as native, patch("tools.baseline.native_double.NativeDoubleNormalization") as double, patch("tools.baseline.native_kmeans_potential.NativeKMeansPotentials") as potential:
+                native.return_value.__enter__.return_value.identity = {}
+                native.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.identity = {}
+                double.return_value.__enter__.return_value.initialization_wall_ns = 1
+                double.return_value.__enter__.return_value.library = SimpleNamespace(wxdouble_vbx_kmeans_centroids=object())
+                potential.return_value.__enter__.return_value.identity = {}
+                potential.return_value.__enter__.return_value.library = SimpleNamespace(wxkmeans_weighted_potentials=object(), wxkmeans_distance_products=object())
+                with self.assertRaisesRegex(ValueError, "product_512_abi_unavailable"):
+                    main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--plda-normalization-library", "unused.dylib", "--plda-normalization-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--kmeans-feature-mean", "--kmeans-upcast-norms", "--kmeans-distance-products", "--kmeans-distance-products-512", "--kmeans-potential-library", "unused.dylib", "--kmeans-potential-library-sha256", "0" * 64, "--hf_token", "private-secret"])
+            data = json.loads(report.read_text())
+            self.assertEqual(data["status"], "failed")
+            self.assertTrue(data["kmeans_distance_products_512_requested"])
+            self.assertFalse(data["kmeans_distance_products_512_observed"])
             self.assertFalse(data["kmeans_distance_products_observed"])
             self.assertEqual(data["native_cpu_kmeans_distance_product_calls"], 0)
             self.assertIs(KMeans.fit, original_fit)

@@ -152,3 +152,78 @@ class NativeKMeansDistanceProductTests(unittest.TestCase):
                 with native_kmeans_feature_mean(gpu, [], product_records=[]):
                     pass
         self.assertIs(KMeans.fit, original_fit); self.assertIs(kmeans._kmeans_plusplus, original_plus)
+
+    def test_extended_shapes_dispatch_bits_and_legacy_guards(self):
+        rng = np.random.default_rng(51283)
+        with self.context() as cpu:
+            for rows, columns in ((1, 257), (1, 512), (257, 1), (512, 1), (3, 257), (3, 512), (257, 3), (512, 3), (257, 512), (512, 257), (511, 512), (512, 512)):
+                for features in (1, 3, 17, 256, 1024):
+                    for same in (False, True) if rows == columns else (False,):
+                        left = rng.normal(size=(rows, features))
+                        right = left if same else rng.normal(size=(columns, features))
+                        expected = left @ right.T
+                        actual, record = cpu.distance_products(left, right, extended_shape=True)
+                        np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+                        self.assertTrue(record["extended_shape_enabled"])
+                        self.assertEqual(record["maximum_extent"], 512)
+                        self.assertEqual(record["execution_device"], "cpu")
+                        self.assertEqual(record["gpu_kernels"], [])
+            for shape in ((513, 1, 3), (1, 513, 3), (0, 512, 3), (512, 1, 1025)):
+                rows, columns, features = shape
+                with self.assertRaisesRegex(ValueError, "shape_invalid"):
+                    cpu.distance_products(np.ones((rows, features)), np.ones((columns, features)), extended_shape=True)
+            left, right = np.ones((3, 17)), np.ones((512, 17))
+            with self.assertRaisesRegex(ValueError, "shape_invalid"):
+                cpu.distance_products(left, right)
+            for flag in (1, None, "yes"):
+                with self.assertRaisesRegex(ValueError, "configuration"):
+                    cpu.distance_products(left, right, extended_shape=flag)
+            for value in (np.nan, np.inf, 2. ** -201, 2. ** 201):
+                right[-1, -1] = value
+                with self.assertRaisesRegex(ValueError, "value_domain_invalid"):
+                    cpu.distance_products(left, right, extended_shape=True)
+            with patch.object(cpu, "library", SimpleNamespace()), self.assertRaisesRegex(ValueError, "product_512_abi_unavailable"):
+                cpu.distance_products(left, right, extended_shape=True)
+
+    def test_extended_helper_original_batches_and_weighted_fits(self):
+        with self.context() as cpu, NativeDoubleNormalization(self.double, self.double_identity["library_sha256"]) as gpu:
+            for rows in (257, 512):
+                values = np.random.default_rng(rows).normal(size=(rows, 17)).astype(np.float32)
+                candidate = compile_upcast_distances(pairwise._euclidean_distances, pairwise.row_norms, product=lambda left, right, dense_output: distance_products(cpu, records, left, right, dense_output, extended_shape=True))
+                for right in (values, values.copy(), values[:3].copy()):
+                    records = []
+                    expected = pairwise._euclidean_distances(values, right, squared=True)
+                    actual = candidate(values, right, squared=True)
+                    np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+                    self.assertTrue(any(max(record["rows"], record["columns"]) == rows for record in records))
+                for clusters in (1, 4):
+                    weights = np.linspace(.125, 2, rows, dtype=np.float32)
+                    rng1, rng2 = np.random.RandomState(17), np.random.RandomState(17)
+                    left, right = values.copy(), values.copy()
+                    expected = KMeans(n_clusters=clusters, n_init=2, random_state=rng1, copy_x=False).fit(left, sample_weight=weights)
+                    with native_kmeans_feature_mean(gpu, [], potential_context=cpu, potential_records=[], upcast_norm_records=[], chunk_records=[], upcast_512=True, product_records=(records := []), products_512=True):
+                        actual = KMeans(n_clusters=clusters, n_init=2, random_state=rng2, copy_x=False).fit(right, sample_weight=weights)
+                    np.testing.assert_array_equal(actual.cluster_centers_.view(np.uint32), expected.cluster_centers_.view(np.uint32))
+                    np.testing.assert_array_equal(actual.labels_, expected.labels_)
+                    np.testing.assert_array_equal(left.view(np.uint32), right.view(np.uint32))
+                    np.testing.assert_array_equal(rng1.uniform(size=32), rng2.uniform(size=32))
+                    self.assertEqual((actual.inertia_, actual.n_iter_, actual._n_threads), (expected.inertia_, expected.n_iter_, expected._n_threads))
+                    self.assertTrue(any(max(record["rows"], record["columns"]) > 256 for record in records))
+            with self.assertRaisesRegex(ValueError, "product_512_configuration"), native_kmeans_feature_mean(gpu, [], products_512=True):
+                pass
+            with patch.object(cpu, "library", SimpleNamespace(wxkmeans_weighted_potentials=object(), wxkmeans_distance_products=object())), self.assertRaisesRegex(ValueError, "product_512_abi_unavailable"), native_kmeans_feature_mean(gpu, [], potential_context=cpu, potential_records=[], upcast_norm_records=[], product_records=[], products_512=True):
+                pass
+
+    def test_extended_unaligned_readonly_concurrent_and_closed(self):
+        left = np.random.default_rng(51291).normal(size=(3, 17))
+        right = np.random.default_rng(51292).normal(size=(512, 17))
+        unaligned = np.ndarray(right.shape, dtype=np.float64, buffer=bytearray(right.nbytes + 1), offset=1)
+        unaligned[:] = right
+        unaligned.flags.writeable = False
+        with self.context() as cpu:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                outputs = list(executor.map(lambda _: cpu.distance_products(left, unaligned, extended_shape=True)[0], range(4)))
+            for actual in outputs:
+                np.testing.assert_array_equal(actual.view(np.uint64), (left @ right.T).view(np.uint64))
+        with self.assertRaisesRegex(ValueError, "closed"):
+            cpu.distance_products(left, right, extended_shape=True)

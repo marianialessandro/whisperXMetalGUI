@@ -304,12 +304,14 @@ class NativeKMeansPotentials:
             raise ValueError("kmeans_upcast_chunk_native_result_invalid")
         return output, {"scope": "experimental_native_cpu_kmeans_upcast_chunk", "execution_device": "cpu", "backend": "cpp_ieee_integer_conversion", "rows": rows, "features": features, "extended_rows_enabled": extended_rows, "maximum_rows": 512 if extended_rows else 256, "native_blas_calls": 0, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": 0, "host_input_bytes_read": values.nbytes, "native_result_staging_bytes": output.nbytes, "host_result_bytes": output.nbytes, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_numeric_dtype_conversion": False, "signed_zero_preserved": True, "binary32_subnormals_preserved": True, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
 
-    def distance_products(self, left, right):
+    def distance_products(self, left, right, *, extended_shape=False):
         if any(type(value) is not np.ndarray or value.dtype != np.float64 or value.ndim != 2 or not value.flags.c_contiguous for value in (left, right)):
             raise ValueError("kmeans_distance_product_operand_format_invalid")
+        if type(extended_shape) is not bool:
+            raise ValueError("kmeans_product_512_configuration_invalid")
         rows, features = left.shape
         columns = right.shape[0]
-        if not 0 < rows <= 256 or not 0 < columns <= 256 or not 0 < features <= 1024 or right.shape[1] != features:
+        if not 0 < rows <= (512 if extended_shape else 256) or not 0 < columns <= (512 if extended_shape else 256) or not 0 < features <= 1024 or right.shape[1] != features:
             raise ValueError("kmeans_distance_product_shape_invalid")
         output, metrics, error = np.empty((rows, columns), dtype=np.float64), PotentialMetrics(), ct.create_string_buffer(128)
         started = time.perf_counter_ns()
@@ -317,9 +319,9 @@ class NativeKMeansPotentials:
             if self.closed:
                 raise ValueError("kmeans_potential_context_closed")
             try:
-                native = self.library.wxkmeans_distance_products
+                native = self.library.wxkmeans_distance_products_512 if extended_shape else self.library.wxkmeans_distance_products
             except AttributeError as failure:
-                raise ValueError("kmeans_distance_product_abi_unavailable") from failure
+                raise ValueError("kmeans_product_512_abi_unavailable" if extended_shape else "kmeans_distance_product_abi_unavailable") from failure
             native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(PotentialMetrics), ct.c_char_p, ct.c_uint32]
             native.restype = ct.c_int
             if native(left.ctypes.data, right.ctypes.data, rows, columns, features, output.ctypes.data, ct.byref(metrics), error, len(error)):
@@ -327,7 +329,7 @@ class NativeKMeansPotentials:
         if metrics.version != 1 or metrics.blas_calls != (0 if features == 1 and (rows > 1 or columns > 1) else 1) or not np.isfinite(output).all():
             raise ValueError("kmeans_distance_product_native_result_invalid")
         dispatch = "ddot" if rows == columns == 1 else ("scalar_outer" if features == 1 else ("dgemv_colmajor_trans" if rows == 1 or columns == 1 else ("dsyrk_rowmajor_upper" if rows == columns and left.ctypes.data == right.ctypes.data else "dgemm_rowmajor_nt")))
-        return output, {"scope": "experimental_native_cpu_kmeans_distance_products", "execution_device": "cpu", "backend": "accelerate_ilp64", "rows": rows, "columns": columns, "features": features, "numpy_dispatch": dispatch, "native_blas_calls": metrics.blas_calls, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": left.nbytes + right.nbytes, "host_result_bytes": output.nbytes, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "cpu_numeric_distance_products": True, "python_numeric_distance_products": False, "numpy_bitwise_certified": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+        return output, {"scope": "experimental_native_cpu_kmeans_distance_products", "execution_device": "cpu", "backend": "accelerate_ilp64", "rows": rows, "columns": columns, "features": features, "extended_shape_enabled": extended_shape, "maximum_extent": 512 if extended_shape else 256, "numpy_dispatch": dispatch, "native_blas_calls": metrics.blas_calls, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": left.nbytes + right.nbytes, "host_result_bytes": output.nbytes, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "cpu_numeric_distance_products": True, "python_numeric_distance_products": False, "numpy_bitwise_certified": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
 
     def weighted_potentials(self, distances, weights):
         if type(distances) is not np.ndarray or distances.dtype != np.float32 or distances.ndim != 2 or not distances.flags.c_contiguous or type(weights) is not np.ndarray or weights.dtype != np.float32 or weights.ndim not in (1, 2) or not weights.flags.c_contiguous or (weights.ndim == 2 and weights.shape[1] != 1):
@@ -361,13 +363,13 @@ def weighted_potentials(context, records, distances, weights):
 SAFE_SPARSE_DOT_SHA256 = "c8259546787ab8ac484494c57e1e32550a42a55c9f67346521f77f56a0a13185"
 
 
-def distance_products(context, records, left, transposed_right, dense_output=False):
+def distance_products(context, records, left, transposed_right, dense_output=False, *, extended_shape=False):
     from tools.baseline.native_kmeans_upcast_norms import EUCLIDEAN_SHA256, UPCAST_SHA256, NUMPY_CORE_SHA256
     if dense_output is not True or type(transposed_right) is not np.ndarray or transposed_right.ndim != 2 or not transposed_right.flags.f_contiguous:
         raise ValueError("kmeans_distance_product_transposed_right_required")
     if np.__config__.CONFIG.get("Build Dependencies", {}).get("blas", {}).get("name") != "accelerate":
         raise ValueError("kmeans_potential_accelerate_numpy_required")
-    output, record = context.distance_products(left, transposed_right.T)
+    output, record = context.distance_products(left, transposed_right.T, **({"extended_shape": extended_shape} if extended_shape is not False else {}))
     record.update({"adapter_scope": "sklearn_kmeans_plusplus_distance_chunk_blas", "original_euclidean_sha256": EUCLIDEAN_SHA256, "original_upcast_sha256": UPCAST_SHA256, "original_safe_sparse_dot_sha256": SAFE_SPARSE_DOT_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "host_input_staging_copy_bytes": 0, "cpu_residuals": ["float32_to_float64_chunk_conversion", "distance_blas_products_native_accelerate", "weighted_potentials", "rng_and_seed_control", "lloyd_or_elkan", "host_staging_and_control"]})
     records.append(record)
     return output
