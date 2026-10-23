@@ -1,3 +1,6 @@
+The bounded C++ relocation selection adapts NumPy 2.2.6 finite-float32 single-kth introselect.
+Source: https://github.com/numpy/numpy/blob/v2.2.6/numpy/_core/src/npysort/selection.cpp
+
 The C++ Lloyd center-shift squared-sum also adapts NumPy 2.2.6 pairwise reduction ordering.
 Source: https://github.com/numpy/numpy/blob/v2.2.6/numpy/_core/src/umath/loops_utils.h.src
 

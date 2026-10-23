@@ -25,7 +25,7 @@ def build_library(output, with_inertia=False):
     source = Path(__file__).with_suffix(".cpp")
     with tempfile.TemporaryDirectory(prefix="kmeans-potential-build-", dir=output.parent) as directory:
         staged = Path(directory) / "potential.dylib"
-        command = ["xcrun", "clang++", "-std=c++20", "-O1", "-ffp-contract=off", "-dynamiclib", str(source), str(source.with_name("native_kmeans_assignment.cpp")), "-framework", "Accelerate", "-o", str(staged)]
+        command = ["xcrun", "clang++", "-std=c++20", "-O1", "-ffp-contract=off", "-dynamiclib", str(source), str(source.with_name("native_kmeans_assignment.cpp")), str(source.with_name("native_kmeans_relocation.cpp")), "-framework", "Accelerate", "-o", str(staged)]
         if with_inertia:
             from tools.baseline.native_kmeans_inertia import runtime_path
             runtime = runtime_path()
@@ -39,6 +39,7 @@ def build_library(output, with_inertia=False):
             subprocess.run(["codesign", "--force", "--sign", "-", "--timestamp=none", str(staged)], check=True, capture_output=True, timeout=10)
         os.link(staged, output)
     identity = {"library_sha256": hashlib.sha256(output.read_bytes()).hexdigest(), "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(), "assignment_source_sha256": hashlib.sha256(source.with_name("native_kmeans_assignment.cpp").read_bytes()).hexdigest(), "distance_source_sha256": hashlib.sha256(source.with_name("native_kmeans_distance.hpp").read_bytes()).hexdigest(), "scope": "experimental_native_cpu_kmeans_potentials"}
+    identity.update({name + "_source_sha256": hashlib.sha256(source.with_name(filename).read_bytes()).hexdigest() for name, filename in (("relocation", "native_kmeans_relocation.cpp"), ("selection", "native_kmeans_selection.hpp"), ("pairwise", "native_kmeans_pairwise.hpp"))})
     if with_inertia:
         identity.update({"inertia_source_sha256": hashlib.sha256(source.with_name("native_kmeans_inertia.cpp").read_bytes()).hexdigest(), "openmp_runtime_sha256": hashlib.sha256(runtime.read_bytes()).hexdigest()})
     return identity
@@ -71,6 +72,30 @@ class NativeKMeansPotentials:
     def close(self):
         with self.lock:
             self.closed = True
+
+    def lloyd_relocated_centroids(self, values, weights, labels, previous):
+        if any(type(value) is not np.ndarray or value.dtype != np.float32 or not value.flags.c_contiguous for value in (values, weights, previous)) or values.ndim != 2 or previous.ndim != 2 or weights.ndim != 1 or type(labels) is not np.ndarray or labels.dtype != np.int32 or labels.ndim != 1 or not labels.flags.c_contiguous:
+            raise ValueError("kmeans_relocation_operand_format_invalid")
+        rows, features = values.shape
+        clusters = previous.shape[0]
+        if not 0 < rows <= 256 or not 0 < clusters <= rows or not 0 < features <= 1024 or previous.shape[1] != features or weights.shape != (rows,) or labels.shape != (rows,):
+            raise ValueError("kmeans_relocation_shape_invalid")
+        centers, totals, distances, order, counts = np.empty_like(previous), np.empty(clusters, np.float32), np.empty(rows, np.float32), np.empty(rows, np.int32), np.empty(2, np.uint32)
+        metrics, error = PotentialMetrics(), ct.create_string_buffer(128)
+        started = time.perf_counter_ns()
+        with self.lock:
+            if self.closed:
+                raise ValueError("kmeans_potential_context_closed")
+            try:
+                native = self.library.wxkmeans_lloyd_relocated_centroids
+            except AttributeError as failure:
+                raise ValueError("kmeans_relocation_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p] * 4 + [ct.c_uint32] * 3 + [ct.c_void_p] * 5 + [ct.POINTER(PotentialMetrics), ct.c_char_p, ct.c_uint32]; native.restype = ct.c_int
+            if native(values.ctypes.data, weights.ctypes.data, labels.ctypes.data, previous.ctypes.data, rows, clusters, features, centers.ctypes.data, totals.ctypes.data, distances.ctypes.data, order.ctypes.data, counts.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.blas_calls != 0 or not np.isfinite(centers).all() or not np.isfinite(totals).all() or not np.isfinite(distances).all() or counts[0] > clusters or counts[1] > counts[0] or (order[:int(counts[0])] < 0).any() or (order[:int(counts[0])] >= rows).any():
+            raise ValueError("kmeans_relocation_native_result_invalid")
+        return centers, totals, distances, order[:int(counts[0])], {"scope": "experimental_native_cpu_lloyd_relocated_centroids", "execution_device": "cpu", "backend": "cpp_fma_pairwise_introselect_relocated_centroids", "samples": rows, "clusters": clusters, "features": features, "empty_clusters": int(counts[0]), "relocated_clusters": int(counts[1]), "selection_calls": int(counts[0] > 0), "distance_rows": rows if counts[0] else 0, "native_blas_calls": 0, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": values.nbytes + weights.nbytes + labels.nbytes + previous.nbytes, "host_result_bytes": centers.nbytes + totals.nbytes + distances.nbytes + order.nbytes + counts.nbytes, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_numeric_centroid_update": False, "python_numeric_relocation": False, "python_argpartition": False, "centroid_updates_replaced": True, "empty_cluster_relocation_replaced": True, "lloyd_iteration_replaced": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
 
     def inertia_dense(self, values, weights, centers, labels, n_threads, single_label=-1):
         if any(type(value) is not np.ndarray or value.dtype != np.float32 or not value.flags.c_contiguous for value in (values, weights, centers)) or values.ndim != 2 or centers.ndim != 2 or weights.ndim != 1 or type(labels) is not np.ndarray or labels.dtype != np.int32 or labels.ndim != 1 or not labels.flags.c_contiguous:

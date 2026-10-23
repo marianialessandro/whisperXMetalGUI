@@ -11,11 +11,12 @@ import numpy as np
 from tools.baseline.native_kmeans_norms import squared_norms, validate_reference
 
 
+ARGPARTITION_SHA256 = "d49a7e075e5e7ad2587010a92d97c5b163625e8e487074d7d8359ef4a6f046cd"
 LLOYD_BINARY_SHA256 = "865e1791855baec7f4a8233cc5792a13a04efcdb4daef57d986c10fe22f3203f"
 
 
 class LloydNormScope:
-    def __init__(self, context, records, assignment_context=None, assignment_records=None, centroid_records=None, center_shift_records=None):
+    def __init__(self, context, records, assignment_context=None, assignment_records=None, centroid_records=None, center_shift_records=None, relocation_records=None):
         import sklearn.cluster._k_means_lloyd as module
         if not isinstance(records, list):
             raise ValueError("kmeans_lloyd_norm_records_required")
@@ -47,6 +48,18 @@ class LloydNormScope:
                 raise ValueError("kmeans_lloyd_center_shifts_configuration_invalid")
             if getattr(assignment_context.library, "wxkmeans_lloyd_center_shifts", None) is None:
                 raise ValueError("kmeans_lloyd_center_shifts_abi_unavailable")
+        if relocation_records is not None:
+            if centroid_records is None or not isinstance(relocation_records, list):
+                raise ValueError("kmeans_relocation_configuration_invalid")
+            if getattr(assignment_context.library, "wxkmeans_lloyd_relocated_centroids", None) is None:
+                raise ValueError("kmeans_relocation_abi_unavailable")
+            from tools.baseline.native_kmeans_prefix import NUMPY_CORE_SHA256
+            import numpy._core._multiarray_umath as numpy_core
+            if hashlib.sha256(Path(numpy_core.__file__).read_bytes()).hexdigest() != NUMPY_CORE_SHA256 or hashlib.sha256(inspect.getsource(np.argpartition).encode()).hexdigest() != ARGPARTITION_SHA256 or np.getbufsize() != 8192:
+                raise ValueError("kmeans_relocation_numpy_reference_not_supported")
+        self.relocation_records = relocation_records
+        if relocation_records is not None:
+            self.numpy_core_sha256 = NUMPY_CORE_SHA256
         self.center_shift_records = center_shift_records
         self.centroid_records = centroid_records
         self.assignment_context, self.assignment_records = assignment_context, assignment_records
@@ -94,7 +107,12 @@ class LloydNormScope:
                 norms = self.row_norms(centers_old, squared=True)
                 started = time.perf_counter_ns()
                 assigned, distances, assignment_record = self.assignment_context.lloyd_assignment(np.asarray(X), self.centers, norms)
-                updated, totals, record = self.assignment_context.lloyd_centroids(np.asarray(X), np.asarray(sample_weight), assigned, clusters)
+                if self.relocation_records is not None:
+                    if np.getbufsize() != 8192:
+                        raise ValueError("kmeans_relocation_numpy_buffer_not_supported")
+                    updated, totals, relocation_distances, selected, record = self.assignment_context.lloyd_relocated_centroids(np.asarray(X), np.asarray(sample_weight), assigned, self.centers)
+                else:
+                    updated, totals, record = self.assignment_context.lloyd_centroids(np.asarray(X), np.asarray(sample_weight), assigned, clusters)
                 if self.center_shift_records is not None:
                     shifts, shift_record = self.assignment_context.lloyd_center_shifts(updated, self.centers)
                     shift_record.update({"adapter_scope": "sklearn_dense_float32_lloyd_centroid_movement", "original_common_binary_sha256": "793cb26715cc85762eb460e29cce45a4a40584ddcaba761bfd69adafd080f3cf", "cpu_residuals": ["inertia", "convergence_control", "host_staging_and_control"]})
@@ -110,6 +128,12 @@ class LloydNormScope:
                 if self.center_shift_records is not None:
                     record.update({"center_shift_backend": shift_record["backend"], "center_shift_calls": 1, "center_shift_rows": clusters, "cpu_residuals": ["inertia", "convergence_control", "host_staging_and_control"]})
                     self.center_shift_records.append(shift_record)
+                if self.relocation_records is not None:
+                    record["unsupported_operations"] = ["multiple_chunk_merge"]
+                    record["numpy_core_binary_sha256"] = self.numpy_core_sha256
+                    shared = {key: record[key] for key in ("scope", "execution_device", "samples", "clusters", "features", "empty_clusters", "relocated_clusters", "selection_calls", "distance_rows", "python_numeric_relocation", "python_argpartition", "empty_cluster_relocation_replaced", "gpu_kernels", "command_buffers_per_run", "computation_gpu_seconds", "logical_input_upload_bytes", "logical_result_readback_bytes", "quality_certified", "full_pipeline_gpu_certified", "production_backend", "numpy_core_binary_sha256")}
+                    shared.update({"adapter_scope": "sklearn_dense_float32_lloyd_empty_relocation", "backend": "shared_native_cpu_relocated_centroid_update", "shared_centroid_update": True, "shared_operation_index": len(self.centroid_records), "native_wall_ns": 0, "completion_and_bridge_wall_ns": 0, "host_input_snapshot_bytes": 0, "host_result_bytes": 0, "native_blas_calls": 0})
+                    self.relocation_records.append(shared)
                 self.centroid_records.append(record)
                 return None
             if bound is not None and bound.arguments["update_centers"] is False:
