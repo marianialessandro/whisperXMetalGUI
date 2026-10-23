@@ -9,6 +9,7 @@
 #include <initializer_list>
 
 struct KmeansPotentialMetrics { uint32_t version, blas_calls; uint64_t wall_ns; };
+extern "C" int wxkmeans_distinct_labels(const int32_t*, uint32_t, uint32_t*, KmeansPotentialMetrics*, char*, uint32_t);
 extern "C" int wxkmeans_weighted_potentials(const float*, const float*, uint32_t, uint32_t, float*, KmeansPotentialMetrics*, char*, uint32_t);
 
 extern "C" int wxkmeans_distance_products(const double*, const double*, uint32_t, uint32_t, uint32_t, double*, KmeansPotentialMetrics*, char*, uint32_t);
@@ -296,5 +297,24 @@ int main() {
     assert(wxkmeans_distance_products_512(large_left.data(), reinterpret_cast<double*>(large_product_alias.data() + 1), 3, 512, 17, reinterpret_cast<double*>(large_product_alias.data() + 1), &metrics, error, sizeof(error)) == 0);
     std::memcpy(large_product.data(), large_product_alias.data() + 1, large_product.size() * sizeof(double));
     for (double value : large_product) assert(value == 17. * .125);
+
+    std::vector<int32_t> distinct_labels(4096);
+    for (uint32_t index = 0; index < 4096; ++index) distinct_labels[index] = int32_t(index);
+    uint32_t distinct_count = 91;
+    assert(wxkmeans_distinct_labels(distinct_labels.data(), 4096, &distinct_count, &metrics, error, sizeof(error)) == 0 && distinct_count == 4096 && metrics.blas_calls == 0);
+    distinct_count = 91;
+    for (uint32_t count : {0u, 4097u}) assert(wxkmeans_distinct_labels(distinct_labels.data(), count, &distinct_count, &metrics, error, sizeof(error)) != 0 && distinct_count == 91);
+    for (int32_t value : {-1, 4096, std::numeric_limits<int32_t>::max()}) {
+        distinct_labels.back() = value;
+        assert(wxkmeans_distinct_labels(distinct_labels.data(), 4096, &distinct_count, &metrics, error, sizeof(error)) != 0 && distinct_count == 91);
+    }
+    distinct_labels.back() = 4095;
+    assert(wxkmeans_distinct_labels(nullptr, 1, &distinct_count, &metrics, error, sizeof(error)) != 0 && distinct_count == 91);
+    assert(wxkmeans_distinct_labels(distinct_labels.data(), 1, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_distinct_labels(distinct_labels.data(), 1, &distinct_count, nullptr, error, sizeof(error)) != 0 && distinct_count == 91);
+    std::vector<unsigned char> distinct_alias(distinct_labels.size() * sizeof(int32_t) + 1);
+    std::memcpy(distinct_alias.data() + 1, distinct_labels.data(), distinct_labels.size() * sizeof(int32_t));
+    assert(wxkmeans_distinct_labels(reinterpret_cast<int32_t*>(distinct_alias.data() + 1), 4096, reinterpret_cast<uint32_t*>(distinct_alias.data() + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(&distinct_count, distinct_alias.data() + 1, sizeof(distinct_count)); assert(distinct_count == 4096);
 
 }

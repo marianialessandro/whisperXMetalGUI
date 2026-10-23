@@ -207,3 +207,24 @@ extern "C" int wxkmeans_same_clustering(const int32_t* labels, const int32_t* pr
         if (error != nullptr && capacity > 0) { std::strncpy(error, "kmeans_same_clustering_failed", capacity - 1); error[capacity - 1] = 0; } return 1;
     }
 }
+
+extern "C" int wxkmeans_distinct_labels(const int32_t* labels, uint32_t count, uint32_t* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity) {
+    try {
+        require(labels != nullptr && output != nullptr && metrics != nullptr, "kmeans_distinct_pointer_missing");
+        require(count > 0 && count <= 4096, "kmeans_distinct_count_invalid");
+        auto started = std::chrono::steady_clock::now();
+        std::vector<int32_t> values(count); std::memcpy(values.data(), reinterpret_cast<const unsigned char*>(labels), count * sizeof(int32_t));
+        uint64_t seen[64] = {}; uint32_t result = 0;
+        for (int32_t value : values) {
+            require(value >= 0 && value < 4096, "kmeans_distinct_label_domain_invalid");
+            uint32_t word = uint32_t(value) / 64; uint64_t bit = uint64_t(1) << (uint32_t(value) % 64);
+            if ((seen[word] & bit) == 0) { seen[word] |= bit; ++result; }
+        }
+        std::memcpy(reinterpret_cast<unsigned char*>(output), &result, sizeof(result));
+        *metrics = {1, 0, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count())}; return 0;
+    } catch (const std::exception& failure) {
+        if (error != nullptr && capacity > 0) { std::strncpy(error, failure.what(), capacity - 1); error[capacity - 1] = 0; } return 1;
+    } catch (...) {
+        if (error != nullptr && capacity > 0) { std::strncpy(error, "kmeans_distinct_failed", capacity - 1); error[capacity - 1] = 0; } return 1;
+    }
+}

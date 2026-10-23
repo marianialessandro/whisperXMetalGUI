@@ -216,6 +216,27 @@ class NativeKMeansPotentials:
             record.update({"backend": "accelerate_lp64_openmp_static_two_chunks", "native_blas_calls": (rows + 255) // 256, "chunk_size": 256, "chunk_count": (rows + 255) // 256, "requested_threads": n_threads, "effective_iteration_threads": min(n_threads, (rows + 255) // 256), "actual_threads": min(n_threads, (rows + 255) // 256), "thread_count_changed": False, "host_input_snapshot_bytes": 2 * values.nbytes + (((rows + 255) // 256) + 1) * (centers.nbytes + norms.nbytes)})
         return labels, distances, record
 
+    def distinct_labels(self, labels):
+        if type(labels) is not np.ndarray or labels.dtype != np.int32 or labels.ndim != 1 or not labels.flags.c_contiguous:
+            raise ValueError("kmeans_distinct_operand_format_invalid")
+        if not 0 < labels.size <= 4096:
+            raise ValueError("kmeans_distinct_count_invalid")
+        output, metrics, error = np.empty(1, np.uint32), PotentialMetrics(), ct.create_string_buffer(128)
+        started = time.perf_counter_ns()
+        with self.lock:
+            if self.closed:
+                raise ValueError("kmeans_potential_context_closed")
+            try:
+                native = self.library.wxkmeans_distinct_labels
+            except AttributeError as failure:
+                raise ValueError("kmeans_distinct_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_uint32, ct.c_void_p, ct.POINTER(PotentialMetrics), ct.c_char_p, ct.c_uint32]; native.restype = ct.c_int
+            if native(labels.ctypes.data, labels.size, output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.blas_calls != 0 or not 0 < output[0] <= min(labels.size, 4096):
+            raise ValueError("kmeans_distinct_native_result_invalid")
+        return int(output[0]), {"scope": "experimental_native_cpu_kmeans_distinct_labels", "execution_device": "cpu", "backend": "cpp_int32_label_bitset_cardinality", "samples": labels.size, "distinct_labels": int(output[0]), "native_blas_calls": 0, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": labels.nbytes, "host_result_bytes": 4, "worker_bitset_bytes": 512, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_set_cardinality": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+
     def same_clustering(self, labels, previous, clusters):
         if any(type(value) is not np.ndarray or value.dtype != np.int32 or value.ndim != 1 or not value.flags.c_contiguous for value in (labels, previous)):
             raise ValueError("kmeans_same_clustering_operand_format_invalid")
