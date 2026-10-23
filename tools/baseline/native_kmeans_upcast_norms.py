@@ -27,11 +27,13 @@ def squared_upcast_norms(context, records, values, squared=False):
     return result
 
 
-def compile_upcast_distances(original, norms, finish=None, clamp=None, resident=False, resident_norms=False, product=None, upcast_chunk=None):
+def compile_upcast_distances(original, norms, finish=None, clamp=None, resident=False, resident_norms=False, product=None, upcast_chunk=None, resident_512=False):
     import sklearn.metrics.pairwise as pairwise
 
     if type(resident) is not bool or (resident and (finish is None or clamp is None)):
         raise ValueError("kmeans_resident_distances_configuration_invalid")
+    if type(resident_512) is not bool or (resident_512 and not resident):
+        raise ValueError("kmeans_resident_512_configuration_invalid")
     if type(resident_norms) is not bool or (resident_norms and not resident):
         raise ValueError("kmeans_resident_norms_configuration_invalid")
     upcast = pairwise._euclidean_distances_upcast
@@ -119,7 +121,7 @@ def compile_upcast_distances(original, norms, finish=None, clamp=None, resident=
     namespace = dict(upcast.__globals__)
     namespace["__wx_upcast_chunk"] = upcast_chunk
     namespace["__wx_distance_product"] = product
-    namespace["__wx_squared_distance_guard"] = validate_resident_distance_inputs if resident else validate_squared_distance_inputs
+    namespace["__wx_squared_distance_guard"] = (lambda X, Y, squared: validate_resident_distance_inputs(X, Y, squared, extended_shape=True)) if resident_512 else (validate_resident_distance_inputs if resident else validate_squared_distance_inputs)
     namespace["__wx_no_chunk_norms"] = validate_no_chunk_norms
     namespace["__wx_resident_batch_guard"] = validate_resident_batch
     namespace["__wx_distance_finish"] = finish
@@ -155,7 +157,7 @@ def compile_upcast_distances(original, norms, finish=None, clamp=None, resident=
     namespace["_euclidean_distances_upcast"] = candidate_upcast
     namespace["__wx_no_supplied_norms"] = validate_no_supplied_norms
     namespace["__wx_distance_clamp"] = clamp
-    namespace["__wx_squared_distance_guard"] = validate_resident_distance_inputs if resident else validate_squared_distance_inputs
+    namespace["__wx_squared_distance_guard"] = (lambda X, Y, squared: validate_resident_distance_inputs(X, Y, squared, extended_shape=True)) if resident_512 else (validate_resident_distance_inputs if resident else validate_squared_distance_inputs)
     exec(compile(outer, "<WhisperX scoped KMeans Euclidean distance>", "exec"), namespace)
     candidate = namespace[original.__name__]
     if inspect.signature(candidate_upcast) != inspect.signature(upcast) or inspect.signature(candidate) != inspect.signature(original):
@@ -190,17 +192,17 @@ def clamp_distances(context, records, values, zero_diagonal):
     return result
 
 
-def validate_resident_distance_inputs(X, Y, squared):
+def validate_resident_distance_inputs(X, Y, squared, *, extended_shape=False):
     validate_squared_distance_inputs(X, Y, squared)
-    if not 0 < X.shape[0] <= 256 or not 0 < Y.shape[0] <= 256 or not 0 < X.shape[1] <= 1024 or X.shape[1] != Y.shape[1]:
+    if not 0 < X.shape[0] <= (512 if extended_shape else 256) or not 0 < Y.shape[0] <= (512 if extended_shape else 256) or not 0 < X.shape[1] <= 1024 or X.shape[1] != Y.shape[1]:
         raise ValueError("kmeans_resident_distances_single_chunk_shape_required")
 
 
-def resident_finish_distances(context, records, products, left_norms, right_norms, zero_diagonal):
+def resident_finish_distances(context, records, products, left_norms, right_norms, zero_diagonal, *, extended_shape=False):
     if any(type(value) is not np.ndarray or value.dtype != np.float64 or value.ndim != 2 for value in (products, left_norms, right_norms)) or left_norms.shape != (products.shape[0], 1) or right_norms.shape != (1, products.shape[1]):
         raise ValueError("kmeans_resident_distances_operand_not_supported")
     staged = tuple(np.ascontiguousarray(value) for value in (products, left_norms, right_norms))
-    result, record = context.kmeans_resident_distances(staged[0], staged[1].reshape(-1), staged[2].reshape(-1), zero_diagonal)
+    result, record = context.kmeans_resident_distances(staged[0], staged[1].reshape(-1), staged[2].reshape(-1), zero_diagonal, **({"extended_shape": True} if extended_shape else {}))
     record = dict(record)
     record.update({"adapter_scope": "sklearn_kmeans_plusplus_resident_distance_finish", "original_euclidean_sha256": EUCLIDEAN_SHA256, "original_upcast_sha256": UPCAST_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "host_input_staging_copy_bytes": sum(value.nbytes for value, original in zip(staged, (products, left_norms, right_norms)) if not np.shares_memory(value, original)), "cpu_residuals": ["float32_to_float64_chunk_conversion", "distance_blas_products", "weighted_potentials", "rng_and_seed_control", "lloyd_or_elkan", "host_staging_and_control"]})
     records.append(record)
@@ -208,7 +210,10 @@ def resident_finish_distances(context, records, products, left_norms, right_norm
 
 
 class ResidentDistancePipeline:
-    def __init__(self, context, finish_records, clamp_records, norm_records=None, minimum_records=None):
+    def __init__(self, context, finish_records, clamp_records, norm_records=None, minimum_records=None, *, extended_shape=False):
+        if type(extended_shape) is not bool:
+            raise ValueError("kmeans_resident_512_configuration_invalid")
+        self.extended_shape = extended_shape
         self.context, self.finish_records, self.clamp_records = context, finish_records, clamp_records
         self.norm_records = norm_records
         self.minimum_records = minimum_records
@@ -225,7 +230,7 @@ class ResidentDistancePipeline:
     def finish(self, products, left, right, diagonal):
         if self.pending is not None:
             raise ValueError("kmeans_resident_distances_previous_result_not_consumed")
-        output = resident_finish_distances(self.context, self.finish_records, products, left, right, diagonal) if self.norm_records is None else resident_norm_finish_distances(self.context, self.finish_records, self.norm_records, products, left, right, diagonal, closest=self.closest)
+        output = resident_finish_distances(self.context, self.finish_records, products, left, right, diagonal, **({"extended_shape": True} if self.extended_shape else {})) if self.norm_records is None else resident_norm_finish_distances(self.context, self.finish_records, self.norm_records, products, left, right, diagonal, closest=self.closest, **({"extended_shape": True} if self.extended_shape else {}))
         self.pending = (output, diagonal, len(self.finish_records) - 1)
         return output
 
@@ -280,12 +285,12 @@ def validate_no_supplied_norms(*norms):
         raise ValueError("kmeans_resident_norms_provided_binary64_norms_not_supported")
 
 
-def resident_norm_finish_distances(context, records, norm_records, products, left, right, zero_diagonal, closest=None):
+def resident_norm_finish_distances(context, records, norm_records, products, left, right, zero_diagonal, closest=None, *, extended_shape=False):
     if any(type(value) is not np.ndarray or value.dtype != np.float64 or value.ndim != 2 for value in (products, left, right)):
         raise ValueError("kmeans_resident_norms_operand_not_supported")
     staged = tuple(np.ascontiguousarray(value) for value in (products, left, right))
     staged_closest = np.ascontiguousarray(closest) if closest is not None else None
-    result, record = context.kmeans_resident_norms(*staged, zero_diagonal) if closest is None else context.kmeans_resident_minimum(*staged, staged_closest, zero_diagonal)
+    result, record = context.kmeans_resident_norms(*staged, zero_diagonal, **({"extended_shape": True} if extended_shape else {})) if closest is None else context.kmeans_resident_minimum(*staged, staged_closest, zero_diagonal, **({"extended_shape": True} if extended_shape else {}))
     record = dict(record)
     record.update({"adapter_scope": "sklearn_kmeans_plusplus_resident_norms_and_distances", "original_euclidean_sha256": EUCLIDEAN_SHA256, "original_upcast_sha256": UPCAST_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "original_row_norms_sha256": ROW_NORMS_SHA256, "host_input_staging_copy_bytes": sum(value.nbytes for value, original in zip(staged, (products, left, right)) if not np.shares_memory(value, original)), "cpu_residuals": ["float32_to_float64_chunk_conversion", "distance_blas_products", "weighted_potentials", "rng_and_seed_control", "lloyd_or_elkan", "host_staging_and_control"]})
     if closest is not None and not np.shares_memory(staged_closest, closest):

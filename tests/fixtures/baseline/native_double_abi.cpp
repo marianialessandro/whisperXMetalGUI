@@ -1,4 +1,6 @@
 #include <cassert>
+#include <algorithm>
+#include <vector>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -51,6 +53,9 @@ extern "C" int wxdouble_positive_fma(void*, const double*, uint32_t, double*, Do
 extern "C" int wxdouble_kmeans_resident_norms(void*, const double*, const double*, const double*, uint32_t, uint32_t, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_resident_minimum(void*, const double*, const double*, const double*, const float*, uint32_t, uint32_t, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_resident_distances(void*, const double*, const double*, const double*, uint32_t, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_kmeans_resident_norms_512(void*, const double*, const double*, const double*, uint32_t, uint32_t, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_kmeans_resident_minimum_512(void*, const double*, const double*, const double*, const float*, uint32_t, uint32_t, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
+extern "C" int wxdouble_kmeans_resident_distances_512(void*, const double*, const double*, const double*, uint32_t, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_distance_clamp(void*, const float*, uint32_t, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_distance_finish(void*, const double*, const double*, const double*, uint32_t, uint32_t, float*, DoubleMetrics*, char*, uint32_t);
 extern "C" int wxdouble_kmeans_upcast_norms(void*, const double*, uint32_t, uint32_t, double*, DoubleMetrics*, char*, uint32_t);
@@ -941,6 +946,35 @@ int main(int argc, char** argv) {
     assert(wxdouble_vbx_nan_cleanup(context, input, 4097, 2, output, &all_nan, &metrics, error, sizeof(error)) != 0);
     assert(wxdouble_vbx_nan_cleanup(context, cleanup_scores, 1, 2, output, reinterpret_cast<uint32_t*>(output), &metrics, error, sizeof(error)) != 0);
     assert(wxdouble_vbx_nan_cleanup(context, input, 1, 2, output, &all_nan, &metrics, error, sizeof(error)) != 0 && output[0] == 91. && all_nan == 92);
+
+    std::vector<double> extended_left(3 * 17, .25), extended_right(512 * 17, .5), extended_products(3 * 512, 2.125), extended_a(3, 1.0625), extended_b(512, 4.25);
+    std::vector<float> extended_output(3 * 512, 91.f), extended_closest(512, .5f);
+    assert(wxdouble_kmeans_resident_distances_512(context, extended_products.data(), extended_a.data(), extended_b.data(), 3, 512, 0, extended_output.data(), &metrics, error, sizeof(error)) == 0 && metrics.kernels == 1);
+    for (float value : extended_output) assert(value == 1.0625f);
+    assert(wxdouble_kmeans_resident_norms_512(context, extended_products.data(), extended_left.data(), extended_right.data(), 3, 512, 17, 0, extended_output.data(), &metrics, error, sizeof(error)) == 0 && metrics.kernels == 2);
+    for (float value : extended_output) assert(value == 1.0625f);
+    assert(wxdouble_kmeans_resident_minimum_512(context, extended_products.data(), extended_left.data(), extended_right.data(), extended_closest.data(), 3, 512, 17, 0, extended_output.data(), &metrics, error, sizeof(error)) == 0 && metrics.kernels == 3);
+    for (float value : extended_output) assert(value == .5f);
+    std::fill(extended_output.begin(), extended_output.end(), 91.f);
+    assert(wxdouble_kmeans_resident_distances(context, extended_products.data(), extended_a.data(), extended_b.data(), 3, 512, 0, extended_output.data(), &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_resident_norms(context, extended_products.data(), extended_left.data(), extended_right.data(), 3, 512, 17, 0, extended_output.data(), &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_resident_minimum(context, extended_products.data(), extended_left.data(), extended_right.data(), extended_closest.data(), 3, 512, 17, 0, extended_output.data(), &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_resident_norms_512(context, extended_products.data(), extended_left.data(), extended_right.data(), 3, 513, 17, 0, extended_output.data(), &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_resident_distances_512(context, extended_products.data(), extended_a.data(), extended_b.data(), 3, 513, 0, extended_output.data(), &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_resident_minimum_512(context, extended_products.data(), extended_left.data(), extended_right.data(), nullptr, 3, 512, 17, 0, extended_output.data(), &metrics, error, sizeof(error)) != 0);
+    extended_right.back() = std::numeric_limits<double>::infinity();
+    assert(wxdouble_kmeans_resident_norms_512(context, extended_products.data(), extended_left.data(), extended_right.data(), 3, 512, 17, 0, extended_output.data(), &metrics, error, sizeof(error)) != 0);
+    assert(wxdouble_kmeans_resident_minimum_512(context, extended_products.data(), extended_left.data(), extended_right.data(), extended_closest.data(), 3, 512, 17, 0, extended_output.data(), &metrics, error, sizeof(error)) != 0);
+    extended_b.back() = std::numeric_limits<double>::infinity();
+    assert(wxdouble_kmeans_resident_distances_512(context, extended_products.data(), extended_a.data(), extended_b.data(), 3, 512, 0, extended_output.data(), &metrics, error, sizeof(error)) != 0);
+    for (float value : extended_output) assert(value == 91.f);
+    extended_right.back() = .5;
+    std::vector<unsigned char> extended_alias(extended_products.size() * sizeof(double) + 1);
+    std::memcpy(extended_alias.data() + 1, extended_products.data(), extended_products.size() * sizeof(double));
+    assert(wxdouble_kmeans_resident_norms_512(context, reinterpret_cast<double*>(extended_alias.data() + 1), extended_left.data(), extended_right.data(), 3, 512, 17, 0, reinterpret_cast<float*>(extended_alias.data() + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(extended_output.data(), extended_alias.data() + 1, extended_output.size() * sizeof(float));
+    for (float value : extended_output) assert(value == 1.0625f);
+
     wxdouble_destroy(context);
     wxdouble_destroy(nullptr);
     std::string legacy_shader = shader.substr(0, shader.find("\nstruct MatrixDimensions"));

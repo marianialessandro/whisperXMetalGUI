@@ -97,7 +97,7 @@ def shift_inplace(context, records, values, mean, add, role):
 
 
 @contextlib.contextmanager
-def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None, product_records=None, chunk_records=None, lloyd_shift_records=None, lloyd_label_records=None, equivalence_records=None, lloyd_norm_records=None, assignment_records=None, centroid_records=None, center_shift_records=None, inertia_records=None, relocation_records=None, two_chunks=False, upcast_512=False, products_512=False):
+def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None, product_records=None, chunk_records=None, lloyd_shift_records=None, lloyd_label_records=None, equivalence_records=None, lloyd_norm_records=None, assignment_records=None, centroid_records=None, center_shift_records=None, inertia_records=None, relocation_records=None, two_chunks=False, upcast_512=False, products_512=False, resident_512=False):
     global _ACTIVE
     from sklearn.base import _fit_context
     from sklearn.cluster import KMeans
@@ -136,6 +136,12 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
             raise ValueError("kmeans_resident_minimum_configuration_invalid")
         if resident_minimum and getattr(context.library, "wxdouble_kmeans_resident_minimum", None) is None:
             raise ValueError("double_kmeans_resident_minimum_abi_unavailable")
+        if type(resident_512) is not bool or (resident_512 and not resident_distances):
+            raise ValueError("kmeans_resident_512_configuration_invalid")
+        if resident_512:
+            names = ["distances"] + (["norms"] if resident_norms else []) + (["minimum"] if resident_minimum else [])
+            if any(getattr(context.library, "wxdouble_kmeans_resident_" + name + "_512", None) is None for name in names):
+                raise ValueError("double_kmeans_resident_512_abi_unavailable")
         if (potential_context is None) != (potential_records is None) or (potential_records is not None and not isinstance(potential_records, list)):
             raise ValueError("kmeans_potential_configuration_invalid")
         if potential_context is not None:
@@ -269,9 +275,9 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
                 clamp = (lambda values, zero_diagonal: clamp_distances(context, distance_clamp_records, values, zero_diagonal)) if distance_clamp_records is not None else None
                 if resident_distances:
                     from tools.baseline.native_kmeans_upcast_norms import ResidentDistancePipeline
-                    resident_pipeline = ResidentDistancePipeline(context, distance_finish_records, distance_clamp_records, norm_records=upcast_norm_records if resident_norms else None, minimum_records=minimum_records if resident_minimum else None)
+                    resident_pipeline = ResidentDistancePipeline(context, distance_finish_records, distance_clamp_records, norm_records=upcast_norm_records if resident_norms else None, minimum_records=minimum_records if resident_minimum else None, **({"extended_shape": True} if resident_512 else {}))
                     finish, clamp = resident_pipeline.finish, resident_pipeline.clamp
-                upcast_distance = compile_upcast_distances(kmeans_module._kmeans_plusplus.__globals__.get("_euclidean_distances"), upcast_norms, finish=finish if distance_finish_records is not None else None, clamp=clamp, resident=resident_distances, resident_norms=resident_norms, product=(lambda left, right, dense_output: distance_products(potential_context, product_records, left, right, dense_output, **({"extended_shape": True} if products_512 else {}))) if product_records is not None else None, upcast_chunk=(lambda values, target_dtype, role: upcast_chunk(potential_context, chunk_records, values, role, target_dtype, **({"extended_rows": True} if upcast_512 else {}))) if chunk_records is not None else None)
+                upcast_distance = compile_upcast_distances(kmeans_module._kmeans_plusplus.__globals__.get("_euclidean_distances"), upcast_norms, finish=finish if distance_finish_records is not None else None, clamp=clamp, resident=resident_distances, resident_norms=resident_norms, **({"resident_512": True} if resident_512 else {}), product=(lambda left, right, dense_output: distance_products(potential_context, product_records, left, right, dense_output, **({"extended_shape": True} if products_512 else {}))) if product_records is not None else None, upcast_chunk=(lambda values, target_dtype, role: upcast_chunk(potential_context, chunk_records, values, role, target_dtype, **({"extended_rows": True} if upcast_512 else {}))) if chunk_records is not None else None)
             if resident_minimum:
                 resident_pipeline.distance = upcast_distance
             original_plusplus = kmeans_module._kmeans_plusplus

@@ -465,12 +465,12 @@ public:
         return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
-    DoubleMetrics kmeans_distance_finish(const double* products, const double* left_norms, const double* right_norms, MatrixDimensions d, float* output, bool resident = false, uint32_t zero_diagonal = 0) {
+    DoubleMetrics kmeans_distance_finish(const double* products, const double* left_norms, const double* right_norms, MatrixDimensions d, float* output, bool resident = false, uint32_t zero_diagonal = 0, uint32_t maximum_extent = 256) {
         std::lock_guard<std::mutex> guard(mutex_);
         id<MTLComputePipelineState> selected = resident ? resident_distance_pipeline_ : distance_finish_pipeline_;
         require(selected != nil, resident ? "double_kmeans_resident_distances_kernel_unavailable" : "double_kmeans_distance_finish_kernel_unavailable");
         require(products != nullptr && left_norms != nullptr && right_norms != nullptr && output != nullptr && d.rows > 0 && d.rows <= 4096 && d.columns > 0 && d.columns <= 4096 && uint64_t(d.rows) * d.columns <= 1024 * 1024, "double_kmeans_distance_finish_shape_or_pointer_invalid");
-        require(!resident || (d.rows <= 256 && d.columns <= 256 && zero_diagonal <= 1 && (zero_diagonal == 0 || d.rows == d.columns)), "double_kmeans_resident_distances_shape_or_policy_invalid");
+        require(!resident || (d.rows <= maximum_extent && d.columns <= maximum_extent && zero_diagonal <= 1 && (zero_diagonal == 0 || d.rows == d.columns)), "double_kmeans_resident_distances_shape_or_policy_invalid");
         uint64_t count = uint64_t(d.rows) * d.columns;
         auto validate = [&](const double* values, uint64_t length, bool nonnegative) {
             for (uint64_t index = 0; index < length; ++index) {
@@ -502,10 +502,10 @@ public:
         return {1, 1, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), command.GPUEndTime - command.GPUStartTime, input_.length + output_.length + right_.length + terms_.length};
     }
 
-    DoubleMetrics kmeans_resident_norms(const double* products, const double* left, const double* right, MatrixDimensions d, uint32_t zero_diagonal, float* output, const float* closest = nullptr) {
+    DoubleMetrics kmeans_resident_norms(const double* products, const double* left, const double* right, MatrixDimensions d, uint32_t zero_diagonal, float* output, const float* closest = nullptr, uint32_t maximum_extent = 256) {
         std::lock_guard<std::mutex> guard(mutex_);
         require(upcast_norms_pipeline_ != nil && resident_distance_pipeline_ != nil, "double_kmeans_resident_norms_kernel_unavailable");
-        require(products != nullptr && left != nullptr && right != nullptr && output != nullptr && d.rows > 0 && d.rows <= 256 && d.columns > 0 && d.columns <= 256 && d.inner > 0 && d.inner <= 1024 && zero_diagonal <= 1 && (zero_diagonal == 0 || d.rows == d.columns), "double_kmeans_resident_norms_shape_or_pointer_invalid");
+        require(products != nullptr && left != nullptr && right != nullptr && output != nullptr && d.rows > 0 && d.rows <= maximum_extent && d.columns > 0 && d.columns <= maximum_extent && d.inner > 0 && d.inner <= 1024 && zero_diagonal <= 1 && (zero_diagonal == 0 || d.rows == d.columns), "double_kmeans_resident_norms_shape_or_pointer_invalid");
         require(closest == nullptr || kmeans_minimum_pipeline_ != nil, "double_kmeans_resident_minimum_kernel_unavailable");
         uint64_t count = uint64_t(d.rows) * d.columns;
         auto validate = [&](const double* values, uint64_t length, uint64_t minimum, uint64_t maximum) {
@@ -1775,6 +1775,30 @@ extern "C" int wxdouble_kmeans_resident_norms(void* context, const double* produ
 extern "C" int wxdouble_kmeans_resident_minimum(void* context, const double* products, const double* left, const double* right, const float* closest, uint32_t rows, uint32_t columns, uint32_t features, uint32_t zero_diagonal, float* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
     @autoreleasepool {
         try { require(context != nullptr && metrics != nullptr && closest != nullptr, "double_context_metrics_or_closest_missing"); *metrics = static_cast<DoubleContext*>(context)->kmeans_resident_norms(products, left, right, {rows, features, columns}, zero_diagonal, output, closest); return 0; }
+        catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_kmeans_resident_minimum_failed"); return 1; }
+    }
+}
+
+extern "C" int wxdouble_kmeans_resident_distances_512(void* context, const double* products, const double* left_norms, const double* right_norms, uint32_t rows, uint32_t columns, uint32_t zero_diagonal, float* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->kmeans_distance_finish(products, left_norms, right_norms, {rows, 0, columns}, output, true, zero_diagonal, 512); return 0; }
+        catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_kmeans_resident_distances_failed"); return 1; }
+    }
+}
+
+extern "C" int wxdouble_kmeans_resident_norms_512(void* context, const double* products, const double* left, const double* right, uint32_t rows, uint32_t columns, uint32_t features, uint32_t zero_diagonal, float* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr, "double_context_or_metrics_missing"); *metrics = static_cast<DoubleContext*>(context)->kmeans_resident_norms(products, left, right, {rows, features, columns}, zero_diagonal, output, nullptr, 512); return 0; }
+        catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
+        catch (...) { double_error(error, capacity, "double_kmeans_resident_norms_failed"); return 1; }
+    }
+}
+
+extern "C" int wxdouble_kmeans_resident_minimum_512(void* context, const double* products, const double* left, const double* right, const float* closest, uint32_t rows, uint32_t columns, uint32_t features, uint32_t zero_diagonal, float* output, DoubleMetrics* metrics, char* error, uint32_t capacity) {
+    @autoreleasepool {
+        try { require(context != nullptr && metrics != nullptr && closest != nullptr, "double_context_metrics_or_closest_missing"); *metrics = static_cast<DoubleContext*>(context)->kmeans_resident_norms(products, left, right, {rows, features, columns}, zero_diagonal, output, closest, 512); return 0; }
         catch (const std::exception& failure) { double_error(error, capacity, failure.what()); return 1; }
         catch (...) { double_error(error, capacity, "double_kmeans_resident_minimum_failed"); return 1; }
     }
