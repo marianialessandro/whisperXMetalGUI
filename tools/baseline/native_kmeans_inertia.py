@@ -35,8 +35,8 @@ def validate_reference(original):
     runtime_path()
 
 
-def inertia_value(context, records, X, weights, centers, labels, n_threads, single_label=-1):
-    output, record = context.inertia_dense(X, weights, centers, labels, n_threads, single_label)
+def inertia_value(context, records, X, weights, centers, labels, n_threads, single_label=-1, *, two_chunks=False):
+    output, record = context.inertia_dense(X, weights, centers, labels, n_threads, single_label, **({"two_chunks": True} if two_chunks else {}))
     record.update({"adapter_scope": "sklearn_dense_float32_lloyd_inertia", "original_common_binary_sha256": COMMON_BINARY_SHA256, "openmp_runtime_sha256": OPENMP_SHA256, "cpu_residuals": ["convergence_and_best_initialization_control", "host_staging_and_control"]})
     records.append(record)
     return output

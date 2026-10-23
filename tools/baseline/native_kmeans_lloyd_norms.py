@@ -16,7 +16,7 @@ LLOYD_BINARY_SHA256 = "865e1791855baec7f4a8233cc5792a13a04efcdb4daef57d986c10fe2
 
 
 class LloydNormScope:
-    def __init__(self, context, records, assignment_context=None, assignment_records=None, centroid_records=None, center_shift_records=None, relocation_records=None):
+    def __init__(self, context, records, assignment_context=None, assignment_records=None, centroid_records=None, center_shift_records=None, relocation_records=None, two_chunks=False):
         import sklearn.cluster._k_means_lloyd as module
         if not isinstance(records, list):
             raise ValueError("kmeans_lloyd_norm_records_required")
@@ -60,6 +60,14 @@ class LloydNormScope:
         self.relocation_records = relocation_records
         if relocation_records is not None:
             self.numpy_core_sha256 = NUMPY_CORE_SHA256
+        if type(two_chunks) is not bool or (two_chunks and (relocation_records is None or center_shift_records is None)):
+            raise ValueError("kmeans_two_chunks_configuration_invalid")
+        if two_chunks:
+            if any(getattr(assignment_context.library, name, None) is None for name in ("wxkmeans_lloyd_assignment_two_chunks", "wxkmeans_lloyd_centroids_two_chunks", "wxkmeans_inertia_dense_two_chunks")):
+                raise ValueError("kmeans_two_chunks_abi_unavailable")
+            from tools.baseline.native_kmeans_inertia import validate_loaded_runtime
+            validate_loaded_runtime(assignment_context.library)
+        self.two_chunks = two_chunks
         self.center_shift_records = center_shift_records
         self.centroid_records = centroid_records
         self.assignment_context, self.assignment_records = assignment_context, assignment_records
@@ -92,8 +100,8 @@ class LloydNormScope:
         if self.assignment_context is not None:
             bound = self.iteration_signature.bind(X, sample_weight, centers_old, *args, **kwargs)
             bound.apply_defaults()
-            if not 0 < X.shape[0] <= 256 or not 0 < centers_old.shape[0] <= 256:
-                raise ValueError("kmeans_lloyd_assignment_single_chunk_required")
+            if not 0 < X.shape[0] <= (512 if self.two_chunks else 256) or not 0 < centers_old.shape[0] <= 256:
+                raise ValueError("kmeans_lloyd_two_chunks_sample_limit" if self.two_chunks else "kmeans_lloyd_assignment_single_chunk_required")
         self.centers = np.asarray(centers_old)
         try:
             if bound is not None and bound.arguments["update_centers"] is True and self.centroid_records is not None:
@@ -106,11 +114,11 @@ class LloydNormScope:
                     raise ValueError("kmeans_lloyd_centroids_outputs_overlap")
                 norms = self.row_norms(centers_old, squared=True)
                 started = time.perf_counter_ns()
-                assigned, distances, assignment_record = self.assignment_context.lloyd_assignment(np.asarray(X), self.centers, norms)
+                assigned, distances, assignment_record = self.assignment_context.lloyd_assignment(np.asarray(X), self.centers, norms, **({"n_threads": bound.arguments["n_threads"]} if self.two_chunks else {}))
                 if self.relocation_records is not None:
                     if np.getbufsize() != 8192:
                         raise ValueError("kmeans_relocation_numpy_buffer_not_supported")
-                    updated, totals, relocation_distances, selected, record = self.assignment_context.lloyd_relocated_centroids(np.asarray(X), np.asarray(sample_weight), assigned, self.centers)
+                    updated, totals, relocation_distances, selected, record = self.assignment_context.lloyd_relocated_centroids(np.asarray(X), np.asarray(sample_weight), assigned, self.centers, **({"n_threads": bound.arguments["n_threads"]} if self.two_chunks else {}))
                 else:
                     updated, totals, record = self.assignment_context.lloyd_centroids(np.asarray(X), np.asarray(sample_weight), assigned, clusters)
                 if self.center_shift_records is not None:
@@ -124,12 +132,12 @@ class LloydNormScope:
                     raise ValueError("kmeans_lloyd_centroids_shift_result_invalid")
                 for (output, shape, dtype), result in zip(outputs, (assigned, updated, totals, shifts)):
                     np.copyto(output, result, casting="no")
-                record.update({"adapter_scope": "sklearn_dense_float32_lloyd_regular_assignment_and_centroids", "original_lloyd_binary_sha256": LLOYD_BINARY_SHA256, "assignment_backend": assignment_record["backend"], "assignment_native_wall_ns": assignment_record["native_wall_ns"], "centroid_completion_and_bridge_wall_ns": record["completion_and_bridge_wall_ns"], "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "centroid_host_input_snapshot_bytes": record["host_input_snapshot_bytes"], "host_input_snapshot_bytes": assignment_record["host_input_snapshot_bytes"] + record["host_input_snapshot_bytes"], "centroid_host_result_bytes": record["host_result_bytes"], "host_result_bytes": assignment_record["host_result_bytes"] + record["host_result_bytes"], "centroid_native_wall_ns": record["native_wall_ns"], "native_wall_ns": assignment_record["native_wall_ns"] + record["native_wall_ns"], "native_blas_calls": 1, "assignment_host_input_snapshot_bytes": assignment_record["host_input_snapshot_bytes"], "assignment_host_result_bytes": assignment_record["host_result_bytes"], "center_shift_backend": "original_cython_euclidean_dense_dense_float", "center_shift_calls": clusters, "host_output_copy_bytes": sum(output.nbytes for output, shape, dtype in outputs), "centroid_norms_device": "gpu", "cpu_residuals": ["cython_center_shift", "inertia", "convergence_control", "host_staging_and_control"], "unsupported_operations": ["empty_cluster_relocation", "multiple_chunk_merge"]})
+                record.update({"adapter_scope": "sklearn_dense_float32_lloyd_regular_assignment_and_centroids", "original_lloyd_binary_sha256": LLOYD_BINARY_SHA256, "assignment_backend": assignment_record["backend"], "assignment_native_wall_ns": assignment_record["native_wall_ns"], "centroid_completion_and_bridge_wall_ns": record["completion_and_bridge_wall_ns"], "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "centroid_host_input_snapshot_bytes": record["host_input_snapshot_bytes"], "host_input_snapshot_bytes": assignment_record["host_input_snapshot_bytes"] + record["host_input_snapshot_bytes"], "centroid_host_result_bytes": record["host_result_bytes"], "host_result_bytes": assignment_record["host_result_bytes"] + record["host_result_bytes"], "centroid_native_wall_ns": record["native_wall_ns"], "native_wall_ns": assignment_record["native_wall_ns"] + record["native_wall_ns"], "native_blas_calls": assignment_record["native_blas_calls"], "assignment_host_input_snapshot_bytes": assignment_record["host_input_snapshot_bytes"], "assignment_host_result_bytes": assignment_record["host_result_bytes"], "center_shift_backend": "original_cython_euclidean_dense_dense_float", "center_shift_calls": clusters, "host_output_copy_bytes": sum(output.nbytes for output, shape, dtype in outputs), "centroid_norms_device": "gpu", "cpu_residuals": ["cython_center_shift", "inertia", "convergence_control", "host_staging_and_control"], "unsupported_operations": ["empty_cluster_relocation", "multiple_chunk_merge"]})
                 if self.center_shift_records is not None:
                     record.update({"center_shift_backend": shift_record["backend"], "center_shift_calls": 1, "center_shift_rows": clusters, "cpu_residuals": ["inertia", "convergence_control", "host_staging_and_control"]})
                     self.center_shift_records.append(shift_record)
                 if self.relocation_records is not None:
-                    record["unsupported_operations"] = ["multiple_chunk_merge"]
+                    record["unsupported_operations"] = ["three_or_more_chunks"] if self.two_chunks else ["multiple_chunk_merge"]
                     record["numpy_core_binary_sha256"] = self.numpy_core_sha256
                     shared = {key: record[key] for key in ("scope", "execution_device", "samples", "clusters", "features", "empty_clusters", "relocated_clusters", "selection_calls", "distance_rows", "python_numeric_relocation", "python_argpartition", "empty_cluster_relocation_replaced", "gpu_kernels", "command_buffers_per_run", "computation_gpu_seconds", "logical_input_upload_bytes", "logical_result_readback_bytes", "quality_certified", "full_pipeline_gpu_certified", "production_backend", "numpy_core_binary_sha256")}
                     shared.update({"adapter_scope": "sklearn_dense_float32_lloyd_empty_relocation", "backend": "shared_native_cpu_relocated_centroid_update", "shared_centroid_update": True, "shared_operation_index": len(self.centroid_records), "native_wall_ns": 0, "completion_and_bridge_wall_ns": 0, "host_input_snapshot_bytes": 0, "host_result_bytes": 0, "native_blas_calls": 0})
@@ -141,7 +149,7 @@ class LloydNormScope:
                 if labels.dtype != np.int32 or labels.shape != (X.shape[0],) or not labels.flags.c_contiguous or not labels.flags.writeable:
                     raise ValueError("kmeans_lloyd_assignment_label_output_invalid")
                 norms = self.row_norms(centers_old, squared=True)
-                assigned, distances, record = self.assignment_context.lloyd_assignment(np.asarray(X), self.centers, norms)
+                assigned, distances, record = self.assignment_context.lloyd_assignment(np.asarray(X), self.centers, norms, **({"n_threads": bound.arguments["n_threads"]} if self.two_chunks else {}))
                 np.copyto(labels, assigned, casting="no")
                 record.update({"adapter_scope": "sklearn_dense_float32_lloyd_final_assignment", "original_lloyd_binary_sha256": LLOYD_BINARY_SHA256, "final_assignment_replaced": True, "centroid_norms_device": "gpu", "host_label_copy_bytes": labels.nbytes, "cpu_residuals": ["regular_lloyd_iterations_and_centroid_updates", "empty_cluster_relocation", "inertia", "convergence_control", "host_staging_and_control"]})
                 self.assignment_records.append(record)

@@ -18,7 +18,8 @@ class PotentialMetrics(ct.Structure):
     _fields_ = [("version", ct.c_uint32), ("blas_calls", ct.c_uint32), ("wall_ns", ct.c_uint64)]
 
 
-def build_library(output, with_inertia=False):
+def build_library(output, with_inertia=False, with_two_chunks=False):
+    with_inertia = with_inertia or with_two_chunks
     output = Path(output).absolute()
     if output.exists() or output.is_symlink():
         raise ValueError("kmeans_potential_build_output_exists")
@@ -32,6 +33,10 @@ def build_library(output, with_inertia=False):
             inertia_object = Path(directory) / "inertia.o"
             subprocess.run(["xcrun", "clang++", "-std=c++20", "-O1", "-ffp-contract=off", "-Xpreprocessor", "-fopenmp", "-fPIC", "-c", str(source.with_name("native_kmeans_inertia.cpp")), "-o", str(inertia_object)], check=True, capture_output=True, timeout=60)
             command += [str(inertia_object), str(runtime), "-Wl,-rpath," + str(runtime.parent)]
+            if with_two_chunks:
+                two_chunks_object = Path(directory) / "two-chunks.o"
+                subprocess.run(["xcrun", "clang++", "-std=c++20", "-O1", "-ffp-contract=off", "-Xpreprocessor", "-fopenmp", "-fPIC", "-c", str(source.with_name("native_kmeans_two_chunks.cpp")), "-o", str(two_chunks_object)], check=True, capture_output=True, timeout=60)
+                command += [str(two_chunks_object)]
         subprocess.run(command, check=True, capture_output=True, timeout=60)
         if with_inertia:
             install_id = subprocess.run(["otool", "-D", str(runtime)], check=True, capture_output=True, text=True, timeout=10).stdout.splitlines()[1].strip()
@@ -42,6 +47,9 @@ def build_library(output, with_inertia=False):
     identity.update({name + "_source_sha256": hashlib.sha256(source.with_name(filename).read_bytes()).hexdigest() for name, filename in (("relocation", "native_kmeans_relocation.cpp"), ("selection", "native_kmeans_selection.hpp"), ("pairwise", "native_kmeans_pairwise.hpp"))})
     if with_inertia:
         identity.update({"inertia_source_sha256": hashlib.sha256(source.with_name("native_kmeans_inertia.cpp").read_bytes()).hexdigest(), "openmp_runtime_sha256": hashlib.sha256(runtime.read_bytes()).hexdigest()})
+    identity["relocation_core_source_sha256"] = hashlib.sha256(source.with_name("native_kmeans_relocation_core.hpp").read_bytes()).hexdigest()
+    if with_two_chunks:
+        identity["two_chunks_source_sha256"] = hashlib.sha256(source.with_name("native_kmeans_two_chunks.cpp").read_bytes()).hexdigest()
     return identity
 
 
@@ -73,12 +81,15 @@ class NativeKMeansPotentials:
         with self.lock:
             self.closed = True
 
-    def lloyd_relocated_centroids(self, values, weights, labels, previous):
+    def lloyd_relocated_centroids(self, values, weights, labels, previous, *, n_threads=None):
         if any(type(value) is not np.ndarray or value.dtype != np.float32 or not value.flags.c_contiguous for value in (values, weights, previous)) or values.ndim != 2 or previous.ndim != 2 or weights.ndim != 1 or type(labels) is not np.ndarray or labels.dtype != np.int32 or labels.ndim != 1 or not labels.flags.c_contiguous:
             raise ValueError("kmeans_relocation_operand_format_invalid")
+        two_chunks = n_threads is not None
+        if two_chunks and (type(n_threads) is not int or n_threads not in (1, 2, 12)):
+            raise ValueError("kmeans_two_chunks_thread_count_not_supported")
         rows, features = values.shape
         clusters = previous.shape[0]
-        if not 0 < rows <= 256 or not 0 < clusters <= rows or not 0 < features <= 1024 or previous.shape[1] != features or weights.shape != (rows,) or labels.shape != (rows,):
+        if not 0 < rows <= (512 if two_chunks else 256) or not 0 < clusters <= min(rows, 256) or not 0 < features <= 1024 or previous.shape[1] != features or weights.shape != (rows,) or labels.shape != (rows,):
             raise ValueError("kmeans_relocation_shape_invalid")
         centers, totals, distances, order, counts = np.empty_like(previous), np.empty(clusters, np.float32), np.empty(rows, np.float32), np.empty(rows, np.int32), np.empty(2, np.uint32)
         metrics, error = PotentialMetrics(), ct.create_string_buffer(128)
@@ -87,22 +98,28 @@ class NativeKMeansPotentials:
             if self.closed:
                 raise ValueError("kmeans_potential_context_closed")
             try:
-                native = self.library.wxkmeans_lloyd_relocated_centroids
+                native = self.library.wxkmeans_lloyd_centroids_two_chunks if two_chunks else self.library.wxkmeans_lloyd_relocated_centroids
             except AttributeError as failure:
-                raise ValueError("kmeans_relocation_abi_unavailable") from failure
-            native.argtypes = [ct.c_void_p] * 4 + [ct.c_uint32] * 3 + [ct.c_void_p] * 5 + [ct.POINTER(PotentialMetrics), ct.c_char_p, ct.c_uint32]; native.restype = ct.c_int
-            if native(values.ctypes.data, weights.ctypes.data, labels.ctypes.data, previous.ctypes.data, rows, clusters, features, centers.ctypes.data, totals.ctypes.data, distances.ctypes.data, order.ctypes.data, counts.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError("kmeans_two_chunks_centroids_abi_unavailable" if two_chunks else "kmeans_relocation_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p] * 4 + [ct.c_uint32] * (4 if two_chunks else 3) + [ct.c_void_p] * 5 + [ct.POINTER(PotentialMetrics), ct.c_char_p, ct.c_uint32]; native.restype = ct.c_int
+            if native(values.ctypes.data, weights.ctypes.data, labels.ctypes.data, previous.ctypes.data, rows, clusters, features, *([n_threads] if two_chunks else []), centers.ctypes.data, totals.ctypes.data, distances.ctypes.data, order.ctypes.data, counts.ctypes.data, ct.byref(metrics), error, len(error)):
                 raise ValueError(error.value.decode("ascii"))
         if metrics.version != 1 or metrics.blas_calls != 0 or not np.isfinite(centers).all() or not np.isfinite(totals).all() or not np.isfinite(distances).all() or counts[0] > clusters or counts[1] > counts[0] or (order[:int(counts[0])] < 0).any() or (order[:int(counts[0])] >= rows).any():
             raise ValueError("kmeans_relocation_native_result_invalid")
-        return centers, totals, distances, order[:int(counts[0])], {"scope": "experimental_native_cpu_lloyd_relocated_centroids", "execution_device": "cpu", "backend": "cpp_fma_pairwise_introselect_relocated_centroids", "samples": rows, "clusters": clusters, "features": features, "empty_clusters": int(counts[0]), "relocated_clusters": int(counts[1]), "selection_calls": int(counts[0] > 0), "distance_rows": rows if counts[0] else 0, "native_blas_calls": 0, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": values.nbytes + weights.nbytes + labels.nbytes + previous.nbytes, "host_result_bytes": centers.nbytes + totals.nbytes + distances.nbytes + order.nbytes + counts.nbytes, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_numeric_centroid_update": False, "python_numeric_relocation": False, "python_argpartition": False, "centroid_updates_replaced": True, "empty_cluster_relocation_replaced": True, "lloyd_iteration_replaced": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+        record = {"scope": "experimental_native_cpu_lloyd_relocated_centroids", "execution_device": "cpu", "backend": "cpp_fma_pairwise_introselect_relocated_centroids", "samples": rows, "clusters": clusters, "features": features, "empty_clusters": int(counts[0]), "relocated_clusters": int(counts[1]), "selection_calls": int(counts[0] > 0), "distance_rows": rows if counts[0] else 0, "native_blas_calls": 0, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": values.nbytes + weights.nbytes + labels.nbytes + previous.nbytes, "host_result_bytes": centers.nbytes + totals.nbytes + distances.nbytes + order.nbytes + counts.nbytes, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_numeric_centroid_update": False, "python_numeric_relocation": False, "python_argpartition": False, "centroid_updates_replaced": True, "empty_cluster_relocation_replaced": True, "lloyd_iteration_replaced": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
 
-    def inertia_dense(self, values, weights, centers, labels, n_threads, single_label=-1):
+        if two_chunks:
+            record.update({"backend": "cpp_openmp_two_chunk_fma_relocated_centroids", "chunk_size": 256, "chunk_count": (rows + 255) // 256, "requested_threads": n_threads, "effective_iteration_threads": min(n_threads, (rows + 255) // 256), "actual_threads": min(n_threads, (rows + 255) // 256), "thread_count_changed": False, "worker_partial_bytes": min(n_threads, (rows + 255) // 256) * (centers.nbytes + totals.nbytes)})
+        return centers, totals, distances, order[:int(counts[0])], record
+
+    def inertia_dense(self, values, weights, centers, labels, n_threads, single_label=-1, *, two_chunks=False):
         if any(type(value) is not np.ndarray or value.dtype != np.float32 or not value.flags.c_contiguous for value in (values, weights, centers)) or values.ndim != 2 or centers.ndim != 2 or weights.ndim != 1 or type(labels) is not np.ndarray or labels.dtype != np.int32 or labels.ndim != 1 or not labels.flags.c_contiguous:
             raise ValueError("kmeans_inertia_operand_format_invalid")
+        if type(two_chunks) is not bool:
+            raise ValueError("kmeans_two_chunks_configuration_invalid")
         rows, features = values.shape
         clusters = centers.shape[0]
-        if not 0 < rows <= 256 or not 0 < clusters <= 256 or not 0 < features <= 1024 or centers.shape[1] != features or weights.shape != (rows,) or labels.shape != (rows,):
+        if not 0 < rows <= (512 if two_chunks else 256) or not 0 < clusters <= 256 or not 0 < features <= 1024 or centers.shape[1] != features or weights.shape != (rows,) or labels.shape != (rows,):
             raise ValueError("kmeans_inertia_shape_invalid")
         if type(n_threads) is not int or n_threads not in (1, 2, 12):
             raise ValueError("kmeans_inertia_thread_count_not_supported")
@@ -114,15 +131,15 @@ class NativeKMeansPotentials:
             if self.closed:
                 raise ValueError("kmeans_potential_context_closed")
             try:
-                native = self.library.wxkmeans_inertia_dense
+                native = self.library.wxkmeans_inertia_dense_two_chunks if two_chunks else self.library.wxkmeans_inertia_dense
             except AttributeError as failure:
-                raise ValueError("kmeans_inertia_abi_unavailable") from failure
+                raise ValueError("kmeans_two_chunks_inertia_abi_unavailable" if two_chunks else "kmeans_inertia_abi_unavailable") from failure
             native.argtypes = [ct.c_void_p] * 4 + [ct.c_uint32] * 4 + [ct.c_int32, ct.c_void_p, ct.POINTER(PotentialMetrics), ct.c_char_p, ct.c_uint32]; native.restype = ct.c_int
             if native(values.ctypes.data, weights.ctypes.data, centers.ctypes.data, labels.ctypes.data, rows, clusters, features, n_threads, single_label, output.ctypes.data, ct.byref(metrics), error, len(error)):
                 raise ValueError(error.value.decode("ascii"))
         if metrics.version != 1 or metrics.blas_calls != 0 or not np.isfinite(output[0]) or output[0] < 0:
             raise ValueError("kmeans_inertia_native_result_invalid")
-        return float(output[0]), {"scope": "experimental_native_cpu_openmp_inertia", "execution_device": "cpu", "backend": "cpp_pinned_openmp_static_float32_fma", "samples": rows, "clusters": clusters, "features": features, "requested_threads": n_threads, "actual_threads": n_threads, "single_label": single_label, "native_blas_calls": 0, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": values.nbytes + weights.nbytes + centers.nbytes + labels.nbytes, "host_result_bytes": 4, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_numeric_inertia": False, "thread_count_changed": False, "lloyd_iteration_replaced": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+        return float(output[0]), {"scope": "experimental_native_cpu_openmp_inertia", "execution_device": "cpu", "backend": "cpp_pinned_openmp_static_float32_fma", "samples": rows, "clusters": clusters, "features": features, "two_chunks_enabled": two_chunks, "requested_threads": n_threads, "actual_threads": n_threads, "single_label": single_label, "native_blas_calls": 0, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": values.nbytes + weights.nbytes + centers.nbytes + labels.nbytes, "host_result_bytes": 4, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_numeric_inertia": False, "thread_count_changed": False, "lloyd_iteration_replaced": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
 
     def lloyd_center_shifts(self, updated, previous):
         if any(type(value) is not np.ndarray or value.dtype != np.float32 or value.ndim != 2 or not value.flags.c_contiguous for value in (updated, previous)):
@@ -169,12 +186,15 @@ class NativeKMeansPotentials:
             raise ValueError("kmeans_lloyd_centroids_native_result_invalid")
         return centers, totals, {"scope": "experimental_native_cpu_lloyd_weighted_centroids", "execution_device": "cpu", "backend": "cpp_float32_fma_double_reciprocal", "samples": rows, "clusters": clusters, "features": features, "native_blas_calls": 0, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": values.nbytes + weights.nbytes + labels.nbytes, "host_result_bytes": centers.nbytes + totals.nbytes, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_numeric_centroid_update": False, "centroid_updates_replaced": True, "empty_cluster_relocation_replaced": False, "lloyd_iteration_replaced": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
 
-    def lloyd_assignment(self, values, centers, norms):
+    def lloyd_assignment(self, values, centers, norms, *, n_threads=None):
         if any(type(value) is not np.ndarray or value.dtype != np.float32 or not value.flags.c_contiguous for value in (values, centers, norms)) or values.ndim != 2 or centers.ndim != 2 or norms.ndim != 1:
             raise ValueError("kmeans_lloyd_assignment_operand_format_invalid")
+        two_chunks = n_threads is not None
+        if two_chunks and (type(n_threads) is not int or n_threads not in (1, 2, 12)):
+            raise ValueError("kmeans_two_chunks_thread_count_not_supported")
         rows, features = values.shape
         clusters = centers.shape[0]
-        if not 0 < rows <= 256 or not 0 < clusters <= 256 or not 0 < features <= 1024 or centers.shape[1] != features or norms.shape != (clusters,):
+        if not 0 < rows <= (512 if two_chunks else 256) or not 0 < clusters <= 256 or not 0 < features <= 1024 or centers.shape[1] != features or norms.shape != (clusters,):
             raise ValueError("kmeans_lloyd_assignment_shape_invalid")
         labels, distances = np.empty(rows, np.int32), np.empty((rows, clusters), np.float32)
         metrics, error = PotentialMetrics(), ct.create_string_buffer(128)
@@ -183,15 +203,17 @@ class NativeKMeansPotentials:
             if self.closed:
                 raise ValueError("kmeans_potential_context_closed")
             try:
-                native = self.library.wxkmeans_lloyd_assignment
+                native = self.library.wxkmeans_lloyd_assignment_two_chunks if two_chunks else self.library.wxkmeans_lloyd_assignment
             except AttributeError as failure:
-                raise ValueError("kmeans_lloyd_assignment_abi_unavailable") from failure
-            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.c_void_p, ct.POINTER(PotentialMetrics), ct.c_char_p, ct.c_uint32]; native.restype = ct.c_int
-            if native(values.ctypes.data, centers.ctypes.data, norms.ctypes.data, rows, clusters, features, labels.ctypes.data, distances.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError("kmeans_two_chunks_assignment_abi_unavailable" if two_chunks else "kmeans_lloyd_assignment_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_void_p, *([ct.c_uint32] * (4 if two_chunks else 3)), ct.c_void_p, ct.c_void_p, ct.POINTER(PotentialMetrics), ct.c_char_p, ct.c_uint32]; native.restype = ct.c_int
+            if native(values.ctypes.data, centers.ctypes.data, norms.ctypes.data, rows, clusters, features, *([n_threads] if two_chunks else []), labels.ctypes.data, distances.ctypes.data, ct.byref(metrics), error, len(error)):
                 raise ValueError(error.value.decode("ascii"))
-        if metrics.version != 1 or metrics.blas_calls != 1 or not np.isfinite(distances).all() or (labels < 0).any() or (labels >= clusters).any():
+        if metrics.version != 1 or metrics.blas_calls != ((rows + 255) // 256 if two_chunks else 1) or not np.isfinite(distances).all() or (labels < 0).any() or (labels >= clusters).any():
             raise ValueError("kmeans_lloyd_assignment_native_result_invalid")
         record = {"scope": "experimental_native_cpu_lloyd_final_assignment", "execution_device": "cpu", "backend": "accelerate_newlapack_lp64_sgemm_first_minimum", "samples": rows, "clusters": clusters, "features": features, "native_blas_calls": 1, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": values.nbytes + centers.nbytes + norms.nbytes, "host_result_bytes": labels.nbytes + distances.nbytes, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_numeric_assignment": False, "lloyd_iteration_replaced": False, "centroid_updates_replaced": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+        if two_chunks:
+            record.update({"backend": "accelerate_lp64_openmp_static_two_chunks", "native_blas_calls": (rows + 255) // 256, "chunk_size": 256, "chunk_count": (rows + 255) // 256, "requested_threads": n_threads, "effective_iteration_threads": min(n_threads, (rows + 255) // 256), "actual_threads": min(n_threads, (rows + 255) // 256), "thread_count_changed": False, "host_input_snapshot_bytes": 2 * values.nbytes + (((rows + 255) // 256) + 1) * (centers.nbytes + norms.nbytes)})
         return labels, distances, record
 
     def same_clustering(self, labels, previous, clusters):
@@ -365,8 +387,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, help="New native CPU Accelerate dylib path; existing files are preserved.")
     parser.add_argument("--with-inertia", action="store_true", help="Additionally build the pinned OpenMP inertia ABI using sklearn's existing libomp; default builds retain the previous dependencies.")
+    parser.add_argument("--with-two-chunks", action="store_true", help="Additionally build the pinned OpenMP two-chunk Lloyd ABIs; implies --with-inertia and preserves legacy single-chunk ABIs.")
     args = parser.parse_args()
-    print(json.dumps(build_library(args.output, with_inertia=args.with_inertia), sort_keys=True))
+    print(json.dumps(build_library(args.output, with_inertia=args.with_inertia, with_two_chunks=args.with_two_chunks), sort_keys=True))
 
 
 if __name__ == "__main__":

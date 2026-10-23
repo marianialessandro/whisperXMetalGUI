@@ -97,7 +97,7 @@ def shift_inplace(context, records, values, mean, add, role):
 
 
 @contextlib.contextmanager
-def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None, product_records=None, chunk_records=None, lloyd_shift_records=None, lloyd_label_records=None, equivalence_records=None, lloyd_norm_records=None, assignment_records=None, centroid_records=None, center_shift_records=None, inertia_records=None, relocation_records=None):
+def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None, product_records=None, chunk_records=None, lloyd_shift_records=None, lloyd_label_records=None, equivalence_records=None, lloyd_norm_records=None, assignment_records=None, centroid_records=None, center_shift_records=None, inertia_records=None, relocation_records=None, two_chunks=False):
     global _ACTIVE
     from sklearn.base import _fit_context
     from sklearn.cluster import KMeans
@@ -165,6 +165,8 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
             from scipy import sparse
             original_equivalence = inspect.unwrap(KMeans.fit).__globals__.get("_is_same_clustering")
             validate_equivalence(original_equivalence)
+        if type(two_chunks) is not bool or (two_chunks and (relocation_records is None or inertia_records is None)):
+            raise ValueError("kmeans_two_chunks_configuration_invalid")
         if relocation_records is not None and (centroid_records is None or not isinstance(relocation_records, list)):
             raise ValueError("kmeans_relocation_configuration_invalid")
         if inertia_records is not None:
@@ -182,7 +184,7 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
         lloyd_norm_scope = None
         if lloyd_norm_records is not None:
             from tools.baseline.native_kmeans_lloyd_norms import LloydNormScope
-            lloyd_norm_scope = LloydNormScope(context, lloyd_norm_records, assignment_context=potential_context if assignment_records is not None else None, assignment_records=assignment_records, centroid_records=centroid_records, center_shift_records=center_shift_records, relocation_records=relocation_records)
+            lloyd_norm_scope = LloydNormScope(context, lloyd_norm_records, assignment_context=potential_context if assignment_records is not None else None, assignment_records=assignment_records, centroid_records=centroid_records, center_shift_records=center_shift_records, relocation_records=relocation_records, two_chunks=two_chunks)
         original_lloyd = candidate_lloyd = None
         if lloyd_shift_records is not None or lloyd_label_records is not None or lloyd_norm_scope is not None:
             import sklearn.cluster._kmeans as kmeans_module
@@ -196,7 +198,7 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
                 raise ValueError("kmeans_lloyd_labels_abi_unavailable")
             validate_reference(kmeans_module._kmeans_plusplus.__globals__["row_norms"])
             original_lloyd = kmeans_module._kmeans_single_lloyd
-            candidate_lloyd = compile_native_lloyd(original_lloyd, (lambda values: shift_total(potential_context, lloyd_shift_records, values)) if lloyd_shift_records is not None else None, labels_equal=(lambda values, previous: labels_equal(potential_context, lloyd_label_records, values, previous)) if lloyd_label_records is not None else None, dense_iteration=lloyd_norm_scope.iteration if lloyd_norm_scope is not None else None, inertia=(lambda X, weights, centers, labels, n_threads, single_label=-1: inertia_value(potential_context, inertia_records, X, weights, centers, labels, n_threads, single_label)) if inertia_records is not None else None)
+            candidate_lloyd = compile_native_lloyd(original_lloyd, (lambda values: shift_total(potential_context, lloyd_shift_records, values)) if lloyd_shift_records is not None else None, labels_equal=(lambda values, previous: labels_equal(potential_context, lloyd_label_records, values, previous)) if lloyd_label_records is not None else None, dense_iteration=lloyd_norm_scope.iteration if lloyd_norm_scope is not None else None, inertia=(lambda X, weights, centers, labels, n_threads, single_label=-1: inertia_value(potential_context, inertia_records, X, weights, centers, labels, n_threads, single_label, **({"two_chunks": True} if two_chunks else {}))) if inertia_records is not None else None)
         resident_pipeline = None
         original_tolerance = None
         original_plusplus = None

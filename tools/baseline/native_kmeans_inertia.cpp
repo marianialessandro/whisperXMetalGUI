@@ -19,10 +19,10 @@ extern "C" const char* wxkmeans_inertia_runtime_path() {
     return dladdr(reinterpret_cast<const void*>(&omp_get_num_threads), &info) && info.dli_fname != nullptr ? info.dli_fname : nullptr;
 }
 
-extern "C" int wxkmeans_inertia_dense(const float* values, const float* weights, const float* centers, const int32_t* labels, uint32_t rows, uint32_t clusters, uint32_t features, uint32_t threads, int32_t single_label, float* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity) {
+static int wxkmeans_inertia_impl(const float* values, const float* weights, const float* centers, const int32_t* labels, uint32_t rows, uint32_t clusters, uint32_t features, uint32_t threads, int32_t single_label, float* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity, uint32_t maximum_rows) {
     try {
         require(values != nullptr && weights != nullptr && centers != nullptr && labels != nullptr && output != nullptr && metrics != nullptr, "kmeans_inertia_pointer_missing");
-        require(rows > 0 && rows <= 256 && clusters > 0 && clusters <= 256 && features > 0 && features <= 1024, "kmeans_inertia_shape_invalid");
+        require(rows > 0 && rows <= maximum_rows && clusters > 0 && clusters <= 256 && features > 0 && features <= 1024, "kmeans_inertia_shape_invalid");
         require(threads == 1 || threads == 2 || threads == 12, "kmeans_inertia_thread_count_not_supported");
         require(single_label >= -1 && single_label < int32_t(clusters), "kmeans_inertia_single_label_invalid");
         require(omp_get_dynamic() == 0 && std::getenv("KMP_FORCE_REDUCTION") == nullptr && std::getenv("KMP_DETERMINISTIC_REDUCTION") == nullptr, "kmeans_inertia_runtime_policy_not_supported");
@@ -60,3 +60,7 @@ extern "C" int wxkmeans_inertia_dense(const float* values, const float* weights,
         return 1;
     }
 }
+
+extern "C" int wxkmeans_inertia_dense(const float* values, const float* weights, const float* centers, const int32_t* labels, uint32_t rows, uint32_t clusters, uint32_t features, uint32_t threads, int32_t single_label, float* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity) { return wxkmeans_inertia_impl(values, weights, centers, labels, rows, clusters, features, threads, single_label, output, metrics, error, capacity, 256); }
+
+extern "C" int wxkmeans_inertia_dense_two_chunks(const float* values, const float* weights, const float* centers, const int32_t* labels, uint32_t rows, uint32_t clusters, uint32_t features, uint32_t threads, int32_t single_label, float* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity) { return wxkmeans_inertia_impl(values, weights, centers, labels, rows, clusters, features, threads, single_label, output, metrics, error, capacity, 512); }
