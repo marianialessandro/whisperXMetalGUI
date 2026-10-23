@@ -1,4 +1,6 @@
 #include <cassert>
+#include <algorithm>
+#include <vector>
 #include <cmath>
 #include <bit>
 #include <cstdint>
@@ -12,6 +14,7 @@ extern "C" int wxkmeans_weighted_potentials(const float*, const float*, uint32_t
 extern "C" int wxkmeans_distance_products(const double*, const double*, uint32_t, uint32_t, uint32_t, double*, KmeansPotentialMetrics*, char*, uint32_t);
 
 extern "C" int wxkmeans_upcast_chunk(const float*, uint32_t, uint32_t, double*, KmeansPotentialMetrics*, char*, uint32_t);
+extern "C" int wxkmeans_upcast_chunk_512(const float*, uint32_t, uint32_t, double*, KmeansPotentialMetrics*, char*, uint32_t);
 
 extern "C" int wxkmeans_lloyd_shift_total(const float*, uint32_t, float*, KmeansPotentialMetrics*, char*, uint32_t);
 
@@ -257,5 +260,23 @@ int main() {
     std::memcpy(&equivalent, unaligned_equivalent + 1, sizeof(equivalent)); assert(equivalent == 1);
     assert(wxkmeans_same_clustering(map_a, map_b, 3, 2, reinterpret_cast<uint32_t*>(map_a), &metrics, error, sizeof(error)) == 0 && map_a[0] == 1);
     assert(wxkmeans_same_clustering(nullptr, nullptr, 0, 0, nullptr, nullptr, nullptr, 0) != 0);
+
+    std::vector<float> large_chunk(512 * 17, .25f);
+    std::vector<double> large_converted(large_chunk.size(), 91.);
+    assert(wxkmeans_upcast_chunk_512(large_chunk.data(), 512, 17, large_converted.data(), &metrics, error, sizeof(error)) == 0);
+    for (double value : large_converted) assert(value == .25);
+    std::fill(large_converted.begin(), large_converted.end(), 91.);
+    assert(wxkmeans_upcast_chunk(large_chunk.data(), 512, 17, large_converted.data(), &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_upcast_chunk_512(large_chunk.data(), 513, 17, large_converted.data(), &metrics, error, sizeof(error)) != 0);
+    large_chunk.back() = std::numeric_limits<float>::infinity();
+    assert(wxkmeans_upcast_chunk_512(large_chunk.data(), 512, 17, large_converted.data(), &metrics, error, sizeof(error)) != 0);
+    for (double value : large_converted) assert(value == 91.);
+    large_chunk.back() = -.25f;
+    std::vector<unsigned char> large_alias(large_converted.size() * sizeof(double) + 1);
+    std::memcpy(large_alias.data() + 1, large_chunk.data(), large_chunk.size() * sizeof(float));
+    assert(wxkmeans_upcast_chunk_512(reinterpret_cast<float*>(large_alias.data() + 1), 512, 17, reinterpret_cast<double*>(large_alias.data() + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(large_converted.data(), large_alias.data() + 1, large_converted.size() * sizeof(double));
+    for (size_t index = 0; index < large_chunk.size(); ++index) assert(large_converted[index] == double(large_chunk[index]));
+    assert(wxkmeans_upcast_chunk_512(nullptr, 512, 17, large_converted.data(), &metrics, error, sizeof(error)) != 0);
 
 }

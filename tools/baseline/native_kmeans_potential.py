@@ -279,11 +279,13 @@ class NativeKMeansPotentials:
             raise ValueError("kmeans_lloyd_shift_native_result_invalid")
         return output[0], {"scope": "experimental_native_cpu_kmeans_lloyd_shift_total", "execution_device": "cpu", "backend": "cpp_numpy_pairwise_float32", "centers": shifts.size, "native_blas_calls": 0, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": shifts.nbytes, "host_result_bytes": 4, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_numeric_shift_reduction": False, "lloyd_iteration_replaced": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
 
-    def upcast_chunk(self, values):
+    def upcast_chunk(self, values, *, extended_rows=False):
         if type(values) is not np.ndarray or values.dtype != np.float32 or values.ndim != 2 or not values.flags.c_contiguous:
             raise ValueError("kmeans_upcast_chunk_operand_format_invalid")
+        if type(extended_rows) is not bool:
+            raise ValueError("kmeans_upcast_512_configuration_invalid")
         rows, features = values.shape
-        if not 0 < rows <= 256 or not 0 < features <= 1024:
+        if not 0 < rows <= (512 if extended_rows else 256) or not 0 < features <= 1024:
             raise ValueError("kmeans_upcast_chunk_shape_invalid")
         output, metrics, error = np.empty(values.shape, dtype=np.float64), PotentialMetrics(), ct.create_string_buffer(128)
         started = time.perf_counter_ns()
@@ -291,16 +293,16 @@ class NativeKMeansPotentials:
             if self.closed:
                 raise ValueError("kmeans_potential_context_closed")
             try:
-                native = self.library.wxkmeans_upcast_chunk
+                native = self.library.wxkmeans_upcast_chunk_512 if extended_rows else self.library.wxkmeans_upcast_chunk
             except AttributeError as failure:
-                raise ValueError("kmeans_upcast_chunk_abi_unavailable") from failure
+                raise ValueError("kmeans_upcast_512_abi_unavailable" if extended_rows else "kmeans_upcast_chunk_abi_unavailable") from failure
             native.argtypes = [ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_void_p, ct.POINTER(PotentialMetrics), ct.c_char_p, ct.c_uint32]
             native.restype = ct.c_int
             if native(values.ctypes.data, rows, features, output.ctypes.data, ct.byref(metrics), error, len(error)):
                 raise ValueError(error.value.decode("ascii"))
         if metrics.version != 1 or metrics.blas_calls != 0 or not np.isfinite(output).all():
             raise ValueError("kmeans_upcast_chunk_native_result_invalid")
-        return output, {"scope": "experimental_native_cpu_kmeans_upcast_chunk", "execution_device": "cpu", "backend": "cpp_ieee_integer_conversion", "rows": rows, "features": features, "native_blas_calls": 0, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": 0, "host_input_bytes_read": values.nbytes, "native_result_staging_bytes": output.nbytes, "host_result_bytes": output.nbytes, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_numeric_dtype_conversion": False, "signed_zero_preserved": True, "binary32_subnormals_preserved": True, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+        return output, {"scope": "experimental_native_cpu_kmeans_upcast_chunk", "execution_device": "cpu", "backend": "cpp_ieee_integer_conversion", "rows": rows, "features": features, "extended_rows_enabled": extended_rows, "maximum_rows": 512 if extended_rows else 256, "native_blas_calls": 0, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": 0, "host_input_bytes_read": values.nbytes, "native_result_staging_bytes": output.nbytes, "host_result_bytes": output.nbytes, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_numeric_dtype_conversion": False, "signed_zero_preserved": True, "binary32_subnormals_preserved": True, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
 
     def distance_products(self, left, right):
         if any(type(value) is not np.ndarray or value.dtype != np.float64 or value.ndim != 2 or not value.flags.c_contiguous for value in (left, right)):
@@ -371,13 +373,13 @@ def distance_products(context, records, left, transposed_right, dense_output=Fal
     return output
 
 
-def upcast_chunk(context, records, values, role, target_dtype=np.float64):
+def upcast_chunk(context, records, values, role, target_dtype=np.float64, *, extended_rows=False):
     from tools.baseline.native_kmeans_upcast_norms import EUCLIDEAN_SHA256, UPCAST_SHA256, NUMPY_CORE_SHA256
     if target_dtype is not np.float64:
         raise ValueError("kmeans_upcast_chunk_target_dtype_not_supported")
     if role not in ("X_chunk", "Y_chunk"):
         raise ValueError("kmeans_upcast_chunk_role_invalid")
-    output, record = context.upcast_chunk(values)
+    output, record = context.upcast_chunk(values, **({"extended_rows": True} if extended_rows else {}))
     record.update({"adapter_scope": "sklearn_kmeans_plusplus_chunk_float64_conversion", "operand_role": role, "original_euclidean_sha256": EUCLIDEAN_SHA256, "original_upcast_sha256": UPCAST_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256, "host_input_staging_copy_bytes": 0, "cpu_residuals": ["chunk_conversion_native_cpp", "distance_blas_products", "weighted_potentials", "rng_and_seed_control", "lloyd_or_elkan", "host_staging_and_control"]})
     records.append(record)
     return output

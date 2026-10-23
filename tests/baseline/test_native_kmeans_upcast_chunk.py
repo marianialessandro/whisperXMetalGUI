@@ -145,3 +145,57 @@ class NativeKMeansUpcastChunkTests(unittest.TestCase):
                 with native_kmeans_feature_mean(gpu, [], chunk_records=[]):
                     pass
         self.assertIs(KMeans.fit, original_fit); self.assertIs(kmeans._kmeans_plusplus, original_plus)
+
+    def test_extended_rows_ieee_bits_guards_and_late_invalid_input(self):
+        rng = np.random.default_rng(5112)
+        with self.context() as cpu:
+            for rows in (1, 256, 257, 511, 512):
+                bits = rng.integers(0, 2 ** 32, size=(rows, 1024), dtype=np.uint32)
+                bits[(bits & 0x7f800000) == 0x7f800000] = 0
+                bits.reshape(-1)[:8] = [0, 0x80000000, 1, 0x80000001, 0x007fffff, 0x807fffff, 0x7f7fffff, 0xff7fffff]
+                values = bits.view(np.float32)
+                actual, record = cpu.upcast_chunk(values, extended_rows=True)
+                np.testing.assert_array_equal(actual.view(np.uint64), values.astype(np.float64).view(np.uint64))
+                self.assertTrue(record["extended_rows_enabled"])
+                self.assertEqual(record["maximum_rows"], 512)
+            for value in (1, None, "yes"):
+                with self.assertRaisesRegex(ValueError, "configuration"):
+                    cpu.upcast_chunk(values, extended_rows=value)
+            with self.assertRaisesRegex(ValueError, "shape_invalid"):
+                cpu.upcast_chunk(values)
+            with self.assertRaisesRegex(ValueError, "shape_invalid"):
+                cpu.upcast_chunk(np.zeros((513, 1), np.float32), extended_rows=True)
+            values[-1, -1] = np.nan
+            with self.assertRaisesRegex(ValueError, "finite_input_required"):
+                cpu.upcast_chunk(values, extended_rows=True)
+            with patch.object(cpu, "library", SimpleNamespace()), self.assertRaisesRegex(ValueError, "upcast_512_abi_unavailable"):
+                cpu.upcast_chunk(np.ones((257, 1), np.float32), extended_rows=True)
+
+    def test_extended_rows_original_helper_batching_and_full_fits(self):
+        with self.context() as cpu, NativeDoubleNormalization(self.double, self.double_identity["library_sha256"]) as gpu:
+            for rows in (257, 512):
+                values = np.random.default_rng(rows).normal(size=(rows, 17)).astype(np.float32)
+                candidate = compile_upcast_distances(pairwise._euclidean_distances, pairwise.row_norms, upcast_chunk=lambda value, target_dtype, role: upcast_chunk(cpu, records, value, role, target_dtype, extended_rows=True))
+                for right in (values, values.copy(), values[:3].copy()):
+                    records = []
+                    expected = pairwise._euclidean_distances(values, right, squared=True)
+                    actual = candidate(values, right, squared=True)
+                    np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+                    self.assertTrue(any(record["rows"] == rows for record in records))
+                for clusters in (1, 4):
+                    weights = np.linspace(.125, 2, rows, dtype=np.float32)
+                    rng1, rng2 = np.random.RandomState(17), np.random.RandomState(17)
+                    left, right = values.copy(), values.copy()
+                    expected = KMeans(n_clusters=clusters, n_init=2, random_state=rng1, copy_x=False).fit(left, sample_weight=weights)
+                    with native_kmeans_feature_mean(gpu, [], potential_context=cpu, potential_records=[], upcast_norm_records=[], chunk_records=(records := []), upcast_512=True):
+                        actual = KMeans(n_clusters=clusters, n_init=2, random_state=rng2, copy_x=False).fit(right, sample_weight=weights)
+                    np.testing.assert_array_equal(actual.cluster_centers_.view(np.uint32), expected.cluster_centers_.view(np.uint32))
+                    np.testing.assert_array_equal(actual.labels_, expected.labels_)
+                    np.testing.assert_array_equal(left.view(np.uint32), right.view(np.uint32))
+                    np.testing.assert_array_equal(rng1.uniform(size=32), rng2.uniform(size=32))
+                    self.assertEqual((actual.inertia_, actual.n_iter_, actual._n_threads), (expected.inertia_, expected.n_iter_, expected._n_threads))
+                    self.assertTrue(any(record["rows"] > 256 for record in records))
+            with self.assertRaisesRegex(ValueError, "upcast_512_configuration"), native_kmeans_feature_mean(gpu, [], upcast_512=True):
+                pass
+            with patch.object(cpu, "library", SimpleNamespace(wxkmeans_weighted_potentials=object(), wxkmeans_upcast_chunk=object())), self.assertRaisesRegex(ValueError, "upcast_512_abi_unavailable"), native_kmeans_feature_mean(gpu, [], potential_context=cpu, potential_records=[], upcast_norm_records=[], chunk_records=[], upcast_512=True):
+                pass

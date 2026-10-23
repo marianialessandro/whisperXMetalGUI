@@ -94,10 +94,10 @@ extern "C" int wxkmeans_distance_products(const double* left, const double* righ
     }
 }
 
-extern "C" int wxkmeans_upcast_chunk(const float* input, uint32_t rows, uint32_t features, double* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity) {
+static int wxkmeans_upcast_chunk_impl(const float* input, uint32_t rows, uint32_t features, double* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity, uint32_t maximum_rows) {
     try {
         require(input != nullptr && output != nullptr && metrics != nullptr, "kmeans_upcast_chunk_pointer_missing");
-        require(rows > 0 && rows <= 256 && features > 0 && features <= 1024, "kmeans_upcast_chunk_shape_invalid");
+        require(rows > 0 && rows <= maximum_rows && features > 0 && features <= 1024, "kmeans_upcast_chunk_shape_invalid");
         auto started = std::chrono::steady_clock::now();
         uint64_t count = uint64_t(rows) * features;
         std::vector<uint64_t> result(count);
@@ -123,6 +123,14 @@ extern "C" int wxkmeans_upcast_chunk(const float* input, uint32_t rows, uint32_t
         if (error != nullptr && capacity > 0) { std::strncpy(error, "kmeans_upcast_chunk_failed", capacity - 1); error[capacity - 1] = 0; }
         return 1;
     }
+}
+
+extern "C" int wxkmeans_upcast_chunk(const float* input, uint32_t rows, uint32_t features, double* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity) {
+    return wxkmeans_upcast_chunk_impl(input, rows, features, output, metrics, error, capacity, 256);
+}
+
+extern "C" int wxkmeans_upcast_chunk_512(const float* input, uint32_t rows, uint32_t features, double* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity) {
+    return wxkmeans_upcast_chunk_impl(input, rows, features, output, metrics, error, capacity, 512);
 }
 
 // NumPy pairwise reduction order is adapted under the notice in native_numpy_norm_notice.txt.
