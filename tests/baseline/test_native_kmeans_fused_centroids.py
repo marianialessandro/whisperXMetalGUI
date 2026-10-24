@@ -52,6 +52,9 @@ class NativeKMeansFusedCentroidTests(unittest.TestCase):
                                 np.testing.assert_array_equal(left.view(np.uint32), right.view(np.uint32))
                             np.testing.assert_array_equal(actual[4].view(np.uint32), expected_shifts.view(np.uint32))
                             record = actual[5]
+                            self.assertTrue(record["center_shift_owned_buffer_reuse"])
+                            self.assertEqual(record["center_shift_snapshot_bytes_avoided"], previous.nbytes * 2)
+                            self.assertEqual(record["center_shift_input_snapshot_bytes"], 0)
                             self.assertTrue(record["fused_center_shifts"])
                             self.assertFalse(record["python_center_shift_bridge"])
                             self.assertEqual(record["intermediate_centroid_transfer_for_shift_bytes"], 0)

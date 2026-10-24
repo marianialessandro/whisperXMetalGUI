@@ -57,6 +57,9 @@ class NativeKMeansFusedUpdateTests(unittest.TestCase):
                                 np.testing.assert_array_equal(left.view(np.uint32), right.view(np.uint32))
                             np.testing.assert_array_equal(actual[4].view(np.uint32), expected_shifts.view(np.uint32))
                             record = actual[5]
+                            self.assertTrue(record["center_shift_owned_buffer_reuse"])
+                            self.assertEqual(record["center_shift_snapshot_bytes_avoided"], previous.nbytes * 2)
+                            self.assertEqual(record["center_shift_input_snapshot_bytes"], 0)
                             self.assertTrue(record["fused_center_shifts"])
                             self.assertFalse(record["python_center_shift_bridge"])
                             self.assertEqual(record["intermediate_centroid_transfer_for_shift_bytes"], 0)
@@ -78,6 +81,12 @@ class NativeKMeansFusedUpdateTests(unittest.TestCase):
             for threads in (0, 3, True):
                 with self.assertRaisesRegex(ValueError, "thread_count"):
                     cpu.lloyd_update(x, weights, previous, norms, threads)
+            self.assertTrue(cpu.owned_center_shifts)
+            with patch.object(cpu, "owned_center_shifts", False):
+                legacy_report = cpu.lloyd_update(x, weights, previous, norms, 12)[7]
+                self.assertFalse(legacy_report["center_shift_owned_buffer_reuse"])
+                self.assertEqual(legacy_report["center_shift_snapshot_bytes_avoided"], 0)
+                self.assertEqual(legacy_report["host_input_snapshot_bytes"], expected[7]["host_input_snapshot_bytes"] + previous.nbytes * 2)
             weights[-1] = -1
             with self.assertRaisesRegex(ValueError, "weight_domain"):
                 cpu.lloyd_update(x, weights, previous, norms, 12)

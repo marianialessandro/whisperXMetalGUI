@@ -47,6 +47,7 @@ def build_library(output, with_inertia=False, with_two_chunks=False):
     identity.update({name + "_source_sha256": hashlib.sha256(source.with_name(filename).read_bytes()).hexdigest() for name, filename in (("relocation", "native_kmeans_relocation.cpp"), ("selection", "native_kmeans_selection.hpp"), ("pairwise", "native_kmeans_pairwise.hpp"))})
     if with_inertia:
         identity.update({"inertia_source_sha256": hashlib.sha256(source.with_name("native_kmeans_inertia.cpp").read_bytes()).hexdigest(), "openmp_runtime_sha256": hashlib.sha256(runtime.read_bytes()).hexdigest()})
+    identity["center_shifts_core_source_sha256"] = hashlib.sha256(source.with_name("native_kmeans_center_shifts_core.hpp").read_bytes()).hexdigest()
     identity["relocation_core_source_sha256"] = hashlib.sha256(source.with_name("native_kmeans_relocation_core.hpp").read_bytes()).hexdigest()
     if with_two_chunks:
         identity["two_chunks_source_sha256"] = hashlib.sha256(source.with_name("native_kmeans_two_chunks.cpp").read_bytes()).hexdigest()
@@ -68,8 +69,14 @@ class NativeKMeansPotentials:
         if getattr(self.library, "wxkmeans_inertia_dense", None) is not None:
             from tools.baseline.native_kmeans_inertia import validate_loaded_runtime
             validate_loaded_runtime(self.library)
+        capability = getattr(self.library, "wxkmeans_owned_center_shifts_version", None)
+        self.owned_center_shifts = capability is not None
+        if capability is not None:
+            capability.argtypes = []; capability.restype = ct.c_uint32
+            if capability() != 1:
+                raise ValueError("kmeans_owned_shifts_version_not_supported")
         self.lock, self.closed = threading.RLock(), False
-        self.identity = {"library_sha256": expected_sha256, "backend": "cpu_accelerate_ilp64", "production_backend": False}
+        self.identity = {"library_sha256": expected_sha256, "backend": "cpu_accelerate_ilp64", "owned_center_shifts": self.owned_center_shifts, "production_backend": False}
 
     def __enter__(self):
         return self
@@ -116,7 +123,7 @@ class NativeKMeansPotentials:
         if with_shifts:
             if not np.isfinite(shifts).all() or (shifts < 0).any():
                 raise ValueError("kmeans_fused_centroids_shift_result_invalid")
-            record.update({"backend": "cpp_openmp_relocated_centroids_and_shifts", "fused_center_shifts": True, "center_shift_rows": clusters, "python_center_shift_bridge": False, "intermediate_centroid_transfer_for_shift_bytes": 0, "host_input_snapshot_bytes": values.nbytes + weights.nbytes + labels.nbytes + previous.nbytes * 4, "host_result_bytes": record["host_result_bytes"] + shifts.nbytes})
+            record.update({"backend": "cpp_openmp_relocated_centroids_and_shifts", "fused_center_shifts": True, "center_shift_rows": clusters, "python_center_shift_bridge": False, "intermediate_centroid_transfer_for_shift_bytes": 0, "host_input_snapshot_bytes": values.nbytes + weights.nbytes + labels.nbytes + previous.nbytes * (2 if self.owned_center_shifts else 4), "center_shift_input_snapshot_bytes": 0 if self.owned_center_shifts else previous.nbytes * 2, "center_shift_owned_buffer_reuse": self.owned_center_shifts, "center_shift_snapshot_bytes_avoided": previous.nbytes * 2 if self.owned_center_shifts else 0, "host_result_bytes": record["host_result_bytes"] + shifts.nbytes})
             return centers, totals, distances, order[:int(counts[0])], shifts, record
         return centers, totals, distances, order[:int(counts[0])], record
 
@@ -147,7 +154,7 @@ class NativeKMeansPotentials:
             raise ValueError("kmeans_update_native_result_invalid")
         record = {"scope": "experimental_native_cpu_lloyd_relocated_centroids", "execution_device": "cpu", "backend": "cpp_fma_pairwise_introselect_relocated_centroids", "samples": rows, "clusters": clusters, "features": features, "empty_clusters": int(counts[0]), "relocated_clusters": int(counts[1]), "selection_calls": int(counts[0] > 0), "distance_rows": rows if counts[0] else 0, "native_blas_calls": 0, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": values.nbytes + weights.nbytes + labels.nbytes + previous.nbytes, "host_result_bytes": centers.nbytes + totals.nbytes + distances.nbytes + order.nbytes + counts.nbytes, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_numeric_centroid_update": False, "python_numeric_relocation": False, "python_argpartition": False, "centroid_updates_replaced": True, "empty_cluster_relocation_replaced": True, "lloyd_iteration_replaced": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
         chunks = (rows + 255) // 256
-        record.update({"backend": "cpp_openmp_assignment_relocation_and_shifts", "fused_center_shifts": True, "fused_assignment": True, "native_timing_scope": "assignment_relocation_and_shifts_inclusive", "center_shift_rows": clusters, "python_center_shift_bridge": False, "python_assignment_bridge": False, "intermediate_centroid_transfer_for_shift_bytes": 0, "intermediate_label_transfer_for_centroid_bytes": 0, "native_blas_calls": chunks, "chunk_size": 256, "chunk_count": chunks, "requested_threads": n_threads, "effective_iteration_threads": min(n_threads, chunks), "actual_threads": min(n_threads, chunks), "thread_count_changed": False, "worker_partial_bytes": min(n_threads, chunks) * (centers.nbytes + totals.nbytes), "host_input_snapshot_bytes": 3 * values.nbytes + weights.nbytes + labels.nbytes + (chunks + 6) * previous.nbytes + (chunks + 1) * norms.nbytes, "host_result_bytes": labels.nbytes + scores.nbytes + centers.nbytes + totals.nbytes + distances.nbytes + order.nbytes + counts.nbytes + shifts.nbytes})
+        record.update({"backend": "cpp_openmp_assignment_relocation_and_shifts", "fused_center_shifts": True, "fused_assignment": True, "native_timing_scope": "assignment_relocation_and_shifts_inclusive", "center_shift_rows": clusters, "python_center_shift_bridge": False, "python_assignment_bridge": False, "intermediate_centroid_transfer_for_shift_bytes": 0, "intermediate_label_transfer_for_centroid_bytes": 0, "center_shift_input_snapshot_bytes": 0 if self.owned_center_shifts else previous.nbytes * 2, "center_shift_owned_buffer_reuse": self.owned_center_shifts, "center_shift_snapshot_bytes_avoided": previous.nbytes * 2 if self.owned_center_shifts else 0, "native_blas_calls": chunks, "chunk_size": 256, "chunk_count": chunks, "requested_threads": n_threads, "effective_iteration_threads": min(n_threads, chunks), "actual_threads": min(n_threads, chunks), "thread_count_changed": False, "worker_partial_bytes": min(n_threads, chunks) * (centers.nbytes + totals.nbytes), "host_input_snapshot_bytes": 3 * values.nbytes + weights.nbytes + labels.nbytes + (chunks + (4 if self.owned_center_shifts else 6)) * previous.nbytes + (chunks + 1) * norms.nbytes, "host_result_bytes": labels.nbytes + scores.nbytes + centers.nbytes + totals.nbytes + distances.nbytes + order.nbytes + counts.nbytes + shifts.nbytes})
         return labels, scores, centers, totals, distances, order[:int(counts[0])], shifts, record
 
     def inertia_dense(self, values, weights, centers, labels, n_threads, single_label=-1, *, two_chunks=False):

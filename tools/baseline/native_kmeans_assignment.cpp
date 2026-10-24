@@ -2,6 +2,7 @@
 #include <Accelerate/Accelerate.h>
 #include "native_checks.hpp"
 #include "native_kmeans_distance.hpp"
+#include "native_kmeans_center_shifts_core.hpp"
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -105,16 +106,10 @@ extern "C" int wxkmeans_lloyd_center_shifts(const float* updated, const float* p
         require(updated != nullptr && previous != nullptr && output != nullptr && metrics != nullptr, "kmeans_lloyd_center_shifts_pointer_missing");
         require(clusters > 0 && clusters <= 256 && features > 0 && features <= 1024, "kmeans_lloyd_center_shifts_shape_invalid");
         auto started = std::chrono::steady_clock::now();
-        std::vector<float> a(uint64_t(clusters) * features), b(a.size()), result(clusters);
+        std::vector<float> a(uint64_t(clusters) * features), b(a.size());
         std::memcpy(a.data(), updated, a.size() * sizeof(float));
         std::memcpy(b.data(), previous, b.size() * sizeof(float));
-        for (float value : a) require(std::isfinite(value) && std::abs(value) <= 0x1p32f, "kmeans_lloyd_center_shifts_value_domain_invalid");
-        for (float value : b) require(std::isfinite(value) && std::abs(value) <= 0x1p32f, "kmeans_lloyd_center_shifts_value_domain_invalid");
-        for (uint32_t cluster = 0; cluster < clusters; ++cluster) {
-            uint64_t start = uint64_t(cluster) * features;
-            result[cluster] = std::sqrt(wxkmeans_squared_distance(a.data() + start, b.data() + start, features));
-            require(std::isfinite(result[cluster]) && result[cluster] >= 0, "kmeans_lloyd_center_shifts_result_invalid");
-        }
+        auto result = wxkmeans_owned_center_shifts(a, b, clusters, features);
         std::memcpy(output, result.data(), result.size() * sizeof(float));
         *metrics = {1, 0, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count())};
         return 0;
@@ -125,4 +120,8 @@ extern "C" int wxkmeans_lloyd_center_shifts(const float* updated, const float* p
         if (error != nullptr && capacity > 0) { std::strncpy(error, "kmeans_lloyd_center_shifts_failed", capacity - 1); error[capacity - 1] = 0; }
         return 1;
     }
+}
+
+extern "C" uint32_t wxkmeans_owned_center_shifts_version(void) {
+    return 1;
 }
