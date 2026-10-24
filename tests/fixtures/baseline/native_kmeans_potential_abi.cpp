@@ -9,6 +9,7 @@
 #include <initializer_list>
 
 struct KmeansPotentialMetrics { uint32_t version, blas_calls; uint64_t wall_ns; };
+extern "C" int wxkmeans_lloyd_convergence(const float*, uint32_t, double, uint32_t, uint32_t*, KmeansPotentialMetrics*, char*, uint32_t);
 extern "C" int wxkmeans_local_trials(uint32_t, uint32_t*, KmeansPotentialMetrics*, char*, uint32_t);
 extern "C" int wxkmeans_distinct_labels(const int32_t*, uint32_t, uint32_t*, KmeansPotentialMetrics*, char*, uint32_t);
 extern "C" int wxkmeans_weighted_potentials(const float*, const float*, uint32_t, uint32_t, float*, KmeansPotentialMetrics*, char*, uint32_t);
@@ -329,5 +330,23 @@ int main() {
     unsigned char unaligned_trials[5];
     assert(wxkmeans_local_trials(4096, reinterpret_cast<uint32_t*>(unaligned_trials + 1), &metrics, error, sizeof(error)) == 0);
     std::memcpy(&trial_count, unaligned_trials + 1, sizeof(trial_count)); assert(trial_count == 10);
+
+    float convergence_shift[] = {1.f, 0.f}; uint32_t convergence_result[] = {91, 92};
+    double below_one = std::nextafter(1., 0.);
+    assert(wxkmeans_lloyd_convergence(convergence_shift, 2, below_one, 0, convergence_result, &metrics, error, sizeof(error)) == 0 && convergence_result[0] == std::bit_cast<uint32_t>(1.f) && convergence_result[1] == 1);
+    assert(wxkmeans_lloyd_convergence(convergence_shift, 2, below_one, 1, convergence_result, &metrics, error, sizeof(error)) == 0 && convergence_result[1] == 0);
+    convergence_result[0] = 91; convergence_result[1] = 92;
+    for (double value : {-1., std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN(), 0x1p33}) assert(wxkmeans_lloyd_convergence(convergence_shift, 2, value, 0, convergence_result, &metrics, error, sizeof(error)) != 0 && convergence_result[0] == 91 && convergence_result[1] == 92);
+    assert(wxkmeans_lloyd_convergence(convergence_shift, 2, 1., 2, convergence_result, &metrics, error, sizeof(error)) != 0 && convergence_result[0] == 91);
+    convergence_shift[1] = std::numeric_limits<float>::infinity();
+    assert(wxkmeans_lloyd_convergence(convergence_shift, 2, 1., 0, convergence_result, &metrics, error, sizeof(error)) != 0 && convergence_result[0] == 91 && convergence_result[1] == 92);
+    assert(wxkmeans_lloyd_convergence(nullptr, 2, 1., 0, convergence_result, &metrics, error, sizeof(error)) != 0);
+    convergence_shift[1] = 0.f;
+    assert(wxkmeans_lloyd_convergence(convergence_shift, 0, 1., 0, convergence_result, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_lloyd_convergence(convergence_shift, 2, 1., 0, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_lloyd_convergence(convergence_shift, 2, 1., 0, convergence_result, nullptr, error, sizeof(error)) != 0);
+    unsigned char convergence_alias[9]; std::memcpy(convergence_alias + 1, convergence_shift, sizeof(convergence_shift));
+    assert(wxkmeans_lloyd_convergence(reinterpret_cast<float*>(convergence_alias + 1), 2, 1., 0, reinterpret_cast<uint32_t*>(convergence_alias + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(convergence_result, convergence_alias + 1, sizeof(convergence_result)); assert(convergence_result[0] == std::bit_cast<uint32_t>(1.f) && convergence_result[1] == 1);
 
 }

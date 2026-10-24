@@ -245,3 +245,22 @@ extern "C" int wxkmeans_local_trials(uint32_t clusters, uint32_t* output, Kmeans
         if (error != nullptr && capacity > 0) { std::strncpy(error, "kmeans_local_trials_failed", capacity - 1); error[capacity - 1] = 0; } return 1;
     }
 }
+
+extern "C" int wxkmeans_lloyd_convergence(const float* shifts, uint32_t count, double tolerance, uint32_t binary64_tolerance, uint32_t* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity) {
+    try {
+        require(output != nullptr && metrics != nullptr, "kmeans_convergence_pointer_missing");
+        require(std::isfinite(tolerance) && tolerance >= 0 && tolerance <= 0x1p32 && binary64_tolerance <= 1, "kmeans_convergence_tolerance_invalid");
+        auto started = std::chrono::steady_clock::now();
+        float total; KmeansPotentialMetrics reduction;
+        int status = wxkmeans_lloyd_shift_total(shifts, count, &total, &reduction, error, capacity);
+        if (status != 0) return status;
+        bool converged = binary64_tolerance ? double(total) <= tolerance : total <= static_cast<float>(tolerance);
+        uint32_t result[] = {std::bit_cast<uint32_t>(total), uint32_t(converged)};
+        std::memcpy(reinterpret_cast<unsigned char*>(output), result, sizeof(result));
+        *metrics = {1, 0, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count())}; return 0;
+    } catch (const std::exception& failure) {
+        if (error != nullptr && capacity > 0) { std::strncpy(error, failure.what(), capacity - 1); error[capacity - 1] = 0; } return 1;
+    } catch (...) {
+        if (error != nullptr && capacity > 0) { std::strncpy(error, "kmeans_convergence_failed", capacity - 1); error[capacity - 1] = 0; } return 1;
+    }
+}
