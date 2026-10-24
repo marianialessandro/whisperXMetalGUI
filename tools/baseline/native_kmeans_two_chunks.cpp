@@ -115,3 +115,23 @@ extern "C" int wxkmeans_lloyd_centroids_and_shifts(const float* values, const fl
     } catch (const std::exception& failure) { if (error && capacity) { std::strncpy(error, failure.what(), capacity - 1); error[capacity - 1] = 0; } return 1; }
     catch (...) { if (error && capacity) { std::strncpy(error, "kmeans_fused_centroids_failed", capacity - 1); error[capacity - 1] = 0; } return 1; }
 }
+
+extern "C" int wxkmeans_lloyd_update(const float* values, const float* weights, const float* previous, const float* norms, uint32_t rows, uint32_t clusters, uint32_t features, uint32_t threads, int32_t* labels, float* scores, float* centers, float* cluster_weights, float* distances, int32_t* selected, uint32_t* counts, float* shifts, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity) {
+    try {
+        require(values && weights && previous && norms && labels && scores && centers && cluster_weights && distances && selected && counts && shifts && metrics, "kmeans_update_pointer_missing");
+        require(rows > 0 && rows <= 512 && clusters > 0 && clusters <= rows && clusters <= 256 && features > 0 && features <= 1024, "kmeans_update_shape_invalid");
+        std::pair<uintptr_t, uint64_t> outputs[] = {{reinterpret_cast<uintptr_t>(labels), uint64_t(rows) * 4}, {reinterpret_cast<uintptr_t>(scores), uint64_t(rows) * clusters * 4}, {reinterpret_cast<uintptr_t>(centers), uint64_t(clusters) * features * 4}, {reinterpret_cast<uintptr_t>(cluster_weights), uint64_t(clusters) * 4}, {reinterpret_cast<uintptr_t>(distances), uint64_t(rows) * 4}, {reinterpret_cast<uintptr_t>(selected), uint64_t(rows) * 4}, {reinterpret_cast<uintptr_t>(counts), 8}, {reinterpret_cast<uintptr_t>(shifts), uint64_t(clusters) * 4}};
+        for (uint32_t i = 0; i < 8; ++i) for (uint32_t j = i + 1; j < 8; ++j) require(outputs[i].first <= outputs[j].first ? outputs[j].first - outputs[i].first >= outputs[i].second : outputs[i].first - outputs[j].first >= outputs[j].second, "kmeans_update_outputs_overlap");
+        auto started = std::chrono::steady_clock::now();
+        std::vector<float> old(uint64_t(clusters) * features), assigned_scores(uint64_t(rows) * clusters), updated(old.size()), totals(clusters), row_distances(rows), movement(clusters);
+        std::vector<int32_t> assigned(rows), order(rows); uint32_t relocated[2]; KmeansPotentialMetrics assignment, child;
+        std::memcpy(old.data(), reinterpret_cast<const unsigned char*>(previous), old.size() * 4);
+        int status = wxkmeans_lloyd_assignment_two_chunks(values, old.data(), norms, rows, clusters, features, threads, assigned.data(), assigned_scores.data(), &assignment, error, capacity);
+        if (status != 0) return status;
+        status = wxkmeans_lloyd_centroids_and_shifts(values, weights, assigned.data(), old.data(), rows, clusters, features, threads, updated.data(), totals.data(), row_distances.data(), order.data(), relocated, movement.data(), &child, error, capacity);
+        if (status != 0) return status;
+        std::memcpy(reinterpret_cast<unsigned char*>(labels), assigned.data(), assigned.size() * 4); std::memcpy(reinterpret_cast<unsigned char*>(scores), assigned_scores.data(), assigned_scores.size() * 4); std::memcpy(reinterpret_cast<unsigned char*>(centers), updated.data(), updated.size() * 4); std::memcpy(reinterpret_cast<unsigned char*>(cluster_weights), totals.data(), totals.size() * 4); std::memcpy(reinterpret_cast<unsigned char*>(distances), row_distances.data(), row_distances.size() * 4); std::memcpy(reinterpret_cast<unsigned char*>(selected), order.data(), order.size() * 4); std::memcpy(reinterpret_cast<unsigned char*>(counts), relocated, 8); std::memcpy(reinterpret_cast<unsigned char*>(shifts), movement.data(), movement.size() * 4);
+        *metrics = {1, assignment.blas_calls, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count())}; return 0;
+    } catch (const std::exception& failure) { if (error && capacity) { std::strncpy(error, failure.what(), capacity - 1); error[capacity - 1] = 0; } return 1; }
+    catch (...) { if (error && capacity) { std::strncpy(error, "kmeans_update_failed", capacity - 1); error[capacity - 1] = 0; } return 1; }
+}

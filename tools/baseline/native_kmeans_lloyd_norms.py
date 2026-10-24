@@ -16,7 +16,7 @@ LLOYD_BINARY_SHA256 = "865e1791855baec7f4a8233cc5792a13a04efcdb4daef57d986c10fe2
 
 
 class LloydNormScope:
-    def __init__(self, context, records, assignment_context=None, assignment_records=None, centroid_records=None, center_shift_records=None, relocation_records=None, two_chunks=False, fused_centroids=False):
+    def __init__(self, context, records, assignment_context=None, assignment_records=None, centroid_records=None, center_shift_records=None, relocation_records=None, two_chunks=False, fused_centroids=False, fused_assignment=False):
         import sklearn.cluster._k_means_lloyd as module
         if not isinstance(records, list):
             raise ValueError("kmeans_lloyd_norm_records_required")
@@ -71,6 +71,11 @@ class LloydNormScope:
             raise ValueError("kmeans_fused_centroids_configuration_invalid")
         if fused_centroids and getattr(assignment_context.library, "wxkmeans_lloyd_centroids_and_shifts", None) is None:
             raise ValueError("kmeans_fused_centroids_abi_unavailable")
+        if type(fused_assignment) is not bool or (fused_assignment and not fused_centroids):
+            raise ValueError("kmeans_fused_assignment_configuration_invalid")
+        if fused_assignment and getattr(assignment_context.library, "wxkmeans_lloyd_update", None) is None:
+            raise ValueError("kmeans_update_abi_unavailable")
+        self.fused_assignment = fused_assignment
         self.fused_centroids = fused_centroids
         self.two_chunks = two_chunks
         self.center_shift_records = center_shift_records
@@ -119,11 +124,19 @@ class LloydNormScope:
                     raise ValueError("kmeans_lloyd_centroids_outputs_overlap")
                 norms = self.row_norms(centers_old, squared=True)
                 started = time.perf_counter_ns()
-                assigned, distances, assignment_record = self.assignment_context.lloyd_assignment(np.asarray(X), self.centers, norms, **({"n_threads": bound.arguments["n_threads"]} if self.two_chunks else {}))
+                if self.fused_assignment:
+                    if np.getbufsize() != 8192:
+                        raise ValueError("kmeans_relocation_numpy_buffer_not_supported")
+                    assigned, distances, updated, totals, relocation_distances, selected, shifts, record = self.assignment_context.lloyd_update(np.asarray(X), np.asarray(sample_weight), self.centers, norms, bound.arguments["n_threads"])
+                    assignment_record = {"backend": "shared_native_cpu_fused_assignment", "native_wall_ns": 0, "host_input_snapshot_bytes": 0, "host_result_bytes": 0, "native_blas_calls": record["native_blas_calls"]}
+                else:
+                    assigned, distances, assignment_record = self.assignment_context.lloyd_assignment(np.asarray(X), self.centers, norms, **({"n_threads": bound.arguments["n_threads"]} if self.two_chunks else {}))
                 if self.relocation_records is not None:
                     if np.getbufsize() != 8192:
                         raise ValueError("kmeans_relocation_numpy_buffer_not_supported")
-                    if self.fused_centroids:
+                    if self.fused_assignment:
+                        pass
+                    elif self.fused_centroids:
                         updated, totals, relocation_distances, selected, shifts, record = self.assignment_context.lloyd_relocated_centroids(np.asarray(X), np.asarray(sample_weight), assigned, self.centers, n_threads=bound.arguments["n_threads"], with_shifts=True)
                     else:
                         updated, totals, relocation_distances, selected, record = self.assignment_context.lloyd_relocated_centroids(np.asarray(X), np.asarray(sample_weight), assigned, self.centers, **({"n_threads": bound.arguments["n_threads"]} if self.two_chunks else {}))

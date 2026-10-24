@@ -120,6 +120,36 @@ class NativeKMeansPotentials:
             return centers, totals, distances, order[:int(counts[0])], shifts, record
         return centers, totals, distances, order[:int(counts[0])], record
 
+    def lloyd_update(self, values, weights, previous, norms, n_threads):
+        if any(type(value) is not np.ndarray or value.dtype != np.float32 or not value.flags.c_contiguous for value in (values, weights, previous, norms)) or values.ndim != 2 or previous.ndim != 2 or weights.ndim != 1 or norms.ndim != 1:
+            raise ValueError("kmeans_update_operand_format_invalid")
+        rows, features = values.shape
+        clusters = previous.shape[0]
+        if not 0 < rows <= 512 or not 0 < clusters <= min(rows, 256) or not 0 < features <= 1024 or previous.shape[1] != features or weights.shape != (rows,) or norms.shape != (clusters,):
+            raise ValueError("kmeans_update_shape_invalid")
+        if type(n_threads) is not int or n_threads not in (1, 2, 12):
+            raise ValueError("kmeans_update_thread_count_not_supported")
+        labels, scores = np.empty(rows, np.int32), np.empty((rows, clusters), np.float32)
+        centers, totals, distances, order, counts, shifts = np.empty_like(previous), np.empty(clusters, np.float32), np.empty(rows, np.float32), np.empty(rows, np.int32), np.empty(2, np.uint32), np.empty(clusters, np.float32)
+        metrics, error = PotentialMetrics(), ct.create_string_buffer(128)
+        started = time.perf_counter_ns()
+        with self.lock:
+            if self.closed:
+                raise ValueError("kmeans_potential_context_closed")
+            try:
+                native = self.library.wxkmeans_lloyd_update
+            except AttributeError as failure:
+                raise ValueError("kmeans_update_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p] * 4 + [ct.c_uint32] * 4 + [ct.c_void_p] * 8 + [ct.POINTER(PotentialMetrics), ct.c_char_p, ct.c_uint32]; native.restype = ct.c_int
+            if native(values.ctypes.data, weights.ctypes.data, previous.ctypes.data, norms.ctypes.data, rows, clusters, features, n_threads, labels.ctypes.data, scores.ctypes.data, centers.ctypes.data, totals.ctypes.data, distances.ctypes.data, order.ctypes.data, counts.ctypes.data, shifts.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        if metrics.version != 1 or metrics.blas_calls != (rows + 255) // 256 or not all(np.isfinite(a).all() for a in (scores, centers, totals, distances, shifts)) or (labels < 0).any() or (labels >= clusters).any() or counts[0] > clusters or counts[1] > counts[0] or (order[:int(counts[0])] < 0).any() or (order[:int(counts[0])] >= rows).any():
+            raise ValueError("kmeans_update_native_result_invalid")
+        record = {"scope": "experimental_native_cpu_lloyd_relocated_centroids", "execution_device": "cpu", "backend": "cpp_fma_pairwise_introselect_relocated_centroids", "samples": rows, "clusters": clusters, "features": features, "empty_clusters": int(counts[0]), "relocated_clusters": int(counts[1]), "selection_calls": int(counts[0] > 0), "distance_rows": rows if counts[0] else 0, "native_blas_calls": 0, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": values.nbytes + weights.nbytes + labels.nbytes + previous.nbytes, "host_result_bytes": centers.nbytes + totals.nbytes + distances.nbytes + order.nbytes + counts.nbytes, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_numeric_centroid_update": False, "python_numeric_relocation": False, "python_argpartition": False, "centroid_updates_replaced": True, "empty_cluster_relocation_replaced": True, "lloyd_iteration_replaced": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+        chunks = (rows + 255) // 256
+        record.update({"backend": "cpp_openmp_assignment_relocation_and_shifts", "fused_center_shifts": True, "fused_assignment": True, "native_timing_scope": "assignment_relocation_and_shifts_inclusive", "center_shift_rows": clusters, "python_center_shift_bridge": False, "python_assignment_bridge": False, "intermediate_centroid_transfer_for_shift_bytes": 0, "intermediate_label_transfer_for_centroid_bytes": 0, "native_blas_calls": chunks, "chunk_size": 256, "chunk_count": chunks, "requested_threads": n_threads, "effective_iteration_threads": min(n_threads, chunks), "actual_threads": min(n_threads, chunks), "thread_count_changed": False, "worker_partial_bytes": min(n_threads, chunks) * (centers.nbytes + totals.nbytes), "host_input_snapshot_bytes": 3 * values.nbytes + weights.nbytes + labels.nbytes + (chunks + 6) * previous.nbytes + (chunks + 1) * norms.nbytes, "host_result_bytes": labels.nbytes + scores.nbytes + centers.nbytes + totals.nbytes + distances.nbytes + order.nbytes + counts.nbytes + shifts.nbytes})
+        return labels, scores, centers, totals, distances, order[:int(counts[0])], shifts, record
+
     def inertia_dense(self, values, weights, centers, labels, n_threads, single_label=-1, *, two_chunks=False):
         if any(type(value) is not np.ndarray or value.dtype != np.float32 or not value.flags.c_contiguous for value in (values, weights, centers)) or values.ndim != 2 or centers.ndim != 2 or weights.ndim != 1 or type(labels) is not np.ndarray or labels.dtype != np.int32 or labels.ndim != 1 or not labels.flags.c_contiguous:
             raise ValueError("kmeans_inertia_operand_format_invalid")
