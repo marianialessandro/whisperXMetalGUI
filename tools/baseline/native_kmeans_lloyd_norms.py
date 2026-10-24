@@ -16,7 +16,7 @@ LLOYD_BINARY_SHA256 = "865e1791855baec7f4a8233cc5792a13a04efcdb4daef57d986c10fe2
 
 
 class LloydNormScope:
-    def __init__(self, context, records, assignment_context=None, assignment_records=None, centroid_records=None, center_shift_records=None, relocation_records=None, two_chunks=False):
+    def __init__(self, context, records, assignment_context=None, assignment_records=None, centroid_records=None, center_shift_records=None, relocation_records=None, two_chunks=False, fused_centroids=False):
         import sklearn.cluster._k_means_lloyd as module
         if not isinstance(records, list):
             raise ValueError("kmeans_lloyd_norm_records_required")
@@ -67,6 +67,11 @@ class LloydNormScope:
                 raise ValueError("kmeans_two_chunks_abi_unavailable")
             from tools.baseline.native_kmeans_inertia import validate_loaded_runtime
             validate_loaded_runtime(assignment_context.library)
+        if type(fused_centroids) is not bool or (fused_centroids and not two_chunks):
+            raise ValueError("kmeans_fused_centroids_configuration_invalid")
+        if fused_centroids and getattr(assignment_context.library, "wxkmeans_lloyd_centroids_and_shifts", None) is None:
+            raise ValueError("kmeans_fused_centroids_abi_unavailable")
+        self.fused_centroids = fused_centroids
         self.two_chunks = two_chunks
         self.center_shift_records = center_shift_records
         self.centroid_records = centroid_records
@@ -118,11 +123,17 @@ class LloydNormScope:
                 if self.relocation_records is not None:
                     if np.getbufsize() != 8192:
                         raise ValueError("kmeans_relocation_numpy_buffer_not_supported")
-                    updated, totals, relocation_distances, selected, record = self.assignment_context.lloyd_relocated_centroids(np.asarray(X), np.asarray(sample_weight), assigned, self.centers, **({"n_threads": bound.arguments["n_threads"]} if self.two_chunks else {}))
+                    if self.fused_centroids:
+                        updated, totals, relocation_distances, selected, shifts, record = self.assignment_context.lloyd_relocated_centroids(np.asarray(X), np.asarray(sample_weight), assigned, self.centers, n_threads=bound.arguments["n_threads"], with_shifts=True)
+                    else:
+                        updated, totals, relocation_distances, selected, record = self.assignment_context.lloyd_relocated_centroids(np.asarray(X), np.asarray(sample_weight), assigned, self.centers, **({"n_threads": bound.arguments["n_threads"]} if self.two_chunks else {}))
                 else:
                     updated, totals, record = self.assignment_context.lloyd_centroids(np.asarray(X), np.asarray(sample_weight), assigned, clusters)
                 if self.center_shift_records is not None:
-                    shifts, shift_record = self.assignment_context.lloyd_center_shifts(updated, self.centers)
+                    if self.fused_centroids:
+                        shift_record = {"scope": "experimental_native_cpu_lloyd_center_shifts", "execution_device": "cpu", "backend": "shared_native_cpu_fused_centroid_shifts", "rows": clusters, "clusters": clusters, "center_shifts_replaced": True, "lloyd_iteration_replaced": False, "features": features, "shared_centroid_update": True, "shared_operation_index": len(self.centroid_records), "native_blas_calls": 0, "native_wall_ns": 0, "completion_and_bridge_wall_ns": 0, "host_input_snapshot_bytes": 0, "host_result_bytes": 0, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_numeric_center_shift": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+                    else:
+                        shifts, shift_record = self.assignment_context.lloyd_center_shifts(updated, self.centers)
                     shift_record.update({"adapter_scope": "sklearn_dense_float32_lloyd_centroid_movement", "original_common_binary_sha256": "793cb26715cc85762eb460e29cce45a4a40584ddcaba761bfd69adafd080f3cf", "cpu_residuals": ["inertia", "convergence_control", "host_staging_and_control"]})
                 else:
                     shifts = np.empty(clusters, np.float32)

@@ -794,6 +794,14 @@ class MetalCLITests(unittest.TestCase):
             self.assertEqual(caught.exception.code, 2)
             self.assertFalse(report.exists())
 
+    def test_kmeans_fused_centroids_requires_two_chunks(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stderr(io.StringIO()):
+            report = Path(directory) / "report.json"
+            with self.assertRaises(SystemExit) as caught:
+                main(["--mps-library", "unused.dylib", "--mps-library-sha256", "0" * 64, "--native-report", str(report), "private.wav", "--diarize", "--kmeans-lloyd-fused-centroids"])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertFalse(report.exists())
+
     def test_kmeans_clustering_equivalence_requires_library_and_upcast_norms(self):
         for extra in ([], ["--kmeans-upcast-norms"]):
             with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stderr(io.StringIO()):

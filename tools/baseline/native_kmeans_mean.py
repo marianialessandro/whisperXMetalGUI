@@ -116,7 +116,7 @@ def shift_inplace(context, records, values, mean, add, role):
 
 
 @contextlib.contextmanager
-def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None, product_records=None, chunk_records=None, lloyd_shift_records=None, lloyd_label_records=None, equivalence_records=None, lloyd_norm_records=None, assignment_records=None, centroid_records=None, center_shift_records=None, inertia_records=None, relocation_records=None, two_chunks=False, upcast_512=False, products_512=False, resident_512=False, distinct_records=None, local_trial_records=None, random_probability_records=None, convergence_records=None, decision_records=None):
+def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None, product_records=None, chunk_records=None, lloyd_shift_records=None, lloyd_label_records=None, equivalence_records=None, lloyd_norm_records=None, assignment_records=None, centroid_records=None, center_shift_records=None, inertia_records=None, relocation_records=None, two_chunks=False, upcast_512=False, products_512=False, resident_512=False, distinct_records=None, local_trial_records=None, random_probability_records=None, convergence_records=None, decision_records=None, fused_centroids=False):
     global _ACTIVE
     from sklearn.base import _fit_context
     from sklearn.cluster import KMeans
@@ -229,6 +229,8 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
             from scipy import sparse
             original_equivalence = inspect.unwrap(KMeans.fit).__globals__.get("_is_same_clustering")
             validate_equivalence(original_equivalence)
+        if type(fused_centroids) is not bool or (fused_centroids and not two_chunks):
+            raise ValueError("kmeans_fused_centroids_configuration_invalid")
         if type(two_chunks) is not bool or (two_chunks and (relocation_records is None or inertia_records is None)):
             raise ValueError("kmeans_two_chunks_configuration_invalid")
         if relocation_records is not None and (centroid_records is None or not isinstance(relocation_records, list)):
@@ -248,7 +250,7 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
         lloyd_norm_scope = None
         if lloyd_norm_records is not None:
             from tools.baseline.native_kmeans_lloyd_norms import LloydNormScope
-            lloyd_norm_scope = LloydNormScope(context, lloyd_norm_records, assignment_context=potential_context if assignment_records is not None else None, assignment_records=assignment_records, centroid_records=centroid_records, center_shift_records=center_shift_records, relocation_records=relocation_records, two_chunks=two_chunks)
+            lloyd_norm_scope = LloydNormScope(context, lloyd_norm_records, assignment_context=potential_context if assignment_records is not None else None, assignment_records=assignment_records, centroid_records=centroid_records, center_shift_records=center_shift_records, relocation_records=relocation_records, two_chunks=two_chunks, **({"fused_centroids": True} if fused_centroids else {}))
         original_lloyd = candidate_lloyd = None
         if lloyd_shift_records is not None or lloyd_label_records is not None or lloyd_norm_scope is not None:
             import sklearn.cluster._kmeans as kmeans_module

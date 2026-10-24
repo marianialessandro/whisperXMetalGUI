@@ -81,9 +81,11 @@ class NativeKMeansPotentials:
         with self.lock:
             self.closed = True
 
-    def lloyd_relocated_centroids(self, values, weights, labels, previous, *, n_threads=None):
+    def lloyd_relocated_centroids(self, values, weights, labels, previous, *, n_threads=None, with_shifts=False):
         if any(type(value) is not np.ndarray or value.dtype != np.float32 or not value.flags.c_contiguous for value in (values, weights, previous)) or values.ndim != 2 or previous.ndim != 2 or weights.ndim != 1 or type(labels) is not np.ndarray or labels.dtype != np.int32 or labels.ndim != 1 or not labels.flags.c_contiguous:
             raise ValueError("kmeans_relocation_operand_format_invalid")
+        if type(with_shifts) is not bool or (with_shifts and n_threads is None):
+            raise ValueError("kmeans_fused_centroids_configuration_invalid")
         two_chunks = n_threads is not None
         if two_chunks and (type(n_threads) is not int or n_threads not in (1, 2, 12)):
             raise ValueError("kmeans_two_chunks_thread_count_not_supported")
@@ -92,17 +94,18 @@ class NativeKMeansPotentials:
         if not 0 < rows <= (512 if two_chunks else 256) or not 0 < clusters <= min(rows, 256) or not 0 < features <= 1024 or previous.shape[1] != features or weights.shape != (rows,) or labels.shape != (rows,):
             raise ValueError("kmeans_relocation_shape_invalid")
         centers, totals, distances, order, counts = np.empty_like(previous), np.empty(clusters, np.float32), np.empty(rows, np.float32), np.empty(rows, np.int32), np.empty(2, np.uint32)
+        shifts = np.empty(clusters, np.float32) if with_shifts else None
         metrics, error = PotentialMetrics(), ct.create_string_buffer(128)
         started = time.perf_counter_ns()
         with self.lock:
             if self.closed:
                 raise ValueError("kmeans_potential_context_closed")
             try:
-                native = self.library.wxkmeans_lloyd_centroids_two_chunks if two_chunks else self.library.wxkmeans_lloyd_relocated_centroids
+                native = self.library.wxkmeans_lloyd_centroids_and_shifts if with_shifts else (self.library.wxkmeans_lloyd_centroids_two_chunks if two_chunks else self.library.wxkmeans_lloyd_relocated_centroids)
             except AttributeError as failure:
-                raise ValueError("kmeans_two_chunks_centroids_abi_unavailable" if two_chunks else "kmeans_relocation_abi_unavailable") from failure
-            native.argtypes = [ct.c_void_p] * 4 + [ct.c_uint32] * (4 if two_chunks else 3) + [ct.c_void_p] * 5 + [ct.POINTER(PotentialMetrics), ct.c_char_p, ct.c_uint32]; native.restype = ct.c_int
-            if native(values.ctypes.data, weights.ctypes.data, labels.ctypes.data, previous.ctypes.data, rows, clusters, features, *([n_threads] if two_chunks else []), centers.ctypes.data, totals.ctypes.data, distances.ctypes.data, order.ctypes.data, counts.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError("kmeans_fused_centroids_abi_unavailable" if with_shifts else ("kmeans_two_chunks_centroids_abi_unavailable" if two_chunks else "kmeans_relocation_abi_unavailable")) from failure
+            native.argtypes = [ct.c_void_p] * 4 + [ct.c_uint32] * (4 if two_chunks else 3) + [ct.c_void_p] * (6 if with_shifts else 5) + [ct.POINTER(PotentialMetrics), ct.c_char_p, ct.c_uint32]; native.restype = ct.c_int
+            if native(values.ctypes.data, weights.ctypes.data, labels.ctypes.data, previous.ctypes.data, rows, clusters, features, *([n_threads] if two_chunks else []), centers.ctypes.data, totals.ctypes.data, distances.ctypes.data, order.ctypes.data, counts.ctypes.data, *([shifts.ctypes.data] if with_shifts else []), ct.byref(metrics), error, len(error)):
                 raise ValueError(error.value.decode("ascii"))
         if metrics.version != 1 or metrics.blas_calls != 0 or not np.isfinite(centers).all() or not np.isfinite(totals).all() or not np.isfinite(distances).all() or counts[0] > clusters or counts[1] > counts[0] or (order[:int(counts[0])] < 0).any() or (order[:int(counts[0])] >= rows).any():
             raise ValueError("kmeans_relocation_native_result_invalid")
@@ -110,6 +113,11 @@ class NativeKMeansPotentials:
 
         if two_chunks:
             record.update({"backend": "cpp_openmp_two_chunk_fma_relocated_centroids", "chunk_size": 256, "chunk_count": (rows + 255) // 256, "requested_threads": n_threads, "effective_iteration_threads": min(n_threads, (rows + 255) // 256), "actual_threads": min(n_threads, (rows + 255) // 256), "thread_count_changed": False, "worker_partial_bytes": min(n_threads, (rows + 255) // 256) * (centers.nbytes + totals.nbytes)})
+        if with_shifts:
+            if not np.isfinite(shifts).all() or (shifts < 0).any():
+                raise ValueError("kmeans_fused_centroids_shift_result_invalid")
+            record.update({"backend": "cpp_openmp_relocated_centroids_and_shifts", "fused_center_shifts": True, "center_shift_rows": clusters, "python_center_shift_bridge": False, "intermediate_centroid_transfer_for_shift_bytes": 0, "host_input_snapshot_bytes": values.nbytes + weights.nbytes + labels.nbytes + previous.nbytes * 4, "host_result_bytes": record["host_result_bytes"] + shifts.nbytes})
+            return centers, totals, distances, order[:int(counts[0])], shifts, record
         return centers, totals, distances, order[:int(counts[0])], record
 
     def inertia_dense(self, values, weights, centers, labels, n_threads, single_label=-1, *, two_chunks=False):
