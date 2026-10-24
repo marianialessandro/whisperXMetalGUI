@@ -721,3 +721,12 @@ Reports expose `kmeans_distinct_labels_requested`, `kmeans_distinct_labels_obser
 The source-pinned adapter replaces only the assignment inside the original `n_local_trials is None` branch. Explicit trial counts retain their original behavior and produce no native-default-count record. RNG calls, probabilities, candidate counts and downstream selection remain unchanged. Sparse fits, explicit centroid initialization and non-owner threads preserve the existing fit paths. Invalid domain/ABI/configuration and expression/guard drift fail explicitly; the raw ABI validates before writing its scalar output.
 
 Reports expose `kmeans_local_trials_requested`, `kmeans_local_trials_observed`, `native_cpu_kmeans_local_trial_calls` and shape/scalar metadata in `operations.kmeans_local_trials`. This is CPU work with no BLAS/GPU dispatch. It does not certify speedup, quality, a full-GPU pipeline or production readiness.
+
+
+### Optional Metal probabilities for random centroid initialization
+
+`--kmeans-random-probabilities` requires `--kmeans-feature-mean` and the existing `wxdouble_kmeans_seed_probabilities` ABI. Scoped fits opt in with `random_probability_records=[]`. It replaces `sample_weight / sample_weight.sum()` only in the source-pinned dense float32 `init="random"` initializer. The shared Metal kernel preserves the original float32 pairwise sum and division; the original `RandomState.choice(..., replace=False)` and centroid indexing remain in place. No new native ABI or shader is introduced.
+
+The original initializer signature, optional subsampling and centroid-count override remain unchanged. Sparse input, explicit/callable initialization, default k-means++, other threads and overridden initializer methods preserve their original behavior. The adapter uses a private compiled fit/initializer namespace, leaving `KMeans._init_centroids` unchanged. Source/AST/NumPy reduction checks reject drift; failures restore the scoped fit hooks. Native weight/value bounds remain those of the existing seed-probability primitive.
+
+Reports distinguish `kmeans_random_probabilities_requested`, `kmeans_random_probabilities_observed` and `native_kmeans_random_probability_calls`. `operations.kmeans_random_probabilities` contains scalar/shape/timing metadata with `rng_replaced=False`, no probabilities or centroid arrays. Standard diarization uses k-means++ and therefore may enable the option while observing zero random-initialization calls. This does not certify quality, speedup, full-GPU execution or production readiness.

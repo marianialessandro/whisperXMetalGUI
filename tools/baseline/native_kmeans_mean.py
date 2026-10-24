@@ -19,7 +19,7 @@ _LOCK = threading.RLock()
 _ACTIVE = False
 
 
-def compile_native_mean(original, mean, shift=None, norms=None, equivalence=None, distinct=None):
+def compile_native_mean(original, mean, shift=None, norms=None, equivalence=None, distinct=None, initializer=None):
     inner = inspect.unwrap(original)
     source = inspect.getsource(inner)
     if hashlib.sha256(source.encode()).hexdigest() != FIT_SHA256 or inner.__closure__:
@@ -66,7 +66,15 @@ def compile_native_mean(original, mean, shift=None, norms=None, equivalence=None
             raise ValueError("kmeans_distinct_expression_contract_changed")
         found[0].func = ast.Name(id="__wx_distinct_labels", ctx=ast.Load())
         found[0].args = [ast.Name(id="X", ctx=ast.Load()), ast.Name(id="best_labels", ctx=ast.Load())]
+    if initializer is not None:
+        target = ast.parse("self._init_centroids(X, x_squared_norms=x_squared_norms, init=init, random_state=random_state, sample_weight=sample_weight)", mode="eval").body
+        found = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.dump(node) == ast.dump(target)]
+        if len(found) != 1:
+            raise ValueError("kmeans_random_init_fit_expression_changed")
+        found[0].func = ast.Name(id="__wx_init_centroids", ctx=ast.Load())
+        found[0].args.insert(0, ast.Name(id="self", ctx=ast.Load()))
     namespace = dict(inner.__globals__)
+    namespace["__wx_init_centroids"] = initializer
     namespace["__wx_distinct_labels"] = distinct
     namespace["__wx_same_clustering"] = equivalence
     namespace["__wx_native_kmeans_mean"] = mean
@@ -108,7 +116,7 @@ def shift_inplace(context, records, values, mean, add, role):
 
 
 @contextlib.contextmanager
-def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None, product_records=None, chunk_records=None, lloyd_shift_records=None, lloyd_label_records=None, equivalence_records=None, lloyd_norm_records=None, assignment_records=None, centroid_records=None, center_shift_records=None, inertia_records=None, relocation_records=None, two_chunks=False, upcast_512=False, products_512=False, resident_512=False, distinct_records=None, local_trial_records=None):
+def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None, product_records=None, chunk_records=None, lloyd_shift_records=None, lloyd_label_records=None, equivalence_records=None, lloyd_norm_records=None, assignment_records=None, centroid_records=None, center_shift_records=None, inertia_records=None, relocation_records=None, two_chunks=False, upcast_512=False, products_512=False, resident_512=False, distinct_records=None, local_trial_records=None, random_probability_records=None):
     global _ACTIVE
     from sklearn.base import _fit_context
     from sklearn.cluster import KMeans
@@ -181,6 +189,17 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
             raise ValueError("kmeans_upcast_512_configuration_invalid")
         if upcast_512 and getattr(potential_context.library, "wxkmeans_upcast_chunk_512", None) is None:
             raise ValueError("kmeans_upcast_512_abi_unavailable")
+        candidate_initializer = None
+        if random_probability_records is not None:
+            from tools.baseline.native_kmeans_random_init import compile_random_initializer, random_probabilities
+            if not isinstance(random_probability_records, list):
+                raise ValueError("kmeans_random_init_configuration_invalid")
+            if getattr(context.library, "wxdouble_kmeans_seed_probabilities", None) is None:
+                raise ValueError("kmeans_random_init_probability_abi_unavailable")
+            from tools.baseline.native_kmeans_norms import validate_reference
+            validate_reference(inspect.unwrap(KMeans.fit).__globals__["row_norms"])
+            original_initializer = KMeans._init_centroids
+            candidate_initializer = compile_random_initializer(original_initializer, lambda weights: random_probabilities(context, random_probability_records, weights))
         if local_trial_records is not None:
             if potential_context is None or not isinstance(local_trial_records, list):
                 raise ValueError("kmeans_local_trials_configuration_invalid")
@@ -370,7 +389,13 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
             distinct_records.append(record)
             return result
 
-        candidate = compile_native_mean(original, mean, shift=shift if shift_records is not None else None, norms=norms if norm_records is not None else None, equivalence=(lambda X, labels, previous, clusters: original_equivalence(labels, previous, clusters) if sparse.issparse(X) else same_clustering(potential_context, equivalence_records, labels, previous, clusters)) if equivalence_records is not None else None, distinct=distinct if distinct_records is not None else None)
+        def initialize(instance, X, *args, **kwargs):
+            from scipy import sparse
+            if type(X) is not np.ndarray or X.dtype != np.float32 or sparse.issparse(X) or getattr(instance._init_centroids, "__func__", None) is not original_initializer:
+                return instance._init_centroids(X, *args, **kwargs)
+            return candidate_initializer(instance, X, *args, **kwargs)
+
+        candidate = compile_native_mean(original, mean, shift=shift if shift_records is not None else None, norms=norms if norm_records is not None else None, equivalence=(lambda X, labels, previous, clusters: original_equivalence(labels, previous, clusters) if sparse.issparse(X) else same_clustering(potential_context, equivalence_records, labels, previous, clusters)) if equivalence_records is not None else None, distinct=distinct if distinct_records is not None else None, initializer=initialize if candidate_initializer is not None else None)
         owner = threading.get_ident()
 
         if candidate_lloyd is not None:
@@ -401,6 +426,11 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
             def wrapped_plusplus(X, *args, **kwargs):
                 from scipy import sparse
                 return candidate_plusplus(X, *args, **kwargs) if threading.get_ident() == owner and not sparse.issparse(X) else original_plusplus(X, *args, **kwargs)
+
+        if candidate_initializer is not None and original_plusplus is not None:
+            if candidate_initializer.__globals__.get("_kmeans_plusplus") is not original_plusplus:
+                raise ValueError("kmeans_random_init_plusplus_binding_changed")
+            candidate_initializer.__globals__["_kmeans_plusplus"] = wrapped_plusplus
 
         if lloyd_norm_scope is not None:
             lloyd_norm_scope.__enter__()
