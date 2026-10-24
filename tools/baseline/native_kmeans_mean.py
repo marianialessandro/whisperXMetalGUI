@@ -108,7 +108,7 @@ def shift_inplace(context, records, values, mean, add, role):
 
 
 @contextlib.contextmanager
-def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None, product_records=None, chunk_records=None, lloyd_shift_records=None, lloyd_label_records=None, equivalence_records=None, lloyd_norm_records=None, assignment_records=None, centroid_records=None, center_shift_records=None, inertia_records=None, relocation_records=None, two_chunks=False, upcast_512=False, products_512=False, resident_512=False, distinct_records=None):
+def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None, product_records=None, chunk_records=None, lloyd_shift_records=None, lloyd_label_records=None, equivalence_records=None, lloyd_norm_records=None, assignment_records=None, centroid_records=None, center_shift_records=None, inertia_records=None, relocation_records=None, two_chunks=False, upcast_512=False, products_512=False, resident_512=False, distinct_records=None, local_trial_records=None):
     global _ACTIVE
     from sklearn.base import _fit_context
     from sklearn.cluster import KMeans
@@ -181,6 +181,11 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
             raise ValueError("kmeans_upcast_512_configuration_invalid")
         if upcast_512 and getattr(potential_context.library, "wxkmeans_upcast_chunk_512", None) is None:
             raise ValueError("kmeans_upcast_512_abi_unavailable")
+        if local_trial_records is not None:
+            if potential_context is None or not isinstance(local_trial_records, list):
+                raise ValueError("kmeans_local_trials_configuration_invalid")
+            if getattr(potential_context.library, "wxkmeans_local_trials", None) is None:
+                raise ValueError("kmeans_local_trials_abi_unavailable")
         if distinct_records is not None:
             if potential_context is None or not isinstance(distinct_records, list):
                 raise ValueError("kmeans_distinct_configuration_invalid")
@@ -305,7 +310,12 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
             search = (lambda cdf, queries: candidate_search(context, search_records, cdf, queries)) if search_records is not None else None
             best = (lambda potentials: best_candidate(context, best_records, potentials)) if best_records is not None else None
             query_scale = (lambda random_values, potential: scale_queries(context, query_records, random_values, potential)) if query_records is not None else None
-            candidate_plusplus = compile_native_prefix(original_plusplus, prefix, minimum=minimum, probabilities=probabilities, search=search, best=best, query_scale=query_scale, upcast_distance=upcast_distance if upcast_norm_records is not None else None, resident_candidate_distance=resident_pipeline.candidate_distance if resident_minimum else None, potential=(lambda distances, weights: weighted_potentials(potential_context, potential_records, distances, weights)) if potential_context is not None else None)
+            def local_trials(clusters):
+                output, record = potential_context.local_trials(clusters)
+                record.update({"adapter_scope": "sklearn_dense_kmeans_plusplus_default_local_trials", "original_plusplus_sha256": hashlib.sha256(inspect.getsource(original_plusplus).encode()).hexdigest(), "cpu_residuals": ["rng_and_seed_control", "host_staging_and_control"]})
+                local_trial_records.append(record)
+                return output
+            candidate_plusplus = compile_native_prefix(original_plusplus, prefix, minimum=minimum, probabilities=probabilities, search=search, best=best, query_scale=query_scale, upcast_distance=upcast_distance if upcast_norm_records is not None else None, resident_candidate_distance=resident_pipeline.candidate_distance if resident_minimum else None, potential=(lambda distances, weights: weighted_potentials(potential_context, potential_records, distances, weights)) if potential_context is not None else None, local_trials=local_trials if local_trial_records is not None else None)
         if tolerance_records is not None:
             import sklearn.cluster._kmeans as kmeans_module
             from tools.baseline.native_kmeans_tolerance import compile_native_tolerance, tolerance_value

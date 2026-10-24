@@ -22,7 +22,7 @@ CLIP_SHA256 = "9a0eb9c2e80a635150f89e1397012b8f775d6abfeebb19e569cede3f23a2f155"
 ARGMIN_SHA256 = "7cfd400e4c8292a14b60ec6628a65256c0c3cd130197eee6e2047daa06b84360"
 
 
-def compile_native_prefix(original, prefix, minimum=None, probabilities=None, search=None, best=None, query_scale=None, upcast_distance=None, resident_candidate_distance=None, potential=None):
+def compile_native_prefix(original, prefix, minimum=None, probabilities=None, search=None, best=None, query_scale=None, upcast_distance=None, resident_candidate_distance=None, potential=None, local_trials=None):
     if not inspect.isfunction(original) or original.__closure__ or inspect.unwrap(original) is not original:
         raise ValueError("kmeans_weighted_prefix_reference_not_supported")
     source = inspect.getsource(original)
@@ -93,6 +93,15 @@ def compile_native_prefix(original, prefix, minimum=None, probabilities=None, se
             if len(found) != 1:
                 raise ValueError("kmeans_potential_expression_contract_changed")
             potential_matches.append(found[0])
+    if local_trials is not None:
+        target = ast.parse("n_local_trials = 2 + int(np.log(n_clusters))").body[0]
+        found = [node for node in ast.walk(tree) if isinstance(node, ast.Assign) and ast.dump(node) == ast.dump(target)]
+        if len(found) != 1:
+            raise ValueError("kmeans_local_trials_expression_contract_changed")
+        guards = [node for node in ast.walk(tree) if isinstance(node, ast.If) and ast.dump(node.test) == ast.dump(ast.parse("n_local_trials is None", mode="eval").body) and found[0] in node.body]
+        if len(guards) != 1 or len(guards[0].body) != 1 or guards[0].orelse:
+            raise ValueError("kmeans_local_trials_default_guard_changed")
+        found[0].value = ast.parse("__wx_local_trials(n_clusters)", mode="eval").body
     class ReplacePrefix(ast.NodeTransformer):
         def visit_Expr(self, node):
             return ast.copy_location(ast.Pass(), node) if clip_matches and node is clip_matches[0] else self.generic_visit(node)
@@ -125,6 +134,7 @@ def compile_native_prefix(original, prefix, minimum=None, probabilities=None, se
     namespace = dict(original.__globals__)
     if upcast_distance is not None:
         namespace["_euclidean_distances"] = upcast_distance
+    namespace["__wx_local_trials"] = local_trials
     namespace["__wx_native_kmeans_potential"] = potential
     namespace["__wx_resident_candidate_distance"] = resident_candidate_distance
     namespace["__wx_native_kmeans_weighted_prefix"] = prefix

@@ -9,6 +9,7 @@
 #include <initializer_list>
 
 struct KmeansPotentialMetrics { uint32_t version, blas_calls; uint64_t wall_ns; };
+extern "C" int wxkmeans_local_trials(uint32_t, uint32_t*, KmeansPotentialMetrics*, char*, uint32_t);
 extern "C" int wxkmeans_distinct_labels(const int32_t*, uint32_t, uint32_t*, KmeansPotentialMetrics*, char*, uint32_t);
 extern "C" int wxkmeans_weighted_potentials(const float*, const float*, uint32_t, uint32_t, float*, KmeansPotentialMetrics*, char*, uint32_t);
 
@@ -316,5 +317,17 @@ int main() {
     std::memcpy(distinct_alias.data() + 1, distinct_labels.data(), distinct_labels.size() * sizeof(int32_t));
     assert(wxkmeans_distinct_labels(reinterpret_cast<int32_t*>(distinct_alias.data() + 1), 4096, reinterpret_cast<uint32_t*>(distinct_alias.data() + 1), &metrics, error, sizeof(error)) == 0);
     std::memcpy(&distinct_count, distinct_alias.data() + 1, sizeof(distinct_count)); assert(distinct_count == 4096);
+
+    uint32_t trial_count = 91;
+    for (uint32_t clusters = 1; clusters <= 4096; ++clusters) {
+        assert(wxkmeans_local_trials(clusters, &trial_count, &metrics, error, sizeof(error)) == 0 && trial_count == 2 + uint32_t(std::log(double(clusters))) && metrics.version == 1 && metrics.blas_calls == 0);
+    }
+    trial_count = 91;
+    for (uint32_t clusters : {0u, 4097u, std::numeric_limits<uint32_t>::max()}) assert(wxkmeans_local_trials(clusters, &trial_count, &metrics, error, sizeof(error)) != 0 && trial_count == 91);
+    assert(wxkmeans_local_trials(1, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_local_trials(1, &trial_count, nullptr, error, sizeof(error)) != 0 && trial_count == 91);
+    unsigned char unaligned_trials[5];
+    assert(wxkmeans_local_trials(4096, reinterpret_cast<uint32_t*>(unaligned_trials + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(&trial_count, unaligned_trials + 1, sizeof(trial_count)); assert(trial_count == 10);
 
 }

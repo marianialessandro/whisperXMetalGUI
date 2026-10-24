@@ -228,3 +228,20 @@ extern "C" int wxkmeans_distinct_labels(const int32_t* labels, uint32_t count, u
         if (error != nullptr && capacity > 0) { std::strncpy(error, "kmeans_distinct_failed", capacity - 1); error[capacity - 1] = 0; } return 1;
     }
 }
+
+extern "C" int wxkmeans_local_trials(uint32_t clusters, uint32_t* output, KmeansPotentialMetrics* metrics, char* error, uint32_t capacity) {
+    try {
+        require(output != nullptr && metrics != nullptr, "kmeans_local_trials_pointer_missing");
+        require(clusters > 0 && clusters <= 4096, "kmeans_local_trials_cluster_count_invalid");
+        auto started = std::chrono::steady_clock::now();
+        uint32_t result = 2;
+        // These integer thresholds reproduce the pinned NumPy logarithm truncation for every cluster count in the bounded domain.
+        for (uint32_t threshold : {3u, 8u, 21u, 55u, 149u, 404u, 1097u, 2981u}) result += clusters >= threshold;
+        std::memcpy(reinterpret_cast<unsigned char*>(output), &result, sizeof(result));
+        *metrics = {1, 0, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count())}; return 0;
+    } catch (const std::exception& failure) {
+        if (error != nullptr && capacity > 0) { std::strncpy(error, failure.what(), capacity - 1); error[capacity - 1] = 0; } return 1;
+    } catch (...) {
+        if (error != nullptr && capacity > 0) { std::strncpy(error, "kmeans_local_trials_failed", capacity - 1); error[capacity - 1] = 0; } return 1;
+    }
+}

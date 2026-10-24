@@ -712,3 +712,12 @@ Source-pinned sklearn batching is preserved. The original default batch accommod
 The CPU implementation snapshots labels, uses a 512-byte bitset and validates all values before writing the scalar result. Readonly/unaligned input and input/output aliasing are supported. Invalid count, labels or pointers leave caller output intact. The adapter preserves convergence-warning text/category and the final labels, centers, inertia and RNG state; failures restore hooks. Source/AST checks reject expression changes and shadowed `len`/`set` globals.
 
 Reports expose `kmeans_distinct_labels_requested`, `kmeans_distinct_labels_observed`, `native_cpu_kmeans_distinct_label_calls` and the scalar result in `operations.kmeans_distinct_labels`. They contain no label arrays. Records attribute this count to CPU with no BLAS/GPU dispatch. No quality, speedup, full-GPU or production certification is implied.
+
+
+### Optional native CPU default KMeans++ local-trial count
+
+`--kmeans-local-trials` requires `--kmeans-potential-library` exposing `wxkmeans_local_trials`. Raw callers use `local_trials(clusters)`, while scoped fits opt in with `local_trial_records=[]`. The new ABI supports Python integer cluster counts 1–4,096 and returns a Python integer from 2 through 10. C++ integer thresholds reproduce the pinned NumPy expression `2 + int(np.log(n_clusters))` over this exhaustive bounded domain. No floating-point logarithm is evaluated in the new path.
+
+The source-pinned adapter replaces only the assignment inside the original `n_local_trials is None` branch. Explicit trial counts retain their original behavior and produce no native-default-count record. RNG calls, probabilities, candidate counts and downstream selection remain unchanged. Sparse fits, explicit centroid initialization and non-owner threads preserve the existing fit paths. Invalid domain/ABI/configuration and expression/guard drift fail explicitly; the raw ABI validates before writing its scalar output.
+
+Reports expose `kmeans_local_trials_requested`, `kmeans_local_trials_observed`, `native_cpu_kmeans_local_trial_calls` and shape/scalar metadata in `operations.kmeans_local_trials`. This is CPU work with no BLAS/GPU dispatch. It does not certify speedup, quality, a full-GPU pipeline or production readiness.
