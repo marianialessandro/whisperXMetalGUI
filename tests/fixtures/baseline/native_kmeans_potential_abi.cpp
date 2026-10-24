@@ -9,6 +9,7 @@
 #include <initializer_list>
 
 struct KmeansPotentialMetrics { uint32_t version, blas_calls; uint64_t wall_ns; };
+extern "C" int wxkmeans_lloyd_decision(const int32_t*, const int32_t*, uint32_t, const float*, uint32_t, double, uint32_t, uint32_t*, KmeansPotentialMetrics*, char*, uint32_t);
 extern "C" int wxkmeans_lloyd_convergence(const float*, uint32_t, double, uint32_t, uint32_t*, KmeansPotentialMetrics*, char*, uint32_t);
 extern "C" int wxkmeans_local_trials(uint32_t, uint32_t*, KmeansPotentialMetrics*, char*, uint32_t);
 extern "C" int wxkmeans_distinct_labels(const int32_t*, uint32_t, uint32_t*, KmeansPotentialMetrics*, char*, uint32_t);
@@ -348,5 +349,23 @@ int main() {
     unsigned char convergence_alias[9]; std::memcpy(convergence_alias + 1, convergence_shift, sizeof(convergence_shift));
     assert(wxkmeans_lloyd_convergence(reinterpret_cast<float*>(convergence_alias + 1), 2, 1., 0, reinterpret_cast<uint32_t*>(convergence_alias + 1), &metrics, error, sizeof(error)) == 0);
     std::memcpy(convergence_result, convergence_alias + 1, sizeof(convergence_result)); assert(convergence_result[0] == std::bit_cast<uint32_t>(1.f) && convergence_result[1] == 1);
+
+    int32_t decision_labels[] = {0, 1}, decision_old[] = {0, 1}; uint32_t decision_result[] = {91, 92, 93};
+    assert(wxkmeans_lloyd_decision(decision_labels, decision_old, 2, nullptr, 0, std::numeric_limits<double>::quiet_NaN(), 99, decision_result, &metrics, error, sizeof(error)) == 0 && decision_result[0] == 1 && decision_result[1] == 0 && decision_result[2] == 0);
+    decision_old[1] = -1;
+    assert(wxkmeans_lloyd_decision(decision_labels, decision_old, 2, convergence_shift, 2, 1., 0, decision_result, &metrics, error, sizeof(error)) == 0 && decision_result[0] == 0 && decision_result[1] == std::bit_cast<uint32_t>(1.f) && decision_result[2] == 1);
+    decision_result[0] = 91; decision_result[1] = 92; decision_result[2] = 93;
+    assert(wxkmeans_lloyd_decision(decision_labels, decision_old, 2, nullptr, 0, 1., 0, decision_result, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_lloyd_decision(decision_labels, decision_old, 2, convergence_shift, 2, -1., 0, decision_result, &metrics, error, sizeof(error)) != 0);
+    decision_labels[1] = 4096;
+    assert(wxkmeans_lloyd_decision(decision_labels, decision_labels, 2, nullptr, 0, 0., 0, decision_result, &metrics, error, sizeof(error)) != 0);
+    assert(decision_result[0] == 91 && decision_result[1] == 92 && decision_result[2] == 93);
+    decision_labels[1] = 1;
+    assert(wxkmeans_lloyd_decision(nullptr, decision_old, 2, nullptr, 0, 0., 0, decision_result, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_lloyd_decision(decision_labels, decision_old, 2, convergence_shift, 2, 1., 0, nullptr, &metrics, error, sizeof(error)) != 0);
+    assert(wxkmeans_lloyd_decision(decision_labels, decision_old, 2, convergence_shift, 2, 1., 0, decision_result, nullptr, error, sizeof(error)) != 0);
+    unsigned char decision_alias[13]; std::memcpy(decision_alias + 1, decision_labels, sizeof(decision_labels));
+    assert(wxkmeans_lloyd_decision(reinterpret_cast<int32_t*>(decision_alias + 1), decision_old, 2, convergence_shift, 2, 1., 0, reinterpret_cast<uint32_t*>(decision_alias + 1), &metrics, error, sizeof(error)) == 0);
+    std::memcpy(decision_result, decision_alias + 1, sizeof(decision_result)); assert(decision_result[0] == 0 && decision_result[2] == 1);
 
 }

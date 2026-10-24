@@ -116,7 +116,7 @@ def shift_inplace(context, records, values, mean, add, role):
 
 
 @contextlib.contextmanager
-def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None, product_records=None, chunk_records=None, lloyd_shift_records=None, lloyd_label_records=None, equivalence_records=None, lloyd_norm_records=None, assignment_records=None, centroid_records=None, center_shift_records=None, inertia_records=None, relocation_records=None, two_chunks=False, upcast_512=False, products_512=False, resident_512=False, distinct_records=None, local_trial_records=None, random_probability_records=None, convergence_records=None):
+def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_records=None, norm_records=None, prefix_records=None, minimum_records=None, probability_records=None, search_records=None, best_records=None, query_records=None, upcast_norm_records=None, distance_finish_records=None, distance_clamp_records=None, resident_distances=False, resident_norms=False, resident_minimum=False, potential_context=None, potential_records=None, product_records=None, chunk_records=None, lloyd_shift_records=None, lloyd_label_records=None, equivalence_records=None, lloyd_norm_records=None, assignment_records=None, centroid_records=None, center_shift_records=None, inertia_records=None, relocation_records=None, two_chunks=False, upcast_512=False, products_512=False, resident_512=False, distinct_records=None, local_trial_records=None, random_probability_records=None, convergence_records=None, decision_records=None):
     global _ACTIVE
     from sklearn.base import _fit_context
     from sklearn.cluster import KMeans
@@ -189,6 +189,11 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
             raise ValueError("kmeans_upcast_512_configuration_invalid")
         if upcast_512 and getattr(potential_context.library, "wxkmeans_upcast_chunk_512", None) is None:
             raise ValueError("kmeans_upcast_512_abi_unavailable")
+        if decision_records is not None:
+            if convergence_records is None or lloyd_label_records is None or not isinstance(decision_records, list) or potential_context is None:
+                raise ValueError("kmeans_decision_configuration_invalid")
+            if getattr(potential_context.library, "wxkmeans_lloyd_decision", None) is None:
+                raise ValueError("kmeans_decision_abi_unavailable")
         if convergence_records is not None:
             if potential_context is None or lloyd_shift_records is None or not isinstance(convergence_records, list):
                 raise ValueError("kmeans_convergence_configuration_invalid")
@@ -247,7 +252,7 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
         original_lloyd = candidate_lloyd = None
         if lloyd_shift_records is not None or lloyd_label_records is not None or lloyd_norm_scope is not None:
             import sklearn.cluster._kmeans as kmeans_module
-            from tools.baseline.native_kmeans_lloyd import compile_native_lloyd, shift_total, labels_equal, tolerance_convergence
+            from tools.baseline.native_kmeans_lloyd import compile_native_lloyd, shift_total, labels_equal, tolerance_convergence, convergence_decision
             from tools.baseline.native_kmeans_norms import validate_reference
             if ((lloyd_shift_records is not None or lloyd_label_records is not None) and potential_context is None) or (lloyd_shift_records is not None and not isinstance(lloyd_shift_records, list)) or (lloyd_label_records is not None and not isinstance(lloyd_label_records, list)):
                 raise ValueError("kmeans_lloyd_shift_configuration_invalid")
@@ -257,7 +262,7 @@ def native_kmeans_feature_mean(context, records, shift_records=None, tolerance_r
                 raise ValueError("kmeans_lloyd_labels_abi_unavailable")
             validate_reference(kmeans_module._kmeans_plusplus.__globals__["row_norms"])
             original_lloyd = kmeans_module._kmeans_single_lloyd
-            candidate_lloyd = compile_native_lloyd(original_lloyd, (lambda values: shift_total(potential_context, lloyd_shift_records, values)) if lloyd_shift_records is not None else None, labels_equal=(lambda values, previous: labels_equal(potential_context, lloyd_label_records, values, previous)) if lloyd_label_records is not None else None, dense_iteration=lloyd_norm_scope.iteration if lloyd_norm_scope is not None else None, inertia=(lambda X, weights, centers, labels, n_threads, single_label=-1: inertia_value(potential_context, inertia_records, X, weights, centers, labels, n_threads, single_label, **({"two_chunks": True} if two_chunks else {}))) if inertia_records is not None else None, convergence=(lambda values, tolerance: tolerance_convergence(potential_context, convergence_records, lloyd_shift_records, values, tolerance)) if convergence_records is not None else None)
+            candidate_lloyd = compile_native_lloyd(original_lloyd, (lambda values: shift_total(potential_context, lloyd_shift_records, values)) if lloyd_shift_records is not None else None, labels_equal=(lambda values, previous: labels_equal(potential_context, lloyd_label_records, values, previous)) if lloyd_label_records is not None else None, dense_iteration=lloyd_norm_scope.iteration if lloyd_norm_scope is not None else None, inertia=(lambda X, weights, centers, labels, n_threads, single_label=-1: inertia_value(potential_context, inertia_records, X, weights, centers, labels, n_threads, single_label, **({"two_chunks": True} if two_chunks else {}))) if inertia_records is not None else None, convergence=(lambda values, tolerance: tolerance_convergence(potential_context, convergence_records, lloyd_shift_records, values, tolerance)) if convergence_records is not None else None, decision=(lambda labels, previous, values, tolerance: convergence_decision(potential_context, decision_records, lloyd_label_records, convergence_records, lloyd_shift_records, labels, previous, values, tolerance)) if decision_records is not None else None)
         resident_pipeline = None
         original_tolerance = None
         original_plusplus = None

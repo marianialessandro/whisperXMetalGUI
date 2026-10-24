@@ -17,7 +17,7 @@ THREADPOOL_DECORATOR_SHA256 = "ec72498b68ea605724643838a8bc4c343ef6d150f8d09fd8b
 ARRAY_EQUAL_SHA256 = "be4f8df0142c72cbd63a30ed74a48129155a6aa845e5e6d2f2898a2a59d35be6"
 
 
-def compile_native_lloyd(original, shift_total=None, labels_equal=None, dense_iteration=None, inertia=None, convergence=None):
+def compile_native_lloyd(original, shift_total=None, labels_equal=None, dense_iteration=None, inertia=None, convergence=None, decision=None):
     from sklearn.cluster import _kmeans
     from sklearn.utils.parallel import _threadpool_controller_decorator
     inner = inspect.unwrap(original)
@@ -33,10 +33,10 @@ def compile_native_lloyd(original, shift_total=None, labels_equal=None, dense_it
     decorator = ast.parse('_threadpool_controller_decorator(limits=1, user_api="blas")', mode="eval").body
     if len(tree.body) != 1 or len(tree.body[0].decorator_list) != 1 or ast.dump(tree.body[0].decorator_list[0]) != ast.dump(decorator) or len(matches) != 1:
         raise ValueError("kmeans_lloyd_shift_expression_contract_changed")
-    if shift_total is not None and convergence is None:
+    if shift_total is not None and convergence is None and decision is None:
         matches[0].func = ast.Name(id="__wx_lloyd_shift_total", ctx=ast.Load())
         matches[0].args = [ast.Name(id="center_shift", ctx=ast.Load())]
-    if convergence is not None:
+    if convergence is not None and decision is None:
         target_assignment = ast.parse("center_shift_tot = (center_shift**2).sum()").body[0]
         assignments = [node for node in ast.walk(tree) if isinstance(node, ast.Assign) and ast.dump(node) == ast.dump(target_assignment)]
         tests = [node for node in ast.walk(tree) if isinstance(node, ast.If) and ast.dump(node.test) == ast.dump(ast.parse("center_shift_tot <= tol", mode="eval").body)]
@@ -45,15 +45,34 @@ def compile_native_lloyd(original, shift_total=None, labels_equal=None, dense_it
         assignments[0].targets = [ast.Tuple(elts=[ast.Name(id="center_shift_tot", ctx=ast.Store()), ast.Name(id="__wx_within_tolerance", ctx=ast.Store())], ctx=ast.Store())]
         assignments[0].value = ast.parse("__wx_lloyd_convergence(center_shift, tol)", mode="eval").body
         tests[0].test = ast.Name(id="__wx_within_tolerance", ctx=ast.Load())
-    if labels_equal is not None:
+    if labels_equal is not None or decision is not None:
         if inner.__globals__.get("np") is not np or hashlib.sha256(inspect.getsource(np.array_equal).encode()).hexdigest() != ARRAY_EQUAL_SHA256:
             raise ValueError("kmeans_lloyd_labels_reference_not_supported")
         target = ast.parse("np.array_equal(labels, labels_old)", mode="eval").body
         found = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.dump(node) == ast.dump(target)]
         if len(found) != 1:
             raise ValueError("kmeans_lloyd_labels_expression_contract_changed")
-        found[0].func = ast.Name(id="__wx_lloyd_labels_equal", ctx=ast.Load())
+        if decision is None:
+            found[0].func = ast.Name(id="__wx_lloyd_labels_equal", ctx=ast.Load())
+    if decision is not None:
+        reduction = ast.parse("center_shift_tot = (center_shift**2).sum()").body[0]
+        reductions = [node for node in ast.walk(tree) if isinstance(node, ast.Assign) and ast.dump(node) == ast.dump(reduction)]
+        strict_tests = [node for node in ast.walk(tree) if isinstance(node, ast.If) and ast.dump(node.test) == ast.dump(ast.parse("np.array_equal(labels, labels_old)", mode="eval").body)]
+        tolerance_tests = [node for node in ast.walk(tree) if isinstance(node, ast.If) and ast.dump(node.test) == ast.dump(ast.parse("center_shift_tot <= tol", mode="eval").body)]
+        if len(reductions) != 1 or len(strict_tests) != 1 or len(tolerance_tests) != 1:
+            raise ValueError("kmeans_decision_expression_contract_changed")
+        reductions[0].value = ast.Name(id="__wx_decision_total", ctx=ast.Load())
+        tolerance_tests[0].test = ast.Name(id="__wx_decision_within", ctx=ast.Load())
+        strict_tests[0].test = ast.Name(id="__wx_decision_strict", ctx=ast.Load())
+        class InsertDecision(ast.NodeTransformer):
+            def visit_If(self, node):
+                if node is strict_tests[0]:
+                    statement = ast.parse("__wx_decision_strict, __wx_decision_total, __wx_decision_within = __wx_lloyd_decision(labels, labels_old, center_shift, tol)").body[0]
+                    return [statement, node]
+                return self.generic_visit(node)
+        tree = InsertDecision().visit(tree)
     namespace = dict(inner.__globals__); namespace["__wx_lloyd_shift_total"] = shift_total
+    namespace["__wx_lloyd_decision"] = decision
     namespace["__wx_lloyd_convergence"] = convergence
     namespace["__wx_lloyd_labels_equal"] = labels_equal
     if dense_iteration is not None:
@@ -99,3 +118,24 @@ def tolerance_convergence(context, records, shift_records, shifts, tolerance):
     shared.update({"scope": "experimental_native_cpu_kmeans_lloyd_shift_total", "adapter_scope": "sklearn_dense_float32_lloyd_center_shift", "backend": "shared_native_cpu_convergence_reduction", "python_numeric_shift_reduction": False, "lloyd_iteration_replaced": False, "threadpool_decorator_sha256": THREADPOOL_DECORATOR_SHA256, "shared_convergence_index": len(records) - 1, "native_wall_ns": 0, "completion_and_bridge_wall_ns": 0, "host_input_snapshot_bytes": 0, "host_result_bytes": 0})
     shift_records.append(shared)
     return total, converged
+
+
+def convergence_decision(context, records, label_records, convergence_records, shift_records, labels, previous, shifts, tolerance):
+    strict, total, within, record = context.lloyd_decision(labels, previous, shifts, tolerance)
+    if not strict and np.getbufsize() != 8192:
+        raise ValueError("kmeans_lloyd_shift_numpy_buffer_not_supported")
+    record.update({"adapter_scope": "sklearn_dense_float32_lloyd_convergence_decision", "original_lloyd_sha256": LLOYD_SHA256, "numpy_core_binary_sha256": NUMPY_CORE_SHA256})
+    records.append(record)
+    shared = dict(record)
+    shared.update({"backend": "shared_native_cpu_lloyd_decision", "shared_decision_index": len(records) - 1, "native_wall_ns": 0, "completion_and_bridge_wall_ns": 0, "host_input_snapshot_bytes": 0, "host_result_bytes": 0, "lloyd_iteration_replaced": False})
+    label = dict(shared)
+    label.update({"scope": "experimental_native_cpu_kmeans_lloyd_labels_equal", "adapter_scope": "sklearn_dense_float32_lloyd_strict_convergence", "original_array_equal_sha256": ARRAY_EQUAL_SHA256})
+    label_records.append(label)
+    if not strict:
+        convergence = dict(shared)
+        convergence.update({"scope": "experimental_native_cpu_lloyd_tolerance_convergence", "adapter_scope": "sklearn_dense_float32_lloyd_tolerance_convergence", "converged": within})
+        convergence_records.append(convergence)
+        shift = dict(shared)
+        shift.update({"scope": "experimental_native_cpu_kmeans_lloyd_shift_total", "adapter_scope": "sklearn_dense_float32_lloyd_center_shift", "shared_convergence_index": len(convergence_records) - 1, "python_numeric_shift_reduction": False, "threadpool_decorator_sha256": THREADPOOL_DECORATOR_SHA256})
+        shift_records.append(shift)
+    return strict, total, within

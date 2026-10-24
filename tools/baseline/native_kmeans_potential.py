@@ -298,6 +298,33 @@ class NativeKMeansPotentials:
             raise ValueError("kmeans_lloyd_labels_native_result_invalid")
         return bool(output[0]), {"scope": "experimental_native_cpu_kmeans_lloyd_labels_equal", "execution_device": "cpu", "backend": "cpp_int32_label_equality", "samples": labels.size, "native_blas_calls": 0, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": labels.nbytes + previous.nbytes, "host_result_bytes": 4, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_label_comparison": False, "lloyd_iteration_replaced": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
 
+    def lloyd_decision(self, labels, previous, shifts=None, tolerance=None):
+        if any(type(value) is not np.ndarray or value.dtype != np.int32 or value.ndim != 1 or not value.flags.c_contiguous for value in (labels, previous)):
+            raise ValueError("kmeans_decision_label_format_invalid")
+        if not 0 < labels.size <= 4096 or previous.shape != labels.shape:
+            raise ValueError("kmeans_decision_label_count_invalid")
+        valid_shifts = type(shifts) is np.ndarray and shifts.dtype == np.float32 and shifts.ndim == 1 and shifts.flags.c_contiguous
+        shift_pointer, clusters = (shifts.ctypes.data, shifts.size) if valid_shifts and shifts.size <= 1024 else (None, 0)
+        valid_type = type(tolerance) in (float, np.float32, np.float64)
+        native_tolerance = float(tolerance) if valid_type else float("nan")
+        output, metrics, error = np.empty(3, np.uint32), PotentialMetrics(), ct.create_string_buffer(128)
+        started = time.perf_counter_ns()
+        with self.lock:
+            if self.closed:
+                raise ValueError("kmeans_potential_context_closed")
+            try:
+                native = self.library.wxkmeans_lloyd_decision
+            except AttributeError as failure:
+                raise ValueError("kmeans_decision_abi_unavailable") from failure
+            native.argtypes = [ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_void_p, ct.c_uint32, ct.c_double, ct.c_uint32, ct.c_void_p, ct.POINTER(PotentialMetrics), ct.c_char_p, ct.c_uint32]; native.restype = ct.c_int
+            if native(labels.ctypes.data, previous.ctypes.data, labels.size, shift_pointer, clusters, native_tolerance, int(type(tolerance) is np.float64), output.ctypes.data, ct.byref(metrics), error, len(error)):
+                raise ValueError(error.value.decode("ascii"))
+        strict, total, within = bool(output[0]), output[1:2].view(np.float32)[0], bool(output[2])
+        if metrics.version != 1 or metrics.blas_calls != 0 or output[0] > 1 or output[2] > 1 or not np.isfinite(total) or total < 0 or (strict and (output[1] != 0 or output[2] != 0)):
+            raise ValueError("kmeans_decision_native_result_invalid")
+        record = {"scope": "experimental_native_cpu_lloyd_convergence_decision", "execution_device": "cpu", "backend": "cpp_short_circuit_strict_or_tolerance", "samples": labels.size, "centers": clusters, "strict_convergence": strict, "tolerance_evaluated": not strict, "converged_by_tolerance": within, "comparison_precision": None if strict else ("binary64" if type(tolerance) is np.float64 else "binary32"), "tolerance_type": None if strict else type(tolerance).__name__, "native_blas_calls": 0, "native_wall_ns": metrics.wall_ns, "completion_and_bridge_wall_ns": time.perf_counter_ns() - started, "host_input_snapshot_bytes": labels.nbytes + previous.nbytes + (shifts.nbytes if not strict else 0), "host_result_bytes": 12, "gpu_kernels": [], "command_buffers_per_run": 0, "computation_gpu_seconds": None, "logical_input_upload_bytes": 0, "logical_result_readback_bytes": 0, "python_label_comparison": False, "python_numeric_tolerance_comparison": False, "quality_certified": False, "full_pipeline_gpu_certified": False, "production_backend": False}
+        return strict, total, within, record
+
     def lloyd_convergence(self, shifts, tolerance):
         if type(shifts) is not np.ndarray or shifts.dtype != np.float32 or shifts.ndim != 1 or not shifts.flags.c_contiguous:
             raise ValueError("kmeans_convergence_operand_format_invalid")
